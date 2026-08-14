@@ -33,6 +33,9 @@ model Organization {
   bids          Bid[]
   auditLogs     AuditLog[]
   knowledgeAlerts KnowledgeAlert[]
+  commercialExceptions CommercialException[]
+  projectActuals   ProjectActual[]
+  calibrationProposals CalibrationProposal[]
 }
 
 model User {
@@ -214,6 +217,7 @@ model WorkDefinition {
   organization   Organization       @relation(fields: [organizationId], references: [id])
   versions       WorkDefinitionVersion[]
   estimateLines  EstimateLine[]
+  calibrationProposals CalibrationProposal[]
 }
 
 model WorkDefinitionVersion {
@@ -326,19 +330,26 @@ model EstimateLine {
   quantity              Float
   unit                  String
   executionStrategy     String   @default("self-perform") // self-perform | subcontract | hybrid | undecided
+  // Calculation status — 'incomplete' means the price is provisional and
+  // cannot be committed to a finalized estimate (P0-4 fix).
+  calculationStatus     String   @default("complete") // complete | incomplete
+  blockingInputsJson    String   @default("[]") // [{kind:'missing-price',resourceName}]
   // Cost build-up (deterministic, computed by pricing-engine on write)
   materialCost          Float    @default(0)
   labourCost            Float    @default(0)
   plantCost             Float    @default(0)
-  subcontractCost      Float    @default(0)
+  subcontractCost       Float    @default(0)
   directCost            Float    @default(0)
   projectCost           Float    @default(0) // direct + project-specific
   riskCost              Float    @default(0)
   overheadCost          Float    @default(0)
   profitCost            Float    @default(0)
+  estimatedTotalCost    Float    @default(0) // direct + risk + overhead (excludes profit)
+  expectedProfit        Float    @default(0) // sellPrice - estimatedTotalCost
   sellPrice             Float    @default(0)
   unitRate              Float    @default(0)
-  marginPct             Float    @default(0)
+  expectedMarginPct     Float    @default(0) // expectedProfit / sellPrice (P0-6 fix)
+  marginPct             Float    @default(0) // legacy alias kept for backward-compat reads
   confidence            Float    @default(0.5) // 0..1 derived from evidence
   provenanceSummary     String?  // human-readable lineage
   isUnsourced           Boolean  @default(false)
@@ -353,6 +364,24 @@ model EstimateLine {
   workDefinition        WorkDefinition?       @relation(fields: [workDefinitionId], references: [id])
   workDefinitionVersion WorkDefinitionVersion? @relation(fields: [workDefinitionVersionId], references: [id])
   subcontractPackageLine SubcontractPackageLine[]
+  executionSegments     ExecutionSegment[]
+  commercialExceptions  CommercialException[]
+  actuals               ProjectActual[]
+}
+
+// P0-5 fix: hybrid execution needs explicit allocation, never a 50% heuristic.
+// An EstimateLine with strategy 'hybrid' must have ≥2 segments summing to 100%.
+// Missing allocation → calculationStatus = 'incomplete'.
+model ExecutionSegment {
+  id            String   @id @default(cuid())
+  estimateLineId String
+  strategy      String   // self-perform | subcontract
+  scopeDefinition String
+  quantityPct   Float    @default(1.0) // 0..1 share of the line's quantity
+  subcontractQuoteId String?
+  createdAt     DateTime @default(now())
+
+  estimateLine  EstimateLine @relation(fields: [estimateLineId], references: [id])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -374,6 +403,7 @@ model SubcontractPackage {
   opportunity    Opportunity @relation(fields: [opportunityId], references: [id])
   lines          SubcontractPackageLine[]
   quotes         SubcontractQuote[]
+  scopeAtoms     ScopeAtom[]
 }
 
 model SubcontractPackageLine {
@@ -402,6 +432,7 @@ model SubcontractQuote {
 
   subcontractPackage   SubcontractPackage @relation(fields: [subcontractPackageId], references: [id])
   lines                SubcontractQuoteLine[]
+  scopeCoverages       QuoteScopeCoverage[]
 }
 
 model SubcontractQuoteLine {
@@ -412,6 +443,33 @@ model SubcontractQuoteLine {
   currency        String   @default("GHS")
 
   quote           SubcontractQuote @relation(fields: [quoteId], references: [id])
+}
+
+// P0-7 fix: scope reconciliation based on structured scope atoms, not substring.
+// A SubcontractPackage defines required ScopeAtoms (e.g. manufacture, delivery,
+// installation). Each quote explicitly covers/excludes each atom.
+model ScopeAtom {
+  id                   String   @id @default(cuid())
+  subcontractPackageId String
+  name                 String   // e.g. "installation"
+  description          String?
+  createdAt            DateTime @default(now())
+
+  subcontractPackage   SubcontractPackage @relation(fields: [subcontractPackageId], references: [id])
+  coverages            QuoteScopeCoverage[]
+}
+
+model QuoteScopeCoverage {
+  id            String   @id @default(cuid())
+  quoteId       String
+  scopeAtomId   String
+  // covered | excluded | unstated. 'unstated' = quote didn't address this atom.
+  status        String   @default("unstated")
+  note          String?
+  createdAt     DateTime @default(now())
+
+  quote         SubcontractQuote @relation(fields: [quoteId], references: [id])
+  scopeAtom     ScopeAtom        @relation(fields: [scopeAtomId], references: [id])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -480,4 +538,79 @@ model KnowledgeAlert {
   createdAt      DateTime @default(now())
 
   organization   Organization @relation(fields: [organizationId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commercial Exceptions (P0-8 fix) — auditable, not a bare boolean.
+// An unsourced rate, an incomplete calculation, or any commercial override
+// must be recorded with who/when/why and (for high-value) director approval.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CommercialException {
+  id              String   @id @default(cuid())
+  organizationId  String
+  estimateLineId  String?
+  entityType      String   // estimate-line | subcontract-quote | assumption
+  entityId        String?
+  type            String   // unsourced-rate | incomplete-calculation | hybrid-without-allocation | missing-quote | other
+  reason          String
+  exposure        Float    @default(0) // GHS value at risk
+  acknowledgedById String?
+  acknowledgedAt  DateTime?
+  approvalRequired Boolean @default(false)
+  approvedById    String?
+  approvedAt      DateTime?
+  createdAt       DateTime @default(now())
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  estimateLine    EstimateLine? @relation(fields: [estimateLineId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Knowledge Loop (P1-12) — actuals → variance → calibration proposal
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ProjectActual {
+  id              String   @id @default(cuid())
+  organizationId  String
+  estimateLineId  String
+  // Actuals captured after execution
+  quantityCompleted Float   @default(0)
+  daysTaken        Float    @default(0)
+  crewSize         Float    @default(0)
+  materialConsumed Float    @default(0)
+  materialCost     Float    @default(0)
+  subcontractFinalCost Float @default(0)
+  // Computed variance (planned vs actual)
+  plannedProductivity Float  @default(0) // qty / crew-day
+  actualProductivity  Float  @default(0)
+  productivityVariance Float @default(0) // (actual - planned) / planned
+  plannedCost      Float    @default(0)
+  actualCost       Float    @default(0)
+  costVariance     Float    @default(0) // (actual - planned) / planned
+  recordedAt       DateTime @default(now())
+  createdAt        DateTime @default(now())
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  estimateLine    EstimateLine @relation(fields: [estimateLineId], references: [id])
+  calibrationProposals CalibrationProposal[]
+}
+
+model CalibrationProposal {
+  id                     String   @id @default(cuid())
+  organizationId         String
+  workDefinitionId       String
+  projectActualId        String?
+  type                   String   // productivity-update | price-update | method-update
+  currentValue           String
+  proposedValue          String
+  rationale              String
+  status                 String   @default("pending") // pending | approved | rejected | applied
+  reviewedById           String?
+  reviewedAt             DateTime?
+  createdAt              DateTime @default(now())
+
+  organization           Organization @relation(fields: [organizationId], references: [id])
+  workDefinition         WorkDefinition @relation(fields: [workDefinitionId], references: [id])
+  projectActual          ProjectActual? @relation(fields: [projectActualId], references: [id])
 }

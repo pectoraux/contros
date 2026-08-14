@@ -1,0 +1,2002 @@
+     1→/**
+     2→ * Contractor OS — Seed Script.
+     3→ *
+     4→ * Run with: `bun run scripts/seed.ts`
+     5→ *
+     6→ * Wipes all rows (dependency-safe order) and seeds a realistic Ghana
+     7→ * construction dataset for the "Adom Construction Ltd" organization.
+     8→ *
+     9→ * The seed exercises every engine in `src/lib/engines`:
+    10→ *  - `priceLine` for each EstimateLine
+    11→ *  - `computeConfidence` for each EstimateLine
+    12→ *  - `computeScopeCompleteness` for the demo opportunity's ScopePackage
+    13→ *  - `reconcileSubcontract` for each SubcontractQuote
+    14→ *
+    15→ * All entity IDs are fixed strings (e.g. `org-1`, `wd-msry-001-v1`) so that
+    16→ * re-running the script is stable and reproducible.
+    17→ */
+    18→
+    19→import { PrismaClient } from '@prisma/client';
+    20→import bcrypt from 'bcryptjs';
+    21→import { config } from 'dotenv';
+    22→config({ path: '/home/z/my-project/.env' });
+    23→import {
+    24→  priceLine,
+    25→  computeConfidence,
+    26→  computeScopeCompleteness,
+    27→  reconcileSubcontract,
+    28→  formatGHS,
+    29→  type CostRecipeLine,
+    30→  type PricingBreakdown,
+    31→} from '../src/lib/engines';
+    32→
+    33→async function hashPassword(plain: string): Promise<string> {
+    34→  return bcrypt.hash(plain, 10);
+    35→}
+    36→
+    37→// ─────────────────────────────────────────────────────────────────────────────
+    38→// Helpers
+    39→// ─────────────────────────────────────────────────────────────────────────────
+    40→
+    41→const DAY_MS = 24 * 60 * 60 * 1000;
+    42→const daysAgo = (n: number): Date => new Date(Date.now() - n * DAY_MS);
+    43→const daysFromNow = (n: number): Date => new Date(Date.now() + n * DAY_MS);
+    44→const iso = (d: Date): string => d.toISOString();
+    45→
+    46→const prisma = new PrismaClient();
+    47→
+    48→/** A recipe line with its associated resource + price observation (for DB seeding). */
+    49→interface RecipeSeed {
+    50→  resourceCode: string;
+    51→  resourceName: string;
+    52→  unit: string;
+    53→  kind: 'material' | 'labour' | 'plant' | 'subcontract' | 'fee';
+    54→  quantityPerUnit: number;
+    55→  price: number;
+    56→  provenance: string;
+    57→  sourceReference?: string;
+    58→  observedAtDaysAgo: number;
+    59→  /** If true, the recipe line will have priceObservation=null (unsourced). */
+    60→  unsourced?: boolean;
+    61→  /** Region override for the Resource row. */
+    62→  region?: string;
+    63→}
+    64→
+    65→/** A WorkDefinition seed with all required version fields + recipe. */
+    66→interface WdSeed {
+    67→  wdId: string;
+    68→  versionId: string;
+    69→  code: string;
+    70→  name: string;
+    71→  category: string;
+    72→  unit: string;
+    73→  wastage: number;
+    74→  productivity: number;
+    75→  hazards: string[];
+    76→  controls: string[];
+    77→  qualityChecklist: string[];
+    78→  ppe: string;
+    79→  permits: string;
+    80→  subcontractability: 'yes' | 'no' | 'partial';
+    81→  methodStatementFragment: string;
+    82→  commonAssumptions: string;
+    83→  commonExclusions: string;
+    84→  recipe: RecipeSeed[];
+    85→}
+    86→
+    87→// ─────────────────────────────────────────────────────────────────────────────
+    88→// Work Definitions (construction-ghana industry pack)
+    89→// ─────────────────────────────────────────────────────────────────────────────
+    90→
+    91→const WORK_DEFINITIONS: WdSeed[] = [
+    92→  // 1. Sandcrete Blockwork
+    93→  {
+    94→    wdId: 'wd-msry-001',
+    95→    versionId: 'wd-msry-001-v1',
+    96→    code: 'WD-MSRY-001',
+    97→    name: '150mm Sandcrete Blockwork in Cement Mortar (1:4)',
+    98→    category: 'masonry',
+    99→    unit: 'm2',
+   100→    wastage: 0.05,
+   101→    productivity: 12,
+   102→    hazards: [
+   103→      'Manual handling injury',
+   104→      'Wall collapse during construction',
+   105→      'Cuts from block handling',
+   106→    ],
+   107→    controls: [
+   108→      'Team lift blocks >20kg',
+   109→      'Prop walls >3m high',
+   110→      'Wear cut-resistant gloves',
+   111→    ],
+   112→    qualityChecklist: [
+   113→      'Courses level and plumb within ±5mm',
+   114→      'Perpends and bed joints filled solid',
+   115→      'Wall tied to columns at every course',
+   116→    ],
+   117→    ppe: 'Hard hat, safety boots, gloves, safety glasses',
+   118→    permits: 'None',
+   119→    subcontractability: 'yes',
+   120→    methodStatementFragment:
+   121→      'Set out blockwork to drawing grid lines. Lay first course level. Build up corners/leads. Fill perpends and bed joints solidly. Maintain plumb and line. Cure blockwork if specified.',
+   122→    commonAssumptions:
+   123→      'Blocks supplied by others unless noted. Mortar mix 1:4 cement:sand.',
+   124→    commonExclusions: 'Plastering, formwork, reinforcement.',
+   125→    recipe: [
+   126→      {
+   127→        resourceCode: 'RES-MAT-BLOCK150',
+   128→        resourceName: 'Hollow sandcrete blocks 150mm',
+   129→        unit: 'no',
+   130→        kind: 'material',
+   131→        quantityPerUnit: 12.5,
+   132→        price: 6.5,
+   133→        provenance: 'supplier-quote',
+   134→        sourceReference: 'BTP-Quote-183',
+   135→        observedAtDaysAgo: 30,
+   136→      },
+   137→      {
+   138→        resourceCode: 'RES-MAT-CEM425',
+   139→        resourceName: 'Cement (42.5R)',
+   140→        unit: 'ton',
+   141→        kind: 'material',
+   142→        quantityPerUnit: 0.035,
+   143→        price: 95.0,
+   144→        provenance: 'invoice',
+   145→        sourceReference: 'INV-982',
+   146→        observedAtDaysAgo: 14,
+   147→      },
+   148→      {
+   149→        resourceCode: 'RES-MAT-SAND',
+   150→        resourceName: 'Sand (sharp)',
+   151→        unit: 'm3',
+   152→        kind: 'material',
+   153→        quantityPerUnit: 0.09,
+   154→        price: 65.0,
+   155→        provenance: 'market-survey',
+   156→        sourceReference: 'MS-Q1-2025',
+   157→        observedAtDaysAgo: 60,
+   158→      },
+   159→      {
+   160→        resourceCode: 'RES-LAB-MASON',
+   161→        resourceName: 'Mason',
+   162→        unit: 'day',
+   163→        kind: 'labour',
+   164→        quantityPerUnit: 0.083,
+   165→        price: 120.0,
+   166→        provenance: 'historical-bid',
+   167→        sourceReference: 'BID-2024-P018',
+   168→        observedAtDaysAgo: 120,
+   169→      },
+   170→      {
+   171→        resourceCode: 'RES-LAB-LABOUR',
+   172→        resourceName: 'Labourer',
+   173→        unit: 'day',
+   174→        kind: 'labour',
+   175→        quantityPerUnit: 0.167,
+   176→        price: 70.0,
+   177→        provenance: 'manual',
+   178→        sourceReference: 'Labour-Policy-v7',
+   179→        observedAtDaysAgo: 90,
+   180→      },
+   181→    ],
+   182→  },
+   183→  // 2. Reinforced Concrete Slab
+   184→  {
+   185→    wdId: 'wd-strc-002',
+   186→    versionId: 'wd-strc-002-v1',
+   187→    code: 'WD-STRC-002',
+   188→    name: 'Reinforced Concrete Slab (250mm, in-situ)',
+   189→    category: 'structural',
+   190→    unit: 'm3',
+   191→    wastage: 0.03,
+   192→    productivity: 4,
+   193→    hazards: ['Formwork failure', 'Rebar impalement', 'Concrete pump strike'],
+   194→    controls: [
+   195→      'Inspect formwork before pour',
+   196→      'Provide rebar caps',
+   197→      'Exclusion zone around pump',
+   198→    ],
+   199→    qualityChecklist: [
+   200→      'Formwork inspected and signed off pre-pour',
+   201→      'Rebar cover checked (25mm)',
+   202→      'Slump test passed (75-125mm)',
+   203→      'Cube samples taken (3 per pour)',
+   204→    ],
+   205→    ppe: 'Hard hat, boots, hi-vis, gloves',
+   206→    permits: 'Hot work permit if welding',
+   207→    subcontractability: 'partial',
+   208→    methodStatementFragment:
+   209→      'Erect and brace formwork to drawing levels. Fix reinforcement with 25mm cover chairs. Cast concrete in lifts not exceeding 1.5m. Vibrate using mechanical poker. Finish surface with power float. Cure with hessian and water for 7 days.',
+   210→    commonAssumptions:
+   211→      'Concrete grade C25 unless noted. Formwork is proprietary system. Rebar fabrication off-site.',
+   212→    commonExclusions: 'Post-tensioning, waterproofing, finishes.',
+   213→    recipe: [
+   214→      {
+   215→        resourceCode: 'RES-MAT-CEM425',
+   216→        resourceName: 'Cement (42.5R)',
+   217→        unit: 'ton',
+   218→        kind: 'material',
+   219→        quantityPerUnit: 0.32,
+   220→        price: 95.0,
+   221→        provenance: 'invoice',
+   222→        sourceReference: 'INV-982',
+   223→        observedAtDaysAgo: 14,
+   224→      },
+   225→      {
+   226→        resourceCode: 'RES-MAT-SAND',
+   227→        resourceName: 'Sand (sharp)',
+   228→        unit: 'm3',
+   229→        kind: 'material',
+   230→        quantityPerUnit: 0.45,
+   231→        price: 65.0,
+   232→        provenance: 'market-survey',
+   233→        sourceReference: 'MS-Q1-2025',
+   234→        observedAtDaysAgo: 60,
+   235→      },
+   236→      {
+   237→        resourceCode: 'RES-MAT-AGG',
+   238→        resourceName: 'Coarse aggregates (3/4")',
+   239→        unit: 'm3',
+   240→        kind: 'material',
+   241→        quantityPerUnit: 0.7,
+   242→        price: 110.0,
+   243→        provenance: 'supplier-quote',
+   244→        sourceReference: 'AST-Quote-211',
+   245→        observedAtDaysAgo: 20,
+   246→      },
+   247→      {
+   248→        resourceCode: 'RES-MAT-REBAR',
+   249→        resourceName: 'Reinforcement steel (Y12/Y16)',
+   250→        unit: 'ton',
+   251→        kind: 'material',
+   252→        quantityPerUnit: 0.09,
+   253→        price: 7800.0,
+   254→        provenance: 'supplier-quote',
+   255→        sourceReference: 'SPL-Quote-1042',
+   256→        observedAtDaysAgo: 10,
+   257→      },
+   258→      {
+   259→        resourceCode: 'RES-MAT-FORM',
+   260→        resourceName: 'Formwork (plywood + props)',
+   261→        unit: 'm2',
+   262→        kind: 'material',
+   263→        quantityPerUnit: 2.5,
+   264→        price: 35.0,
+   265→        provenance: 'historical-bid',
+   266→        sourceReference: 'BID-2024-P022',
+   267→        observedAtDaysAgo: 95,
+   268→      },
+   269→      {
+   270→        resourceCode: 'RES-LAB-MASON',
+   271→        resourceName: 'Mason (concreting)',
+   272→        unit: 'day',
+   273→        kind: 'labour',
+   274→        quantityPerUnit: 0.4,
+   275→        price: 120.0,
+   276→        provenance: 'historical-bid',
+   277→        sourceReference: 'BID-2024-P018',
+   278→        observedAtDaysAgo: 120,
+   279→      },
+   280→      {
+   281→        resourceCode: 'RES-LAB-LABOUR',
+   282→        resourceName: 'Labourer',
+   283→        unit: 'day',
+   284→        kind: 'labour',
+   285→        quantityPerUnit: 0.8,
+   286→        price: 70.0,
+   287→        provenance: 'manual',
+   288→        sourceReference: 'Labour-Policy-v7',
+   289→        observedAtDaysAgo: 90,
+   290→      },
+   291→      {
+   292→        resourceCode: 'RES-PLT-MIXER',
+   293→        resourceName: 'Concrete mixer/pump',
+   294→        unit: 'day',
+   295→        kind: 'plant',
+   296→        quantityPerUnit: 0.08,
+   297→        price: 850.0,
+   298→        provenance: 'supplier-quote',
+   299→        sourceReference: 'HIRE-Quote-2025-04',
+   300→        observedAtDaysAgo: 25,
+   301→      },
+   302→    ],
+   303→  },
+   304→  // 3. Aluminium Roofing
+   305→  {
+   306→    wdId: 'wd-roof-003',
+   307→    versionId: 'wd-roof-003-v1',
+   308→    code: 'WD-ROOF-003',
+   309→    name: 'Aluminium Roofing Sheets (0.5mm, corrugated)',
+   310→    category: 'roofing',
+   311→    unit: 'm2',
+   312→    wastage: 0.07,
+   313→    productivity: 25,
+   314→    hazards: ['Fall from height', 'Sharp edge cuts'],
+   315→    controls: ['Use harness on roof', 'Wear gloves'],
+   316→    qualityChecklist: [
+   317→      'Sheets lapped minimum 1.5 corrugations',
+   318→      'Fixings at every corrugation at eaves/ridge',
+   319→      'Ridge cappings sealed',
+   320→    ],
+   321→    ppe: 'Harness, hard hat, boots, gloves',
+   322→    permits: 'Working-at-height permit',
+   323→    subcontractability: 'yes',
+   324→    methodStatementFragment:
+   325→      'Erect edge protection and harness anchor points. Lay underlay. Fix aluminium sheets starting from eaves, lapping away from prevailing wind. Fix ridges, flashings, and barge boards. Seal all penetrations.',
+   326→    commonAssumptions:
+   327→      'Roof pitch 15° unless noted. Timber battens supplied by others.',
+   328→    commonExclusions: 'Insulation, ceiling, guttering (priced separately).',
+   329→    recipe: [
+   330→      {
+   331→        resourceCode: 'RES-MAT-ALU-ROOF',
+   332→        resourceName: 'Aluminium roofing sheets (0.5mm corrugated)',
+   333→        unit: 'm2',
+   334→        kind: 'material',
+   335→        quantityPerUnit: 1.07,
+   336→        price: 58.0,
+   337→        provenance: 'supplier-quote',
+   338→        sourceReference: 'ALU-Quote-558',
+   339→        observedAtDaysAgo: 18,
+   340→      },
+   341→      {
+   342→        resourceCode: 'RES-MAT-RIDGE',
+   343→        resourceName: 'Aluminium ridge cap',
+   344→        unit: 'm',
+   345→        kind: 'material',
+   346→        quantityPerUnit: 0.12,
+   347→        price: 28.0,
+   348→        provenance: 'supplier-quote',
+   349→        sourceReference: 'ALU-Quote-558',
+   350→        observedAtDaysAgo: 18,
+   351→      },
+   352→      {
+   353→        resourceCode: 'RES-MAT-SCREW',
+   354→        resourceName: 'Roofing screws with EPDM washer',
+   355→        unit: 'no',
+   356→        kind: 'material',
+   357→        quantityPerUnit: 8,
+   358→        price: 0.85,
+   359→        provenance: 'invoice',
+   360→        sourceReference: 'INV-1102',
+   361→        observedAtDaysAgo: 22,
+   362→      },
+   363→      {
+   364→        resourceCode: 'RES-LAB-ROOFER',
+   365→        resourceName: 'Roofer',
+   366→        unit: 'day',
+   367→        kind: 'labour',
+   368→        quantityPerUnit: 0.04,
+   369→        price: 130.0,
+   370→        provenance: 'historical-bid',
+   371→        sourceReference: 'BID-2024-P031',
+   372→        observedAtDaysAgo: 110,
+   373→      },
+   374→    ],
+   375→  },
+   376→  // 4. Plastering
+   377→  {
+   378→    wdId: 'wd-fnsh-004',
+   379→    versionId: 'wd-fnsh-004-v1',
+   380→    code: 'WD-FNSH-004',
+   381→    name: 'Plastering (15mm internal, 1:4)',
+   382→    category: 'finishes',
+   383→    unit: 'm2',
+   384→    wastage: 0.05,
+   385→    productivity: 15,
+   386→    hazards: ['Eye irritation from cement dust', 'Falls from scaffolding'],
+   387→    controls: ['Wear safety glasses when mixing', 'Inspect scaffolding daily'],
+   388→    qualityChecklist: [
+   389→      'Surface plumb within ±3mm',
+   390→      'No hollow-sounding areas',
+   391→      'Cured for 3 days minimum',
+   392→    ],
+   393→    ppe: 'Hard hat, safety glasses, gloves, mask when mixing',
+   394→    permits: 'None',
+   395→    subcontractability: 'yes',
+   396→    methodStatementFragment:
+   397→      'Hack and clean substrate. Apply dash bond coat. Apply undercoat 9-12mm thick, scratch to key. Apply finishing coat 3-6mm. Plumb and level to tolerance. Cure with water spray.',
+   398→    commonAssumptions: 'Mortar mix 1:4 cement:sand. Substrate prepared by others.',
+   399→    commonExclusions: 'Painting, skirting, decorative moulds.',
+   400→    recipe: [
+   401→      {
+   402→        resourceCode: 'RES-MAT-CEM425',
+   403→        resourceName: 'Cement (42.5R)',
+   404→        unit: 'ton',
+   405→        kind: 'material',
+   406→        quantityPerUnit: 0.0095,
+   407→        price: 95.0,
+   408→        provenance: 'invoice',
+   409→        sourceReference: 'INV-982',
+   410→        observedAtDaysAgo: 14,
+   411→      },
+   412→      {
+   413→        resourceCode: 'RES-MAT-SAND-PLAST',
+   414→        resourceName: 'Plaster sand (fine)',
+   415→        unit: 'm3',
+   416→        kind: 'material',
+   417→        quantityPerUnit: 0.018,
+   418→        price: 70.0,
+   419→        provenance: 'market-survey',
+   420→        sourceReference: 'MS-Q1-2025',
+   421→        observedAtDaysAgo: 60,
+   422→      },
+   423→      {
+   424→        resourceCode: 'RES-LAB-PLASTER',
+   425→        resourceName: 'Plasterer',
+   426→        unit: 'day',
+   427→        kind: 'labour',
+   428→        quantityPerUnit: 0.067,
+   429→        price: 130.0,
+   430→        provenance: 'historical-bid',
+   431→        sourceReference: 'BID-2024-P018',
+   432→        observedAtDaysAgo: 120,
+   433→      },
+   434→      {
+   435→        resourceCode: 'RES-LAB-LABOUR',
+   436→        resourceName: 'Labourer',
+   437→        unit: 'day',
+   438→        kind: 'labour',
+   439→        quantityPerUnit: 0.067,
+   440→        price: 70.0,
+   441→        provenance: 'manual',
+   442→        sourceReference: 'Labour-Policy-v7',
+   443→        observedAtDaysAgo: 90,
+   444→      },
+   445→    ],
+   446→  },
+   447→  // 5. Electrical First-Fix Conduiting
+   448→  {
+   449→    wdId: 'wd-elec-005',
+   450→    versionId: 'wd-elec-005-v1',
+   451→    code: 'WD-ELEC-005',
+   452→    name: 'First Fix Electrical Conduiting',
+   453→    category: 'mep',
+   454→    unit: 'm',
+   455→    wastage: 0.1,
+   456→    productivity: 40,
+   457→    hazards: ['Electric shock (existing services)', 'Falls from scaffolding'],
+   458→    controls: [
+   459→      'Isolate existing circuits before working',
+   460→      'Use insulated tools',
+   461→      'Inspect scaffolding daily',
+   462→    ],
+   463→    qualityChecklist: [
+   464→      'Conduit fixed at ≤1m centres',
+   465→      'Pull wire installed for future cables',
+   466→      'Boxes set flush with finished wall',
+   467→    ],
+   468→    ppe: 'Hard hat, safety boots, insulated gloves, safety glasses',
+   469→    permits: 'Electrical isolation permit',
+   470→    subcontractability: 'yes',
+   471→    methodStatementFragment:
+   472→      'Set out conduit runs to electrical layout. Fix PVC conduit to walls/ceilings using saddles at 1m centres. Install switch/socket boxes flush. Pull through draw wire. Cap and label all conduits.',
+   473→    commonAssumptions:
+   474→      'Conduit sizes per electrical design (typically 20mm/25mm). Boxes counted separately.',
+   475→    commonExclusions: 'Cable pulling, fittings, final connections, testing.',
+   476→    recipe: [
+   477→      {
+   478→        resourceCode: 'RES-MAT-CONDUIT',
+   479→        resourceName: 'PVC conduit (20mm)',
+   480→        unit: 'm',
+   481→        kind: 'material',
+   482→        quantityPerUnit: 1.05,
+   483→        price: 4.5,
+   484→        provenance: 'supplier-quote',
+   485→        sourceReference: 'ELEC-Quote-719',
+   486→        observedAtDaysAgo: 12,
+   487→      },
+   488→      {
+   489→        resourceCode: 'RES-MAT-ELEC-ACC',
+   490→        resourceName: 'Electrical accessories (boxes, saddles, fittings)',
+   491→        unit: 'no',
+   492→        kind: 'material',
+   493→        quantityPerUnit: 0.35,
+   494→        price: 8.0,
+   495→        provenance: 'invoice',
+   496→        sourceReference: 'INV-1090',
+   497→        observedAtDaysAgo: 8,
+   498→      },
+   499→      // Electrician labour is intentionally UNSOURCED — this is subcontracted work
+   500→      // and we are awaiting a subcontractor quote.
+   501→      {
+   502→        resourceCode: 'RES-LAB-ELEC',
+   503→        resourceName: 'Electrician',
+   504→        unit: 'day',
+   505→        kind: 'labour',
+   506→        quantityPerUnit: 0.025,
+   507→        price: 0,
+   508→        provenance: 'manual',
+   509→        sourceReference: undefined,
+   510→        observedAtDaysAgo: 0,
+   511→        unsourced: true,
+   512→      },
+   513→    ],
+   514→  },
+   515→  // 6. uPVC Soil & Waste Pipe
+   516→  {
+   517→    wdId: 'wd-plmb-006',
+   518→    versionId: 'wd-plmb-006-v1',
+   519→    code: 'WD-PLMB-006',
+   520→    name: 'uPVC Soil & Waste Pipe Installation (110mm)',
+   521→    category: 'mep',
+   522→    unit: 'm',
+   523→    wastage: 0.05,
+   524→    productivity: 20,
+   525→    hazards: ['Confined space entry', 'Exposure to existing sewage'],
+   526→    controls: ['Provide ventilation', 'Wear respiratory protection in confined spaces'],
+   527→    qualityChecklist: [
+   528→      'Pipe gradient 1:40 minimum (soil)',
+   529→      'Joints solvent-welded and tested',
+   530→      'Pipe sleeves at wall penetrations',
+   531→    ],
+   532→    ppe: 'Hard hat, gloves, safety glasses, mask when solvent welding',
+   533→    permits: 'Hot work permit if connecting to existing',
+   534→    subcontractability: 'yes',
+   535→    methodStatementFragment:
+   536→      'Set out pipe runs to plumbing layout. Fix uPVC pipes to walls/soffits using brackets at 1m centres. Solvent-weld joints. Connect to inspection chambers. Cap ends pending second-fix. Test for leaks.',
+   537→    commonAssumptions: 'Pipe sizes per plumbing design. Inspection chambers by others.',
+   538→    commonExclusions: 'Sanitary fittings, water supply, second-fix connections.',
+   539→    recipe: [
+   540→      {
+   541→        resourceCode: 'RES-MAT-UPVC110',
+   542→        resourceName: 'uPVC soil pipe (110mm)',
+   543→        unit: 'm',
+   544→        kind: 'material',
+   545→        quantityPerUnit: 1.05,
+   546→        price: 32.0,
+   547→        provenance: 'supplier-quote',
+   548→        sourceReference: 'PLMB-Quote-441',
+   549→        observedAtDaysAgo: 15,
+   550→      },
+   551→      {
+   552→        resourceCode: 'RES-MAT-UPVC-FIT',
+   553→        resourceName: 'uPVC fittings (bends, junctions, brackets)',
+   554→        unit: 'no',
+   555→        kind: 'material',
+   556→        quantityPerUnit: 0.4,
+   557→        price: 12.0,
+   558→        provenance: 'invoice',
+   559→        sourceReference: 'INV-1088',
+   560→        observedAtDaysAgo: 10,
+   561→      },
+   562→      {
+   563→        resourceCode: 'RES-LAB-PLUMB',
+   564→        resourceName: 'Plumber',
+   565→        unit: 'day',
+   566→        kind: 'labour',
+   567→        quantityPerUnit: 0.05,
+   568→        price: 140.0,
+   569→        provenance: 'historical-bid',
+   570→        sourceReference: 'BID-2024-P027',
+   571→        observedAtDaysAgo: 100,
+   572→      },
+   573→    ],
+   574→  },
+   575→  // 7. Concrete Paving
+   576→  {
+   577→    wdId: 'wd-extw-007',
+   578→    versionId: 'wd-extw-007-v1',
+   579→    code: 'WD-EXTW-007',
+   580→    name: 'Concrete Paving (100mm, interlocking)',
+   581→    category: 'external',
+   582→    unit: 'm2',
+   583→    wastage: 0.05,
+   584→    productivity: 20,
+   585→    hazards: ['Back injury from lifting pavers', 'Crush injury from plate compactor'],
+   586→    controls: [
+   587→      'Team lift paver pallets',
+   588→      'Use ear defenders near plate compactor',
+   589→      'Maintain exclusion zone around plant',
+   590→    ],
+   591→    qualityChecklist: [
+   592→      'Bedding level within ±5mm',
+   593→      'Joints 3-5mm, filled with fine sand',
+   594→      'Surface compacted and re-checked',
+   595→    ],
+   596→    ppe: 'Hard hat, safety boots, hi-vis, ear defenders, gloves',
+   597→    permits: 'None',
+   598→    subcontractability: 'yes',
+   599→    methodStatementFragment:
+   600→      'Excavate and compact subgrade. Lay 50mm lean concrete base. Spread 25mm bedding sand. Lay interlocking pavers to pattern. Cut edge pavers. Vibrate with plate compactor. Brush kiln-dried sand into joints.',
+   601→    commonAssumptions: 'Subgrade prepared and compacted by others. Paver pattern running bond.',
+   602→    commonExclusions: 'Edging restraints, drainage, sub-base.',
+   603→    recipe: [
+   604→      {
+   605→        resourceCode: 'RES-MAT-PAVER',
+   606→        resourceName: 'Interlocking concrete pavers (100mm)',
+   607→        unit: 'm2',
+   608→        kind: 'material',
+   609→        quantityPerUnit: 1.02,
+   610→        price: 75.0,
+   611→        provenance: 'supplier-quote',
+   612→        sourceReference: 'PAV-Quote-308',
+   613→        observedAtDaysAgo: 14,
+   614→      },
+   615→      {
+   616→        resourceCode: 'RES-MAT-SAND-BED',
+   617→        resourceName: 'Bedding sand',
+   618→        unit: 'm3',
+   619→        kind: 'material',
+   620→        quantityPerUnit: 0.03,
+   621→        price: 65.0,
+   622→        provenance: 'market-survey',
+   623→        sourceReference: 'MS-Q1-2025',
+   624→        observedAtDaysAgo: 60,
+   625→      },
+   626→      {
+   627→        resourceCode: 'RES-MAT-CEM425',
+   628→        resourceName: 'Cement (42.5R)',
+   629→        unit: 'ton',
+   630→        kind: 'material',
+   631→        quantityPerUnit: 0.005,
+   632→        price: 95.0,
+   633→        provenance: 'invoice',
+   634→        sourceReference: 'INV-982',
+   635→        observedAtDaysAgo: 14,
+   636→      },
+   637→      {
+   638→        resourceCode: 'RES-LAB-MASON',
+   639→        resourceName: 'Mason (paving)',
+   640→        unit: 'day',
+   641→        kind: 'labour',
+   642→        quantityPerUnit: 0.05,
+   643→        price: 120.0,
+   644→        provenance: 'historical-bid',
+   645→        sourceReference: 'BID-2024-P018',
+   646→        observedAtDaysAgo: 120,
+   647→      },
+   648→      {
+   649→        resourceCode: 'RES-LAB-LABOUR',
+   650→        resourceName: 'Labourer',
+   651→        unit: 'day',
+   652→        kind: 'labour',
+   653→        quantityPerUnit: 0.1,
+   654→        price: 70.0,
+   655→        provenance: 'manual',
+   656→        sourceReference: 'Labour-Policy-v7',
+   657→        observedAtDaysAgo: 90,
+   658→      },
+   659→    ],
+   660→  },
+   661→];
+   662→
+   663→// ─────────────────────────────────────────────────────────────────────────────
+   664→// Wipe
+   665→// ─────────────────────────────────────────────────────────────────────────────
+   666→
+   667→async function wipeAll(): Promise<void> {
+   668→  console.log('• Wiping existing rows (dependency-safe order)...');
+   669→  // Order matters: children first, then parents.
+   670→  // Note: Bid references Estimate (FK), so Bid must be deleted before Estimate.
+   671→  // ResourcePriceObservation references WorkDefinitionVersion, so it must be deleted
+   672→  // before WorkDefinitionVersion.
+   673→  await prisma.knowledgeAlert.deleteMany();
+   674→  await prisma.auditLog.deleteMany();
+   675→  await prisma.waitlistEntry.deleteMany();
+   676→  await prisma.subcontractQuoteLine.deleteMany();
+   677→  await prisma.subcontractQuote.deleteMany();
+   678→  await prisma.subcontractPackageLine.deleteMany();
+   679→  await prisma.subcontractPackage.deleteMany();
+   680→  await prisma.bid.deleteMany();
+   681→  await prisma.estimateRevision.deleteMany();
+   682→  await prisma.estimateLine.deleteMany();
+   683→  await prisma.estimate.deleteMany();
+   684→  await prisma.scopeEvidence.deleteMany();
+   685→  await prisma.scopeAssumption.deleteMany();
+   686→  await prisma.scopeQuestion.deleteMany();
+   687→  await prisma.scopeItem.deleteMany();
+   688→  await prisma.scopePackage.deleteMany();
+   689→  await prisma.opportunity.deleteMany();
+   690→  await prisma.resourcePriceObservation.deleteMany();
+   691→  await prisma.resource.deleteMany();
+   692→  await prisma.workDefinitionVersion.deleteMany();
+   693→  await prisma.workDefinition.deleteMany();
+   694→  await prisma.user.deleteMany();
+   695→  await prisma.client.deleteMany();
+   696→  await prisma.organization.deleteMany();
+   697→  console.log('  ✓ Wipe complete.');
+   698→}
+   699→
+   700→// ─────────────────────────────────────────────────────────────────────────────
+   701→// Organization, Users, Clients
+   702→// ─────────────────────────────────────────────────────────────────────────────
+   703→
+   704→interface SeedCtx {
+   705→  orgId: string;
+   706→  userIds: { kwesi: string; abena: string; kofi: string };
+   707→  clientIds: {
+   708→    ama: string;
+   709→    ugh: string;
+   710→    zenith: string;
+   711→    presby: string;
+   712→  };
+   713→  /** Map resourceCode → resourceId. */
+   714→  resourceIds: Map<string, string>;
+   715→  /** Map wdId → versionId. */
+   716→  wdVersionIds: Map<string, string>;
+   717→  /** Map wdId → workDefinitionId. */
+   718→  wdIds: Map<string, string>;
+   719→}
+   720→
+   721→async function seedOrganizationAndUsers(): Promise<SeedCtx> {
+   722→  console.log('• Seeding Organization + Users + Clients...');
+   723→
+   724→  const orgId = 'org-1';
+   725→  await prisma.organization.create({
+   726→    data: {
+   727→      id: orgId,
+   728→      name: 'Adom Construction Ltd',
+   729→      industryPackId: 'construction-ghana',
+   730→      currency: 'GHS',
+   731→    },
+   732→  });
+   733→
+   734→  const userIds = {
+   735→    kwesi: 'user-kwesi',
+   736→    abena: 'user-abena',
+   737→    kofi: 'user-kofi',
+   738→    admin: 'user-admin',
+   739→  };
+   740→
+   741→  // Demo accounts share a known password for quick login.
+   742→  const demoPasswordHash = await hashPassword('demo1234');
+   743→
+   744→  // Demo accounts (isDemo=true) — one per role, for quick-login links.
+   745→  await prisma.user.create({
+   746→    data: {
+   747→      id: userIds.kwesi,
+   748→      organizationId: orgId,
+   749→      name: 'Kwesi Mensah',
+   750→      email: 'kwesi@adomconstruction.gh',
+   751→      role: 'director',
+   752→      passwordHash: demoPasswordHash,
+   753→      isDemo: true,
+   754→    },
+   755→  });
+   756→  await prisma.user.create({
+   757→    data: {
+   758→      id: userIds.abena,
+   759→      organizationId: orgId,
+   760→      name: 'Abena Owusu',
+   761→      email: 'abena@adomconstruction.gh',
+   762→      role: 'estimator',
+   763→      passwordHash: demoPasswordHash,
+   764→      isDemo: true,
+   765→    },
+   766→  });
+   767→  await prisma.user.create({
+   768→    data: {
+   769→      id: userIds.kofi,
+   770→      organizationId: orgId,
+   771→      name: 'Kofi Asante',
+   772→      email: 'kofi@adomconstruction.gh',
+   773→      role: 'manager',
+   774→      passwordHash: demoPasswordHash,
+   775→      isDemo: true,
+   776→    },
+   777→  });
+   778→
+   779→  // Real (non-demo) admin account — controls the waitlist.
+   780→  await prisma.user.create({
+   781→    data: {
+   782→      id: userIds.admin,
+   783→      organizationId: orgId,
+   784→      name: 'Admin',
+   785→      email: 'ekontetevi@gmail',
+   786→      role: 'admin',
+   787→      passwordHash: await hashPassword('Payswap123456'),
+   788→      isDemo: false,
+   789→    },
+   790→  });
+   791→
+   792→  const clientIds = {
+   793→    ama: 'client-ama',
+   794→    ugh: 'client-ugh',
+   795→    zenith: 'client-zenith',
+   796→    presby: 'client-presby',
+   797→  };
+   798→
+   799→  await prisma.client.create({
+   800→    data: {
+   801→      id: clientIds.ama,
+   802→      organizationId: orgId,
+   803→      name: 'Accra Metropolitan Assembly',
+   804→      contactName: 'Mr. Yaw Boateng',
+   805→      contactEmail: 'yboateng@ama.gov.gh',
+   806→      contactPhone: '+233 20 123 4567',
+   807→      sector: 'public',
+   808→    },
+   809→  });
+   810→  await prisma.client.create({
+   811→    data: {
+   812→      id: clientIds.ugh,
+   813→      organizationId: orgId,
+   814→      name: 'University of Ghana Estates',
+   815→      contactName: 'Dr. Akosua Tuffour',
+   816→      contactEmail: 'atuffour@ug.edu.gh',
+   817→      contactPhone: '+233 24 456 7890',
+   818→      sector: 'public',
+   819→    },
+   820→  });
+   821→  await prisma.client.create({
+   822→    data: {
+   823→      id: clientIds.zenith,
+   824→      organizationId: orgId,
+   825→      name: 'Zenith Properties Ltd',
+   826→      contactName: 'Mrs. Efua Mensah',
+   827→      contactEmail: 'efua@zenithproperties.com',
+   828→      contactPhone: '+233 27 789 0123',
+   829→      sector: 'private',
+   830→    },
+   831→  });
+   832→  await prisma.client.create({
+   833→    data: {
+   834→      id: clientIds.presby,
+   835→      organizationId: orgId,
+   836→      name: 'Presbyterian Church Ghana',
+   837→      contactName: 'Rev. Daniel Owusu',
+   838→      contactEmail: 'daniel@presbygh.org',
+   839→      contactPhone: '+233 20 345 6789',
+   840→      sector: 'ngo',
+   841→    },
+   842→  });
+   843→
+   844→  console.log('  ✓ 1 organization, 3 users, 4 clients.');
+   845→
+   846→  return {
+   847→    orgId,
+   848→    userIds,
+   849→    clientIds,
+   850→    resourceIds: new Map(),
+   851→    wdVersionIds: new Map(),
+   852→    wdIds: new Map(),
+   853→  };
+   854→}
+   855→
+   856→// ─────────────────────────────────────────────────────────────────────────────
+   857→// Work Definitions + Resources + Price Observations
+   858→// ─────────────────────────────────────────────────────────────────────────────
+   859→
+   860→/** Build the recipe JSON (CostRecipeLine[]) from a WdSeed, embedding priceObservations. */
+   861→function buildRecipeJson(wd: WdSeed): string {
+   862→  const recipe: CostRecipeLine[] = wd.recipe.map((r) => ({
+   863→    resourceKind: r.kind,
+   864→    resourceCode: r.resourceCode,
+   865→    resourceName: r.resourceName,
+   866→    unit: r.unit,
+   867→    quantityPerUnit: r.quantityPerUnit,
+   868→    priceObservation: r.unsourced
+   869→      ? null
+   870→      : {
+   871→          price: r.price,
+   872→          provenance: r.provenance,
+   873→          sourceReference: r.sourceReference,
+   874→          observedAt: iso(daysAgo(r.observedAtDaysAgo)),
+   875→        },
+   876→  }));
+   877→  return JSON.stringify(recipe);
+   878→}
+   879→
+   880→async function seedWorkDefinitions(ctx: SeedCtx): Promise<void> {
+   881→  console.log('• Seeding Work Definitions + Resources + Price Observations...');
+   882→
+   883→  // Track resources so we don't create duplicates (cement appears in multiple WDs).
+   884→  const createdResources = new Set<string>();
+   885→
+   886→  for (const wd of WORK_DEFINITIONS) {
+   887→    // 1. Create the WorkDefinition row (without currentVersionId yet).
+   888→    await prisma.workDefinition.create({
+   889→      data: {
+   890→        id: wd.wdId,
+   891→        organizationId: ctx.orgId,
+   892→        code: wd.code,
+   893→        name: wd.name,
+   894→        industry: 'construction',
+   895→        category: wd.category,
+   896→        unit: wd.unit,
+   897→        approvalState: 'approved',
+   898→      },
+   899→    });
+   900→    ctx.wdIds.set(wd.wdId, wd.wdId);
+   901→
+   902→    // 2. Build the recipe JSON.
+   903→    const costRecipeJson = buildRecipeJson(wd);
+   904→
+   905→    // 3. Create the WorkDefinitionVersion (approved).
+   906→    await prisma.workDefinitionVersion.create({
+   907→      data: {
+   908→        id: wd.versionId,
+   909→        workDefinitionId: wd.wdId,
+   910→        version: 1,
+   911→        measurementRule: `per ${wd.unit}`,
+   912→        costRecipeJson,
+   913→        productivityRule: wd.productivity,
+   914→        crewComposition: 'Standard crew (see method statement)',
+   915→        equipment: wd.recipe.find((r) => r.kind === 'plant')?.resourceName ?? 'Hand tools',
+   916→        wastage: wd.wastage,
+   917→        sequencing: 'Per method statement; sequence to programme.',
+   918→        methodStatementFragment: wd.methodStatementFragment,
+   919→        hazardsJson: JSON.stringify(wd.hazards),
+   920→        controlsJson: JSON.stringify(wd.controls),
+   921→        qualityChecklistJson: JSON.stringify(wd.qualityChecklist),
+   922→        requiredPPE: wd.ppe,
+   923→        requiredPermits: wd.permits,
+   924→        subcontractability: wd.subcontractability,
+   925→        commonAssumptions: wd.commonAssumptions,
+   926→        commonExclusions: wd.commonExclusions,
+   927→        approvalState: 'approved',
+   928→        approvedAt: daysAgo(45),
+   929→        approvedById: ctx.userIds.kwesi,
+   930→      },
+   931→    });
+   932→    ctx.wdVersionIds.set(wd.wdId, wd.versionId);
+   933→
+   934→    // 4. Link WD.currentVersionId.
+   935→    await prisma.workDefinition.update({
+   936→      where: { id: wd.wdId },
+   937→      data: { currentVersionId: wd.versionId },
+   938→    });
+   939→
+   940→    // 5. Create Resource + ResourcePriceObservation for each recipe line.
+   941→    for (const r of wd.recipe) {
+   942→      if (!createdResources.has(r.resourceCode)) {
+   943→        const resourceId = `res-${r.resourceCode.toLowerCase().replace(/_/g, '-')}`;
+   944→        await prisma.resource.create({
+   945→          data: {
+   946→            id: resourceId,
+   947→            organizationId: ctx.orgId,
+   948→            code: r.resourceCode,
+   949→            name: r.resourceName,
+   950→            unit: r.unit,
+   951→            kind: r.kind,
+   952→            currency: 'GHS',
+   953→            region: 'Greater Accra',
+   954→          },
+   955→        });
+   956→        ctx.resourceIds.set(r.resourceCode, resourceId);
+   957→        createdResources.add(r.resourceCode);
+   958→      }
+   959→
+   960→      // Create the price observation (skip if recipe line is unsourced).
+   961→      if (!r.unsourced) {
+   962→        const resourceId = ctx.resourceIds.get(r.resourceCode)!;
+   963→        await prisma.resourcePriceObservation.create({
+   964→          data: {
+   965→            id: `rpo-${wd.versionId}-${r.resourceCode.toLowerCase().replace(/_/g, '-')}`,
+   966→            resourceId,
+   967→            workDefinitionVersionId: wd.versionId,
+   968→            price: r.price,
+   969→            currency: 'GHS',
+   970→            provenance: r.provenance,
+   971→            sourceReference: r.sourceReference ?? null,
+   972→            observedAt: daysAgo(r.observedAtDaysAgo),
+   973→            recordedById: ctx.userIds.abena,
+   974→          },
+   975→        });
+   976→      }
+   977→    }
+   978→  }
+   979→
+   980→  console.log(
+   981→    `  ✓ ${WORK_DEFINITIONS.length} work definitions, ${ctx.resourceIds.size} resources, ${await prisma.resourcePriceObservation.count()} price observations.`,
+   982→  );
+   983→}
+   984→
+   985→// ─────────────────────────────────────────────────────────────────────────────
+   986→// Opportunities
+   987→// ─────────────────────────────────────────────────────────────────────────────
+   988→
+   989→async function seedOpportunities(ctx: SeedCtx): Promise<{
+   990→  classroom: string;
+   991→  bungalows: string;
+   992→  lechall: string;
+   993→  office: string;
+   994→}> {
+   995→  console.log('• Seeding Opportunities...');
+   996→
+   997→  // #1 — Two-Storey Classroom Block (main demo).
+   998→  await prisma.opportunity.create({
+   999→    data: {
+  1000→      id: 'opp-classroom',
+  1001→      organizationId: ctx.orgId,
+  1002→      clientId: ctx.clientIds.ama,
+  1003→      ownerId: ctx.userIds.abena,
+  1004→      title: 'Two-Storey Classroom Block — AMA Basic School',
+  1005→      reference: 'AMA/TEN/2025/014',
+  1006→      status: 'estimating',
+  1007→      source: 'tender-portal',
+  1008→      description:
+  1009→        'Construction of a two-storey 12-classroom block with admin wing, library, and staff room for AMA Basic School. Includes structural works, roofing, finishes, MEP first-fix, and external paving.',
+  1010→      receivedAt: daysAgo(14),
+  1011→      submissionDeadline: daysFromNow(21),
+  1012→      location: 'Accra',
+  1013→    },
+  1014→  });
+  1015→
+  1016→  // #2 — Staff Bungalows (Presbyterian Church).
+  1017→  await prisma.opportunity.create({
+  1018→    data: {
+  1019→      id: 'opp-bungalows',
+  1020→      organizationId: ctx.orgId,
+  1021→      clientId: ctx.clientIds.presby,
+  1022→      ownerId: ctx.userIds.kofi,
+  1023→      title: 'Staff Bungalows (4 Units) — Presbyterian Church',
+  1024→      reference: 'PCG/EST/2025/003',
+  1025→      status: 'internal-review',
+  1026→      source: 'direct',
+  1027→      description:
+  1028→        'Design and construction of 4 units of 3-bedroom staff bungalows for the Presbyterian Church Ghana. Includes site works, drainage, and boundary wall.',
+  1029→      receivedAt: daysAgo(20),
+  1030→      submissionDeadline: daysFromNow(10),
+  1031→      location: 'Kumasi',
+  1032→    },
+  1033→  });
+  1034→
+  1035→  // #3 — Lecture Hall Refurbishment (Univ. of Ghana).
+  1036→  await prisma.opportunity.create({
+  1037→    data: {
+  1038→      id: 'opp-lechall',
+  1039→      organizationId: ctx.orgId,
+  1040→      clientId: ctx.clientIds.ugh,
+  1041→      ownerId: ctx.userIds.abena,
+  1042→      title: 'Lecture Hall Refurbishment — University of Ghana',
+  1043→      reference: 'UG/EST/RFQ/2025/087',
+  1044→      status: 'scope-development',
+  1045→      source: 'tender-portal',
+  1046→      description:
+  1047→        'Refurbishment of an existing 250-seat lecture hall: new ceiling, lighting, HVAC, seating, and finishes. Phased works to be carried out during semester break.',
+  1048→      receivedAt: daysAgo(5),
+  1049→      submissionDeadline: daysFromNow(30),
+  1050→      location: 'Legon, Accra',
+  1051→    },
+  1052→  });
+  1053→
+  1054→  // #4 — Office Complex (Zenith Properties) — submitted/won.
+  1055→  await prisma.opportunity.create({
+  1056→    data: {
+  1057→      id: 'opp-office',
+  1058→      organizationId: ctx.orgId,
+  1059→      clientId: ctx.clientIds.zenith,
+  1060→      ownerId: ctx.userIds.kwesi,
+  1061→      title: 'Office Complex — Zenith Properties',
+  1062→      reference: 'ZP/RFQ/2025/012',
+  1063→      status: 'won',
+  1064→      source: 'referral',
+  1065→      description:
+  1066→        'Construction of a 3-storey grade-A office complex with basement parking, ground-floor retail, and rooftop terrace. Includes structural works, MEP, lifts, and external works.',
+  1067→      receivedAt: daysAgo(60),
+  1068→      submissionDeadline: daysAgo(5),
+  1069→      location: 'Osu, Accra',
+  1070→    },
+  1071→  });
+  1072→
+  1073→  console.log('  ✓ 4 opportunities.');
+  1074→  return {
+  1075→    classroom: 'opp-classroom',
+  1076→    bungalows: 'opp-bungalows',
+  1077→    lechall: 'opp-lechall',
+  1078→    office: 'opp-office',
+  1079→  };
+  1080→}
+  1081→
+  1082→// ─────────────────────────────────────────────────────────────────────────────
+  1083→// Scope Package for Opportunity #1 (classroom block)
+  1084→// ─────────────────────────────────────────────────────────────────────────────
+  1085→
+  1086→interface ScopeCtx {
+  1087→  packageId: string;
+  1088→  itemIds: {
+  1089→    blockwork: string;
+  1090→    slab: string;
+  1091→    roofing: string;
+  1092→    plastering: string;
+  1093→    elecSpec: string;
+  1094→    fireResp: string;
+  1095→  };
+  1096→  completeness: number;
+  1097→}
+  1098→
+  1099→async function seedScopeForClassroom(
+  1100→  ctx: SeedCtx,
+  1101→  oppId: string,
+  1102→): Promise<ScopeCtx> {
+  1103→  console.log('• Seeding Scope Package for Classroom Block opportunity...');
+  1104→
+  1105→  const packageId = 'scope-classroom';
+  1106→  const itemIds = {
+  1107→    blockwork: 'si-cb-block',
+  1108→    slab: 'si-cb-slab',
+  1109→    roofing: 'si-cb-roof',
+  1110→    plastering: 'si-cb-plast',
+  1111→    elecSpec: 'si-cb-elec',
+  1112→    fireResp: 'si-cb-fire',
+  1113→  };
+  1114→
+  1115→  // Create the package (we'll update completeness after items are inserted).
+  1116→  await prisma.scopePackage.create({
+  1117→    data: {
+  1118→      id: packageId,
+  1119→      opportunityId: oppId,
+  1120→      completeness: 0,
+  1121→      origin: 'rfq',
+  1122→    },
+  1123→  });
+  1124→
+  1125→  // 6 scope items: 4 known, 1 missing, 1 ambiguous.
+  1126→  await prisma.scopeItem.create({
+  1127→    data: {
+  1128→      id: itemIds.blockwork,
+  1129→      scopePackageId: packageId,
+  1130→      description: '150mm Sandcrete blockwork to external and internal walls',
+  1131→      category: 'masonry',
+  1132→      origin: 'client',
+  1133→      status: 'known',
+  1134→      confidence: 1.0,
+  1135→    },
+  1136→  });
+  1137→  await prisma.scopeItem.create({
+  1138→    data: {
+  1139→      id: itemIds.slab,
+  1140→      scopePackageId: packageId,
+  1141→      description: 'Reinforced concrete slab (250mm) to first-floor level',
+  1142→      category: 'structural',
+  1143→      origin: 'client',
+  1144→      status: 'known',
+  1145→      confidence: 1.0,
+  1146→    },
+  1147→  });
+  1148→  await prisma.scopeItem.create({
+  1149→    data: {
+  1150→      id: itemIds.roofing,
+  1151→      scopePackageId: packageId,
+  1152→      description: 'Aluminium roofing sheets (0.5mm) to classroom roof',
+  1153→      category: 'roofing',
+  1154→      origin: 'client',
+  1155→      status: 'known',
+  1156→      confidence: 1.0,
+  1157→    },
+  1158→  });
+  1159→  await prisma.scopeItem.create({
+  1160→    data: {
+  1161→      id: itemIds.plastering,
+  1162→      scopePackageId: packageId,
+  1163→      description: '15mm internal plastering to wall surfaces',
+  1164→      category: 'finishes',
+  1165→      origin: 'client',
+  1166→      status: 'known',
+  1167→      confidence: 1.0,
+  1168→    },
+  1169→  });
+  1170→  await prisma.scopeItem.create({
+  1171→    data: {
+  1172→      id: itemIds.elecSpec,
+  1173→      scopePackageId: packageId,
+  1174→      description:
+  1175→        'Electrical specification — light fitting schedule, socket counts, conduit sizes, distribution board schedule',
+  1176→      category: 'mep',
+  1177→      origin: 'estimator',
+  1178→      status: 'missing',
+  1179→      confidence: 0.2,
+  1180→    },
+  1181→  });
+  1182→  await prisma.scopeItem.create({
+  1183→    data: {
+  1184→      id: itemIds.fireResp,
+  1185→      scopePackageId: packageId,
+  1186→      description: 'Fire protection responsibility (client or contractor?)',
+  1187→      category: 'mep',
+  1188→      origin: 'estimator',
+  1189→      status: 'ambiguous',
+  1190→      confidence: 0.4,
+  1191→    },
+  1192→  });
+  1193→
+  1194→  // 3 ScopeQuestions (1 open).
+  1195→  await prisma.scopeQuestion.create({
+  1196→    data: {
+  1197→      id: 'sq-cb-1',
+  1198→      scopePackageId: packageId,
+  1199→      question:
+  1200→        'Does the blockwork specification include structural columns at grid intersections?',
+  1201→      category: 'masonry',
+  1202→      interpretationA: 'Blockwork only — columns priced under RC slab package.',
+  1203→      interpretationB: 'Blockwork includes integral columns.',
+  1204→      selectedInterpretation: 'A',
+  1205→      costImpact: 8500,
+  1206→      programmeImpact: 3,
+  1207→      safetyImpact: 'No change',
+  1208→      contractualImpact: 'Clarifies scope split with concrete package.',
+  1209→      status: 'clarified',
+  1210→      resolution: 'Client confirmed interpretation A on tender clarification call.',
+  1211→    },
+  1212→  });
+  1213→  await prisma.scopeQuestion.create({
+  1214→    data: {
+  1215→      id: 'sq-cb-2',
+  1216→      scopePackageId: packageId,
+  1217→      question:
+  1218→        'Is the contractor responsible for fire detection and alarm system installation?',
+  1219→      category: 'mep',
+  1220→      interpretationA:
+  1221→        'Contractor installs first-fix conduiting only — specialist sub for second-fix.',
+  1222→      interpretationB: 'Contractor delivers full fire alarm system (supply + install + commission).',
+  1223→      selectedInterpretation: null,
+  1224→      costImpact: 32000,
+  1225→      programmeImpact: 14,
+  1226→      safetyImpact: 'Critical for occupancy permit.',
+  1227→      contractualImpact: 'Could shift 6-8% of contract value.',
+  1228→      status: 'open',
+  1229→    },
+  1230→  });
+  1231→  await prisma.scopeQuestion.create({
+  1232→    data: {
+  1233→      id: 'sq-cb-3',
+  1234→      scopePackageId: packageId,
+  1235→      question: 'What is the required concrete grade for the slab (C25 or C30)?',
+  1236→      category: 'structural',
+  1237→      interpretationA: 'C25 (standard for school buildings).',
+  1238→      interpretationB: 'C30 (higher durability for coastal environment).',
+  1239→      selectedInterpretation: 'A',
+  1240→      costImpact: 1800,
+  1241→      programmeImpact: 0,
+  1242→      safetyImpact: 'No change',
+  1243→      contractualImpact: 'Minor cost variance.',
+  1244→      status: 'clarified',
+  1245→      resolution: 'Default to C25 per Ghana Building Code unless noted by structural engineer.',
+  1246→    },
+  1247→  });
+  1248→
+  1249→  // 2 ScopeAssumptions (1 unacknowledged high-risk).
+  1250→  await prisma.scopeAssumption.create({
+  1251→    data: {
+  1252→      id: 'sa-cb-1',
+  1253→      scopePackageId: packageId,
+  1254→      text: 'Site is level and free of obstructions at handover; no demolition required.',
+  1255→      rationale: 'AMA site visit report dated 5 days ago confirmed clear site.',
+  1256→      riskLevel: 'low',
+  1257→      acknowledged: true,
+  1258→    },
+  1259→  });
+  1260→  await prisma.scopeAssumption.create({
+  1261→    data: {
+  1262→      id: 'sa-cb-2',
+  1263→      scopePackageId: packageId,
+  1264→      text: 'Fire alarm system to be supplied and installed by specialist sub-contractor appointed by the client; we will provide first-fix conduiting only.',
+  1265→      rationale:
+  1266→        'Tender drawings are silent on responsibility. Pending clarification (see open question SQ-CB-2).',
+  1267→      riskLevel: 'high',
+  1268→      acknowledged: false,
+  1269→    },
+  1270→  });
+  1271→
+  1272→  // 3 ScopeEvidence records.
+  1273→  await prisma.scopeEvidence.create({
+  1274→    data: {
+  1275→      id: 'se-cb-1',
+  1276→      scopePackageId: packageId,
+  1277→      type: 'rfq',
+  1278→      reference: 'AMA/TEN/2025/014',
+  1279→      summary:
+  1280→        'Tender invitation published on AMA procurement portal. Includes scope of works, drawings list, and submission requirements.',
+  1281→    },
+  1282→  });
+  1283→  await prisma.scopeEvidence.create({
+  1284→    data: {
+  1285→      id: 'se-cb-2',
+  1286→      scopePackageId: packageId,
+  1287→      type: 'drawing',
+  1288→      reference: 'DWG-A-001..A-014',
+  1289→      summary:
+  1290→        'Architectural drawings: site plan, ground floor, first floor, roof plan, 4 elevations, 2 sections. Structural drawings deferred to later issue.',
+  1291→    },
+  1292→  });
+  1293→  await prisma.scopeEvidence.create({
+  1294→    data: {
+  1295→      id: 'se-cb-3',
+  1296→      scopePackageId: packageId,
+  1297→      type: 'specification',
+  1298→      reference: 'SPEC-AMA-2025-v2',
+  1299→      summary:
+  1300→        'Specification notes cover blockwork, concrete, roofing, and finishes. MEP specification marked "TBC" — flagged as scope gap.',
+  1301→    },
+  1302→  });
+  1303→
+  1304→  // Compute scope completeness via the engine.
+  1305→  const completenessResult = computeScopeCompleteness(
+  1306→    [
+  1307→      { description: 'Blockwork', status: 'known' },
+  1308→      { description: 'RC Slab', status: 'known' },
+  1309→      { description: 'Roofing', status: 'known' },
+  1310→      { description: 'Plastering', status: 'known' },
+  1311→      { description: 'Electrical specification', status: 'missing' },
+  1312→      { description: 'Fire protection responsibility', status: 'ambiguous' },
+  1313→    ],
+  1314→    [
+  1315→      { status: 'clarified' },
+  1316→      { status: 'open' },
+  1317→      { status: 'clarified' },
+  1318→    ],
+  1319→  );
+  1320→
+  1321→  console.log(
+  1322→    `  • computeScopeCompleteness → score=${completenessResult.score} (known=${completenessResult.knownCount}, missing=${completenessResult.missingCount}, ambiguous=${completenessResult.ambiguousCount}, openQuestions=${completenessResult.openQuestions})`,
+  1323→  );
+  1324→
+  1325→  await prisma.scopePackage.update({
+  1326→    where: { id: packageId },
+  1327→    data: { completeness: completenessResult.score },
+  1328→  });
+  1329→
+  1330→  console.log('  ✓ 1 scope package, 6 items, 3 questions, 2 assumptions, 3 evidence records.');
+  1331→
+  1332→  return { packageId, itemIds, completeness: completenessResult.score };
+  1333→}
+  1334→
+  1335→// ─────────────────────────────────────────────────────────────────────────────
+  1336→// Estimate + Lines for Opportunity #1 (classroom block)
+  1337→// ─────────────────────────────────────────────────────────────────────────────
+  1338→
+  1339→interface EstimateLineSeed {
+  1340→  wdId: string;
+  1341→  description: string;
+  1342→  quantity: number;
+  1343→  scopeItemId: string | null;
+  1344→  executionStrategy: 'self-perform' | 'subcontract' | 'hybrid' | 'undecided';
+  1345→  /** Optional subcontract quote for pricing (only set when strategy='subcontract' and a quote exists). */
+  1346→  subcontractQuote?: { totalAmount: number; coveragePct: number } | null;
+  1347→  /** Optional override for unsourcedRationale / acknowledged. */
+  1348→  unsourcedRationale?: string;
+  1349→  acknowledged?: boolean;
+  1350→}
+  1351→
+  1352→const CLASSROOM_LINES: EstimateLineSeed[] = [
+  1353→  {
+  1354→    wdId: 'wd-msry-001',
+  1355→    description: '150mm Sandcrete blockwork — external walls',
+  1356→    quantity: 380,
+  1357→    scopeItemId: 'si-cb-block',
+  1358→    executionStrategy: 'self-perform',
+  1359→  },
+  1360→  {
+  1361→    wdId: 'wd-msry-001',
+  1362→    description: '150mm Sandcrete blockwork — internal partitions',
+  1363→    quantity: 220,
+  1364→    scopeItemId: 'si-cb-block',
+  1365→    executionStrategy: 'self-perform',
+  1366→  },
+  1367→  {
+  1368→    wdId: 'wd-strc-002',
+  1369→    description: 'Reinforced concrete slab (250mm) — first-floor',
+  1370→    quantity: 28,
+  1371→    scopeItemId: 'si-cb-slab',
+  1372→    executionStrategy: 'self-perform',
+  1373→  },
+  1374→  {
+  1375→    wdId: 'wd-roof-003',
+  1376→    description: 'Aluminium roofing sheets (0.5mm) — classroom roof',
+  1377→    quantity: 320,
+  1378→    scopeItemId: 'si-cb-roof',
+  1379→    executionStrategy: 'self-perform',
+  1380→  },
+  1381→  {
+  1382→    wdId: 'wd-fnsh-004',
+  1383→    description: '15mm internal plastering — wall surfaces',
+  1384→    quantity: 540,
+  1385→    scopeItemId: 'si-cb-plast',
+  1386→    executionStrategy: 'self-perform',
+  1387→  },
+  1388→  {
+  1389→    wdId: 'wd-elec-005',
+  1390→    description: 'First-fix electrical conduiting — provisional, pending subcontractor quote',
+  1391→    quantity: 480,
+  1392→    scopeItemId: 'si-cb-elec',
+  1393→    executionStrategy: 'subcontract',
+  1394→    // No subcontractQuote — this is the unsourced line.
+  1395→    unsourcedRationale: 'Awaiting subcontractor quote for electrical first-fix',
+  1396→    acknowledged: false,
+  1397→  },
+  1398→];
+  1399→
+  1400→interface LinePricingResult {
+  1401→  lineId: string;
+  1402→  breakdown: PricingBreakdown;
+  1403→  confidence: number;
+  1404→  sellPrice: number;
+  1405→}
+  1406→
+  1407→/** Build a human-readable provenance summary from a PricingBreakdown. */
+  1408→function buildProvenanceSummary(b: PricingBreakdown): string {
+  1409→  if (b.provenance.length === 0) {
+  1410→    if (b.unsourcedResources.length > 0) {
+  1411→      return `UNSOURCED: ${b.unsourcedResources.join(', ')}`;
+  1412→    }
+  1413→    return 'No price provenance recorded.';
+  1414→  }
+  1415→  return b.provenance
+  1416→    .map((p) => {
+  1417→      const refPart = p.sourceReference ? ` #${p.sourceReference}` : '';
+  1418→      return `${p.resourceName}: ${p.provenance}${refPart} @ ${formatGHS(p.price)}`;
+  1419→    })
+  1420→    .join('; ');
+  1421→}
+  1422→
+  1423→/** Compute pricing + confidence for a line and persist it. Returns the line id + breakdown. */
+  1424→async function createEstimateLine(
+  1425→  ctx: SeedCtx,
+  1426→  estimateId: string,
+  1427→  lineSeed: EstimateLineSeed,
+  1428→  scopeCompleteness: number,
+  1429→  lineIndex: number,
+  1430→  estimateCreatedAt: Date,
+  1431→  lineIdPrefix: string,
+  1432→): Promise<LinePricingResult> {
+  1433→  const wdId = ctx.wdIds.get(lineSeed.wdId)!;
+  1434→  const versionId = ctx.wdVersionIds.get(lineSeed.wdId)!;
+  1435→
+  1436→  // Look up the WD version (we need name, unit, wastage, productivity, costRecipeJson).
+  1437→  const wdv = await prisma.workDefinitionVersion.findUnique({
+  1438→    where: { id: versionId },
+  1439→    select: {
+  1440→      version: true,
+  1441→      wastage: true,
+  1442→      productivityRule: true,
+  1443→      costRecipeJson: true,
+  1444→      approvalState: true,
+  1445→      workDefinition: { select: { name: true, unit: true } },
+  1446→    },
+  1447→  });
+  1448→  if (!wdv) throw new Error(`WDV ${versionId} not found`);
+  1449→
+  1450→  // Build the PricingInput.
+  1451→  const breakdown = priceLine({
+  1452→    workDefinitionVersion: {
+  1453→      id: versionId,
+  1454→      name: wdv.workDefinition.name,
+  1455→      version: wdv.version,
+  1456→      unit: wdv.workDefinition.unit,
+  1457→      wastage: wdv.wastage,
+  1458→      productivityRule: wdv.productivityRule ?? undefined,
+  1459→      costRecipeJson: wdv.costRecipeJson,
+  1460→    },
+  1461→    quantity: lineSeed.quantity,
+  1462→    executionStrategy: lineSeed.executionStrategy,
+  1463→    overheadPct: 0.1,
+  1464→    profitPct: 0.12,
+  1465→    contingencyPct: 0.05,
+  1466→    subcontractQuote: lineSeed.subcontractQuote ?? null,
+  1467→  });
+  1468→
+  1469→  // Compute confidence. Use the oldest observedAt in the provenance (or the recipe)
+  1470→  // for the freshness factor.
+  1471→  let observedAtForConfidence: string | null = null;
+  1472→  let provenanceForConfidence: string | null = null;
+  1473→  if (breakdown.provenance.length > 0) {
+  1474→    // Use the oldest observation (most conservative freshness).
+  1475→    const sorted = [...breakdown.provenance].sort(
+  1476→      (a, b) => Date.parse(a.observedAt) - Date.parse(b.observedAt),
+  1477→    );
+  1478→    observedAtForConfidence = sorted[0].observedAt;
+  1479→    provenanceForConfidence = sorted[0].provenance;
+  1480→  }
+  1481→
+  1482→  const confidenceResult = computeConfidence({
+  1483→    observedAt: observedAtForConfidence,
+  1484→    referenceDate: iso(estimateCreatedAt),
+  1485→    priceProvenance: provenanceForConfidence,
+  1486→    workDefinitionApprovalState: wdv.approvalState,
+  1487→    scopeCompleteness,
+  1488→    executionStrategy: lineSeed.executionStrategy,
+  1489→    subcontractQuotePresent:
+  1490→      lineSeed.executionStrategy === 'subcontract'
+  1491→        ? Boolean(lineSeed.subcontractQuote)
+  1492→        : null,
+  1493→    productivityRule: wdv.productivityRule,
+  1494→    quantity: lineSeed.quantity,
+  1495→    unit: wdv.workDefinition.unit,
+  1496→  });
+  1497→
+  1498→  const lineId = `${lineIdPrefix}-${lineIndex + 1}`;
+  1499→  await prisma.estimateLine.create({
+  1500→    data: {
+  1501→      id: lineId,
+  1502→      estimateId,
+  1503→      scopeItemId: lineSeed.scopeItemId,
+  1504→      workDefinitionId: wdId,
+  1505→      workDefinitionVersionId: versionId,
+  1506→      description: lineSeed.description,
+  1507→      quantity: lineSeed.quantity,
+  1508→      unit: wdv.workDefinition.unit,
+  1509→      executionStrategy: lineSeed.executionStrategy,
+  1510→      materialCost: breakdown.material,
+  1511→      labourCost: breakdown.labour,
+  1512→      plantCost: breakdown.plant,
+  1513→      subcontractCost: breakdown.subcontract,
+  1514→      directCost: breakdown.directCost,
+  1515→      projectCost: breakdown.projectCost,
+  1516→      riskCost: breakdown.riskCost,
+  1517→      overheadCost: breakdown.overhead,
+  1518→      profitCost: breakdown.profit,
+  1519→      sellPrice: breakdown.sellPrice,
+  1520→      unitRate: breakdown.unitRate,
+  1521→      marginPct: breakdown.marginPct,
+  1522→      confidence: confidenceResult.score,
+  1523→      provenanceSummary: buildProvenanceSummary(breakdown),
+  1524→      isUnsourced: breakdown.unsourced,
+  1525→      unsourcedRationale: breakdown.unsourced
+  1526→        ? (lineSeed.unsourcedRationale ?? `Unsourced resources: ${breakdown.unsourcedResources.join(', ')}`)
+  1527→        : null,
+  1528→      acknowledged: breakdown.unsourced
+  1529→        ? (lineSeed.acknowledged ?? false)
+  1530→        : true,
+  1531→    },
+  1532→  });
+  1533→
+  1534→  return {
+  1535→    lineId,
+  1536→    breakdown,
+  1537→    confidence: confidenceResult.score,
+  1538→    sellPrice: breakdown.sellPrice,
+  1539→  };
+  1540→}
+  1541→
+  1542→interface ClassroomEstimateResult {
+  1543→  estimateId: string;
+  1544→  lines: LinePricingResult[];
+  1545→  totalSellPrice: number;
+  1546→}
+  1547→
+  1548→async function seedEstimateForClassroom(
+  1549→  ctx: SeedCtx,
+  1550→  oppId: string,
+  1551→  scope: ScopeCtx,
+  1552→): Promise<ClassroomEstimateResult> {
+  1553→  console.log('• Seeding Estimate + EstimateLines for Classroom Block...');
+  1554→
+  1555→  const estimateId = 'est-classroom';
+  1556→  const createdAt = daysAgo(3);
+  1557→  await prisma.estimate.create({
+  1558→    data: {
+  1559→      id: estimateId,
+  1560→      organizationId: ctx.orgId,
+  1561→      opportunityId: oppId,
+  1562→      version: 1,
+  1563→      status: 'draft',
+  1564→      overheadPct: 0.1,
+  1565→      profitPct: 0.12,
+  1566→      contingencyPct: 0.05,
+  1567→    },
+  1568→  });
+  1569→
+  1570→  const lines: LinePricingResult[] = [];
+  1571→  for (let i = 0; i < CLASSROOM_LINES.length; i++) {
+  1572→    const seed = CLASSROOM_LINES[i];
+  1573→    const result = await createEstimateLine(
+  1574→      ctx,
+  1575→      estimateId,
+  1576→      seed,
+  1577→      scope.completeness,
+  1578→      i,
+  1579→      createdAt,
+  1580→      'el-classroom',
+  1581→    );
+  1582→    lines.push(result);
+  1583→    console.log(
+  1584→      `  • Line ${i + 1}: "${seed.description}" — sell=${formatGHS(result.sellPrice)} unitRate=${formatGHS(result.breakdown.unitRate)} confidence=${result.confidence.toFixed(4)} unsourced=${result.breakdown.unsourced}`,
+  1585→    );
+  1586→  }
+  1587→
+  1588→  const totalSellPrice = lines.reduce((s, l) => s + l.sellPrice, 0);
+  1589→  console.log(`  ✓ Estimate total sell price: ${formatGHS(totalSellPrice)} (${lines.length} lines).`);
+  1590→
+  1591→  return { estimateId, lines, totalSellPrice };
+  1592→}
+  1593→
+  1594→// ─────────────────────────────────────────────────────────────────────────────
+  1595→// Subcontract Package + Quotes for Opportunity #1
+  1596→// ─────────────────────────────────────────────────────────────────────────────
+  1597→
+  1598→async function seedSubcontractForClassroom(
+  1599→  ctx: SeedCtx,
+  1600→  oppId: string,
+  1601→  estimate: ClassroomEstimateResult,
+  1602→): Promise<void> {
+  1603→  console.log('• Seeding Subcontract Package + Quotes for Classroom Block...');
+  1604→
+  1605→  const packageId = 'subp-classroom-elec';
+  1606→  await prisma.subcontractPackage.create({
+  1607→    data: {
+  1608→      id: packageId,
+  1609→      organizationId: ctx.orgId,
+  1610→      opportunityId: oppId,
+  1611→      name: 'Electrical First-Fix & Conduiting',
+  1612→      scope:
+  1613→        'Supply and installation of all first-fix electrical conduiting, switch/socket boxes, and pull-wires to classroom block. Excludes final electrical specification (light fittings, sockets, distribution boards).',
+  1614→      executionStrategy: 'subcontract',
+  1615→      status: 'quotes-received',
+  1616→      selectedQuoteId: null, // Intentionally unselected → triggers gate blocker.
+  1617→    },
+  1618→  });
+  1619→
+  1620→  // Link the electrical estimate line to the package.
+  1621→  const elecLine = estimate.lines.find(
+  1622→    (l) => l.lineId === 'el-classroom-6',
+  1623→  );
+  1624→  if (!elecLine) throw new Error('Electrical estimate line not found');
+  1625→
+  1626→  const packageLineId = 'subpl-classroom-elec-1';
+  1627→  await prisma.subcontractPackageLine.create({
+  1628→    data: {
+  1629→      id: packageLineId,
+  1630→      subcontractPackageId: packageId,
+  1631→      estimateLineId: elecLine.lineId,
+  1632→      requiredScope:
+  1633→        'First-fix electrical conduiting (480m PVC conduit, switch/socket boxes, pull-wires) per tender drawings DWG-E-001..E-004.',
+  1634→    },
+  1635→  });
+  1636→
+  1637→  // Quote A — VoltTech Electricals Ltd.
+  1638→  const requiredLines = [
+  1639→    {
+  1640→      id: elecLine.lineId,
+  1641→      description: 'First-fix electrical conduiting',
+  1642→      sellPrice: elecLine.sellPrice,
+  1643→    },
+  1644→  ];
+  1645→
+  1646→  const quoteAExclusions = ['Scaffolding', 'Delivery to site', 'Installation at level 3'];
+  1647→  const quoteAAssumptions = ['Quotation valid 30 days', 'Excludes VAT'];
+  1648→
+  1649→  const reconA = reconcileSubcontract({
+  1650→    requiredLines,
+  1651→    quote: {
+  1652→      totalAmount: 18500,
+  1653→      exclusionsJson: JSON.stringify(quoteAExclusions),
+  1654→      assumptionsJson: JSON.stringify(quoteAAssumptions),
+  1655→      // No line detail — whole-quote heuristic.
+  1656→    },
+  1657→  });
+  1658→
+  1659→  console.log(
+  1660→    `  • Quote A (VoltTech): coveragePct=${reconA.coveragePct} status=${reconA.status} warnings=${reconA.warnings.length}`,
+  1661→  );
+  1662→
+  1663→  await prisma.subcontractQuote.create({
+  1664→    data: {
+  1665→      id: 'subq-classroom-volttech',
+  1666→      subcontractPackageId: packageId,
+  1667→      supplierName: 'VoltTech Electricals Ltd',
+  1668→      totalAmount: 18500,
+  1669→      currency: 'GHS',
+  1670→      receivedAt: daysAgo(2),
+  1671→      exclusionsJson: JSON.stringify(quoteAExclusions),
+  1672→      assumptionsJson: JSON.stringify(quoteAAssumptions),
+  1673→      coveragePct: reconA.coveragePct,
+  1674→      status: 'received',
+  1675→    },
+  1676→  });
+  1677→
+  1678→  // Quote B — PowerLine Solutions.
+  1679→  const reconB = reconcileSubcontract({
+  1680→    requiredLines,
+  1681→    quote: {
+  1682→      totalAmount: 21000,
+  1683→      exclusionsJson: JSON.stringify([]),
+  1684→      assumptionsJson: JSON.stringify(['Includes delivery']),
+  1685→    },
+  1686→  });
+  1687→
+  1688→  console.log(
+  1689→    `  • Quote B (PowerLine): coveragePct=${reconB.coveragePct} status=${reconB.status}`,
+  1690→  );
+  1691→
+  1692→  // Force coveragePct = 1.0 per spec.
+  1693→  await prisma.subcontractQuote.create({
+  1694→    data: {
+  1695→      id: 'subq-classroom-powerline',
+  1696→      subcontractPackageId: packageId,
+  1697→      supplierName: 'PowerLine Solutions',
+  1698→      totalAmount: 21000,
+  1699→      currency: 'GHS',
+  1700→      receivedAt: daysAgo(1),
+  1701→      exclusionsJson: JSON.stringify([]),
+  1702→      assumptionsJson: JSON.stringify(['Includes delivery']),
+  1703→      coveragePct: 1.0,
+  1704→      status: 'received',
+  1705→    },
+  1706→  });
+  1707→
+  1708→  console.log('  ✓ 1 subcontract package, 2 quotes (UNSELECTED).');
+  1709→}
+  1710→
+  1711→// ─────────────────────────────────────────────────────────────────────────────
+  1712→// Audit Logs for Opportunity #1
+  1713→// ─────────────────────────────────────────────────────────────────────────────
+  1714→
+  1715→async function seedAuditLogsForClassroom(
+  1716→  ctx: SeedCtx,
+  1717→  oppId: string,
+  1718→  estimate: ClassroomEstimateResult,
+  1719→): Promise<void> {
+  1720→  console.log('• Seeding Audit Logs for Classroom Block...');
+  1721→
+  1722→  const elecLine = estimate.lines.find((l) => l.lineId === 'el-classroom-6')!;
+  1723→  const blockLine = estimate.lines.find((l) => l.lineId === 'el-classroom-1')!;
+  1724→
+  1725→  const entries = [
+  1726→    {
+  1727→      id: 'al-cb-1',
+  1728→      actorId: ctx.userIds.abena,
+  1729→      action: 'opportunity.created',
+  1730→      entityType: 'Opportunity',
+  1731→      entityId: oppId,
+  1732→      summary: 'Imported opportunity from AMA tender portal.',
+  1733→      createdAt: daysAgo(14),
+  1734→    },
+  1735→    {
+  1736→      id: 'al-cb-2',
+  1737→      actorId: ctx.userIds.abena,
+  1738→      action: 'scope.question-raised',
+  1739→      entityType: 'ScopeQuestion',
+  1740→      entityId: 'sq-cb-2',
+  1741→      summary:
+  1742→        'Raised open question on fire alarm system responsibility (cost impact ~GHS 32,000).',
+  1743→      createdAt: daysAgo(10),
+  1744→    },
+  1745→    {
+  1746→      id: 'al-cb-3',
+  1747→      actorId: ctx.userIds.abena,
+  1748→      action: 'assumption.added',
+  1749→      entityType: 'ScopeAssumption',
+  1750→      entityId: 'sa-cb-2',
+  1751→      summary:
+  1752→        'High-risk assumption logged: fire alarm system assumed client-appointed specialist sub.',
+  1753→      createdAt: daysAgo(9),
+  1754→    },
+  1755→    {
+  1756→      id: 'al-cb-4',
+  1757→      actorId: ctx.userIds.abena,
+  1758→      action: 'estimate.created',
+  1759→      entityType: 'Estimate',
+  1760→      entityId: estimate.estimateId,
+  1761→      summary: `Created estimate v1 with ${estimate.lines.length} lines. Total sell: ${formatGHS(estimate.totalSellPrice)}.`,
+  1762→      beforeJson: null,
+  1763→      afterJson: JSON.stringify({ lineCount: estimate.lines.length, totalSell: estimate.totalSellPrice }),
+  1764→      createdAt: daysAgo(3),
+  1765→    },
+  1766→    {
+  1767→      id: 'al-cb-5',
+  1768→      actorId: ctx.userIds.abena,
+  1769→      action: 'rate.changed',
+  1770→      entityType: 'EstimateLine',
+  1771→      entityId: blockLine.lineId,
+  1772→      summary: `Blockwork unit rate set to ${formatGHS(blockLine.breakdown.unitRate)}/m² (cement invoice #INV-982 driven).`,
+  1773→      beforeJson: JSON.stringify({ unitRate: 0 }),
+  1774→      afterJson: JSON.stringify({ unitRate: blockLine.breakdown.unitRate }),
+  1775→      createdAt: daysAgo(2),
+  1776→    },
+  1777→    {
+  1778→      id: 'al-cb-6',
+  1779→      actorId: ctx.userIds.kofi,
+  1780→      action: 'subcontract.quote-received',
+  1781→      entityType: 'SubcontractQuote',
+  1782→      entityId: 'subq-classroom-volttech',
+  1783→      summary:
+  1784→        'VoltTech Electricals Ltd submitted quote @ GHS 18,500 (excludes scaffolding, delivery, level 3 works).',
+  1785→      createdAt: daysAgo(2),
+  1786→    },
+  1787→    {
+  1788→      id: 'al-cb-7',
+  1789→      actorId: ctx.userIds.kofi,
+  1790→      action: 'subcontract.quote-received',
+  1791→      entityType: 'SubcontractQuote',
+  1792→      entityId: 'subq-classroom-powerline',
+  1793→      summary: 'PowerLine Solutions submitted quote @ GHS 21,000 (includes delivery).',
+  1794→      createdAt: daysAgo(1),
+  1795→    },
+  1796→    {
+  1797→      id: 'al-cb-8',
+  1798→      actorId: ctx.userIds.abena,
+  1799→      action: 'estimate.line-flagged',
+  1800→      entityType: 'EstimateLine',
+  1801→      entityId: elecLine.lineId,
+  1802→      summary:
+  1803→        'Electrical first-fix line flagged as UNSOURCED — awaiting subcontractor quote selection. Acknowledged=false.',
+  1804→      createdAt: daysAgo(1),
+  1805→    },
+  1806→  ];
+  1807→
+  1808→  for (const e of entries) {
+  1809→    await prisma.auditLog.create({ data: { ...e, organizationId: ctx.orgId } });
+  1810→  }
+  1811→
+  1812→  console.log(`  ✓ ${entries.length} audit log entries.`);
+  1813→}
+  1814→
+  1815→// ─────────────────────────────────────────────────────────────────────────────
+  1816→// Estimate + Revision + Bid for Opportunity #4 (won)
+  1817→// ─────────────────────────────────────────────────────────────────────────────
+  1818→
+  1819→const OFFICE_LINES: EstimateLineSeed[] = [
+  1820→  {
+  1821→    wdId: 'wd-msry-001',
+  1822→    description: '150mm Sandcrete blockwork — external & internal walls',
+  1823→    quantity: 250,
+  1824→    scopeItemId: null,
+  1825→    executionStrategy: 'self-perform',
+  1826→  },
+  1827→  {
+  1828→    wdId: 'wd-strc-002',
+  1829→    description: 'Reinforced concrete slab (250mm) — 3 floors',
+  1830→    quantity: 18,
+  1831→    scopeItemId: null,
+  1832→    executionStrategy: 'self-perform',
+  1833→  },
+  1834→  {
+  1835→    wdId: 'wd-roof-003',
+  1836→    description: 'Aluminium roofing sheets (0.5mm) — main roof',
+  1837→    quantity: 210,
+  1838→    scopeItemId: null,
+  1839→    executionStrategy: 'self-perform',
+  1840→  },
+  1841→  {
+  1842→    wdId: 'wd-fnsh-004',
+  1843→    description: '15mm internal plastering — all walls',
+  1844→    quantity: 360,
+  1845→    scopeItemId: null,
+  1846→    executionStrategy: 'self-perform',
+  1847→  },
+  1848→  {
+  1849→    wdId: 'wd-extw-007',
+  1850→    description: 'Concrete paving (100mm) — car park & walkways',
+  1851→    quantity: 85,
+  1852→    scopeItemId: null,
+  1853→    executionStrategy: 'self-perform',
+  1854→  },
+  1855→];
+  1856→
+  1857→async function seedEstimateAndBidForOffice(
+  1858→  ctx: SeedCtx,
+  1859→  oppId: string,
+  1860→): Promise<void> {
+  1861→  console.log('• Seeding Estimate + Revision + Bid for Office Complex (won)...');
+  1862→
+  1863→  const estimateId = 'est-office';
+  1864→  const createdAt = daysAgo(35);
+  1865→  await prisma.estimate.create({
+  1866→    data: {
+  1867→      id: estimateId,
+  1868→      organizationId: ctx.orgId,
+  1869→      opportunityId: oppId,
+  1870→      version: 1,
+  1871→      status: 'submitted',
+  1872→      overheadPct: 0.1,
+  1873→      profitPct: 0.12,
+  1874→      contingencyPct: 0.05,
+  1875→    },
+  1876→  });
+  1877→
+  1878→  const lines: LinePricingResult[] = [];
+  1879→  for (let i = 0; i < OFFICE_LINES.length; i++) {
+  1880→    const result = await createEstimateLine(
+  1881→      ctx,
+  1882→      estimateId,
+  1883→      OFFICE_LINES[i],
+  1884→      0.85, // assumed scope completeness for the won opp (not in our scope model)
+  1885→      i,
+  1886→      createdAt,
+  1887→      'el-office',
+  1888→    );
+  1889→    lines.push(result);
+  1890→    console.log(
+  1891→      `  • Line ${i + 1}: "${OFFICE_LINES[i].description}" — sell=${formatGHS(result.sellPrice)}`,
+  1892→    );
+  1893→  }
+  1894→
+  1895→  const finalPrice = lines.reduce((s, l) => s + l.sellPrice, 0);
+  1896→  console.log(`  • Final bid price: ${formatGHS(finalPrice)}.`);
+  1897→
+  1898→  // EstimateRevision — immutable snapshot of the lines submitted.
+  1899→  const snapshot = {
+  1900→    estimateId,
+  1901→    finalizedAt: iso(daysAgo(8)),
+  1902→    overheadPct: 0.1,
+  1903→    profitPct: 0.12,
+  1904→    contingencyPct: 0.05,
+  1905→    lines: lines.map((l, i) => ({
+  1906→      index: i + 1,
+  1907→      lineId: l.lineId,
+  1908→      description: OFFICE_LINES[i].description,
+  1909→      quantity: OFFICE_LINES[i].quantity,
+  1910→      unitRate: l.breakdown.unitRate,
+  1911→      sellPrice: l.sellPrice,
+  1912→      material: l.breakdown.material,
+  1913→      labour: l.breakdown.labour,
+  1914→      plant: l.breakdown.plant,
+  1915→      subcontract: l.breakdown.subcontract,
+  1916→    })),
+  1917→    totalSellPrice: finalPrice,
+  1918→  };
+  1919→
+  1920→  const revisionId = 'rev-office-1';
+  1921→  await prisma.estimateRevision.create({
+  1922→    data: {
+  1923→      id: revisionId,
+  1924→      estimateId,
+  1925→      revisionNo: 1,
+  1926→      snapshotJson: JSON.stringify(snapshot),
+  1927→      finalizedAt: daysAgo(8),
+  1928→      finalizedById: ctx.userIds.kwesi,
+  1929→    },
+  1930→  });
+  1931→
+  1932→  // Mark estimate as superseded (the revision is the immutable snapshot).
+  1933→  // Actually keep it as 'submitted' since that was the submitted state.
+  1934→
+  1935→  // Bid — outcome=won.
+  1936→  await prisma.bid.create({
+  1937→    data: {
+  1938→      id: 'bid-office',
+  1939→      organizationId: ctx.orgId,
+  1940→      opportunityId: oppId,
+  1941→      estimateId,
+  1942→      estimateRevisionId: revisionId,
+  1943→      tenderPackStatus: 'submitted',
+  1944→      finalPrice,
+  1945→      directorAdjustment: -2500,
+  1946→      adjustmentRationale:
+  1947→        'Director shaved GHS 2,500 off final price to match competitor intelligence.',
+  1948→      submittedAt: daysAgo(8),
+  1949→      outcome: 'won',
+  1950→      winningPrice: finalPrice - 2500,
+  1951→      ourRank: 1,
+  1952→      clientFeedback:
+  1953→        'Strong technical submission and competitive pricing. Award letter received.',
+  1954→    },
+  1955→  });
+  1956→
+  1957→  console.log('  ✓ 1 estimate, 1 revision, 1 bid (outcome=won).');
+  1958→}
+  1959→
+  1960→// ─────────────────────────────────────────────────────────────────────────────
+  1961→// Knowledge Alerts
+  1962→// ─────────────────────────────────────────────────────────────────────────────
+  1963→
+  1964→async function seedKnowledgeAlerts(ctx: SeedCtx): Promise<void> {
+  1965→  console.log('• Seeding Knowledge Alerts...');
+  1966→
+  1967→  const cementResourceId = ctx.resourceIds.get('RES-MAT-CEM425');
+  1968→
+  1969→  const alerts = [
+  1970→    {
+  1971→      id: 'ka-stale-cem',
+  1972→      type: 'stale-price',
+  1973→      severity: 'warning',
+  1974→      title: 'Cement price observation is 120+ days old',
+  1975→      detail:
+  1976→        'Cement (42.5R) price of GHS 95.00/ton was last observed 120+ days ago (provenance: historical-bid BID-2024-P018). Re-validate with current supplier quote before next bid submission.',
+  1977→      entityId: cementResourceId ?? null,
+  1978→      entityType: 'Resource',
+  1979→      acknowledged: false,
+  1980→    },
+  1981→    {
+  1982→      id: 'ka-prod-var',
+  1983→      type: 'productivity-variance',
+  1984→      severity: 'warning',
+  1985→      title: 'Blockwork productivity variance >20% on last 3 projects',
+  1986→      detail:
+  1987→        'Sandcrete blockwork productivity assumed at 12 m²/crew-day. Actuals on BID-2024-P018, BID-2024-P022, and BID-2024-P031 averaged 9.4 m²/crew-day (variance: -22%). Consider revising the approved WorkDefinition.',
+  1988→      entityId: 'wd-msry-001-v1',
+  1989→      entityType: 'WorkDefinitionVersion',
+  1990→      acknowledged: false,
+  1991→    },
+  1992→    {
+  1993→      id: 'ka-unapproved-rate',
+  1994→      type: 'unapproved-rate',
+  1995→      severity: 'warning',
+  1996→      title: '3 estimate lines use unapproved work definitions',
+  1997→      detail:
+  1998→        '3 estimate lines reference work-definition versions still in draft approval state. Submit for approval before bid submission to avoid pre-submission gate blockers.',
+  1999→      entityId: null,
+  2000→      entityType: null,
+
+[showing lines 1-2000 of 2115; use offset=2001 with limit to continue reading]

@@ -26,8 +26,10 @@ import {
   computeScopeCompleteness,
   reconcileSubcontract,
   formatGHS,
+  round2,
   type CostRecipeLine,
   type PricingBreakdown,
+  type ExecutionSegmentInput,
 } from '../src/lib/engines';
 
 async function hashPassword(plain: string): Promise<string> {
@@ -670,6 +672,19 @@ async function wipeAll(): Promise<void> {
   // Note: Bid references Estimate (FK), so Bid must be deleted before Estimate.
   // ResourcePriceObservation references WorkDefinitionVersion, so it must be deleted
   // before WorkDefinitionVersion.
+  // P0-4..P0-8: new tables must be wiped BEFORE their parent tables.
+  //   - calibrationProposal → projectActual, workDefinition
+  //   - projectActual → estimateLine
+  //   - commercialException → estimateLine
+  //   - executionSegment → estimateLine
+  //   - quoteScopeCoverage → subcontractQuote, scopeAtom
+  //   - scopeAtom → subcontractPackage
+  await prisma.calibrationProposal.deleteMany();
+  await prisma.projectActual.deleteMany();
+  await prisma.commercialException.deleteMany();
+  await prisma.executionSegment.deleteMany();
+  await prisma.quoteScopeCoverage.deleteMany();
+  await prisma.scopeAtom.deleteMany();
   await prisma.knowledgeAlert.deleteMany();
   await prisma.auditLog.deleteMany();
   await prisma.waitlistEntry.deleteMany();
@@ -1347,6 +1362,19 @@ interface EstimateLineSeed {
   /** Optional override for unsourcedRationale / acknowledged. */
   unsourcedRationale?: string;
   acknowledged?: boolean;
+  /** Optional execution segments for hybrid strategy (P0-5). */
+  executionSegments?: ExecutionSegmentSeed[];
+}
+
+/** Seed-side execution segment (includes scopeDefinition for persistence). */
+interface ExecutionSegmentSeed {
+  strategy: 'self-perform' | 'subcontract';
+  /** 0..1 share of the line's quantity. */
+  quantityPct: number;
+  /** Human-readable scope definition (persisted on ExecutionSegment). */
+  scopeDefinition: string;
+  /** Optional mock subcontract quote for pricing (P0-5 hybrid). */
+  subcontractQuote?: { totalAmount: number; coveragePct: number } | null;
 }
 
 const CLASSROOM_LINES: EstimateLineSeed[] = [
@@ -1355,7 +1383,24 @@ const CLASSROOM_LINES: EstimateLineSeed[] = [
     description: '150mm Sandcrete blockwork — external walls',
     quantity: 380,
     scopeItemId: 'si-cb-block',
-    executionStrategy: 'self-perform',
+    // P0-5: hybrid strategy — explicit execution segments (no 50% heuristic).
+    executionStrategy: 'hybrid',
+    executionSegments: [
+      {
+        strategy: 'self-perform',
+        quantityPct: 0.7,
+        scopeDefinition: 'External wall blockwork (self-perform crew)',
+      },
+      {
+        strategy: 'subcontract',
+        quantityPct: 0.3,
+        scopeDefinition: 'Specialist blockwork at level 3 (subcontractor)',
+        // Mock subcontract quote so the hybrid line stays 'complete'.
+        // The DB ExecutionSegment.subcontractQuoteId stays null for MVP (no
+        // real SubcontractQuote row is linked).
+        subcontractQuote: { totalAmount: 5000, coveragePct: 1.0 },
+      },
+    ],
   },
   {
     wdId: 'wd-msry-001',
@@ -1447,7 +1492,14 @@ async function createEstimateLine(
   });
   if (!wdv) throw new Error(`WDV ${versionId} not found`);
 
-  // Build the PricingInput.
+  // Build the PricingInput. P0-5: pass executionSegments for hybrid strategy.
+  const executionSegmentInputs: ExecutionSegmentInput[] | undefined =
+    lineSeed.executionSegments?.map((s) => ({
+      strategy: s.strategy,
+      quantityPct: s.quantityPct,
+      subcontractQuote: s.subcontractQuote ?? null,
+    }));
+
   const breakdown = priceLine({
     workDefinitionVersion: {
       id: versionId,
@@ -1460,6 +1512,7 @@ async function createEstimateLine(
     },
     quantity: lineSeed.quantity,
     executionStrategy: lineSeed.executionStrategy,
+    executionSegments: executionSegmentInputs,
     overheadPct: 0.1,
     profitPct: 0.12,
     contingencyPct: 0.05,
@@ -1507,6 +1560,9 @@ async function createEstimateLine(
       quantity: lineSeed.quantity,
       unit: wdv.workDefinition.unit,
       executionStrategy: lineSeed.executionStrategy,
+      // P0-4: calculation status + blocking inputs persisted.
+      calculationStatus: breakdown.calculationStatus,
+      blockingInputsJson: JSON.stringify(breakdown.blockingInputs),
       materialCost: breakdown.material,
       labourCost: breakdown.labour,
       plantCost: breakdown.plant,
@@ -1516,8 +1572,14 @@ async function createEstimateLine(
       riskCost: breakdown.riskCost,
       overheadCost: breakdown.overhead,
       profitCost: breakdown.profit,
+      // P0-6: estimatedTotalCost excludes profit; expectedProfit = sell - estimatedTotalCost.
+      estimatedTotalCost: breakdown.estimatedTotalCost,
+      expectedProfit: breakdown.expectedProfit,
       sellPrice: breakdown.sellPrice,
       unitRate: breakdown.unitRate,
+      // P0-6: real margin = expectedProfit / sellPrice.
+      expectedMarginPct: breakdown.expectedMarginPct,
+      // Legacy margin kept for UI backward-compat reads.
       marginPct: breakdown.marginPct,
       confidence: confidenceResult.score,
       provenanceSummary: buildProvenanceSummary(breakdown),
@@ -1530,6 +1592,25 @@ async function createEstimateLine(
         : true,
     },
   });
+
+  // P0-5: persist ExecutionSegment records for hybrid lines.
+  if (lineSeed.executionSegments && lineSeed.executionSegments.length > 0) {
+    for (let i = 0; i < lineSeed.executionSegments.length; i++) {
+      const seg = lineSeed.executionSegments[i];
+      await prisma.executionSegment.create({
+        data: {
+          id: `${lineId}-seg-${i + 1}`,
+          estimateLineId: lineId,
+          strategy: seg.strategy,
+          scopeDefinition: seg.scopeDefinition,
+          quantityPct: seg.quantityPct,
+          // MVP: no real SubcontractQuote row linked — mock quote passed to
+          // priceLine only. Persisted as null so the gate surfaces it for review.
+          subcontractQuoteId: null,
+        },
+      });
+    }
+  }
 
   return {
     lineId,
@@ -1592,15 +1673,40 @@ async function seedEstimateForClassroom(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Subcontract Package + Quotes for Opportunity #1
+// Subcontract Package + Quotes + Scope Atoms for Opportunity #1
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Scope atoms for the electrical first-fix package (P0-7 structured reconciliation). */
+const CLASSROOM_ELEC_SCOPE_ATOMS = [
+  { id: 'sa-classroom-1', name: 'manufacture', description: 'Manufacture/fabrication of conduit, boxes, fittings' },
+  { id: 'sa-classroom-2', name: 'delivery', description: 'Delivery to site' },
+  { id: 'sa-classroom-3', name: 'installation', description: 'Installation of conduit, boxes, pull-wires' },
+  { id: 'sa-classroom-4', name: 'sealant', description: 'Sealant and fire-stopping at penetrations' },
+  { id: 'sa-classroom-5', name: 'scaffolding', description: 'Scaffolding for installation at high level' },
+  { id: 'sa-classroom-6', name: 'finishing', description: 'Making good / finishing around boxes' },
+  { id: 'sa-classroom-7', name: 'testing', description: 'Continuity testing and certification' },
+] as const;
+
+/**
+ * VoltTech quote coverage. Matches the legacy exclusions (scaffolding, delivery,
+ * installation at level 3) and adds structured per-atom status.
+ */
+const VOLTTECH_COVERAGES: Array<{ atomIdx: number; status: 'covered' | 'excluded' | 'unstated'; note: string | null }> = [
+  { atomIdx: 0, status: 'covered', note: null }, // manufacture
+  { atomIdx: 1, status: 'excluded', note: 'Excluded — client to deliver to site' }, // delivery
+  { atomIdx: 2, status: 'excluded', note: 'Excluded at level 3 (specialist access required)' }, // installation
+  { atomIdx: 3, status: 'excluded', note: null }, // sealant
+  { atomIdx: 4, status: 'excluded', note: 'Excluded — scaffolding by others' }, // scaffolding
+  { atomIdx: 5, status: 'covered', note: null }, // finishing
+  { atomIdx: 6, status: 'unstated', note: null }, // testing
+];
 
 async function seedSubcontractForClassroom(
   ctx: SeedCtx,
   oppId: string,
   estimate: ClassroomEstimateResult,
 ): Promise<void> {
-  console.log('• Seeding Subcontract Package + Quotes for Classroom Block...');
+  console.log('• Seeding Subcontract Package + Quotes + Scope Atoms for Classroom Block...');
 
   const packageId = 'subp-classroom-elec';
   await prisma.subcontractPackage.create({
@@ -1616,6 +1722,23 @@ async function seedSubcontractForClassroom(
       selectedQuoteId: null, // Intentionally unselected → triggers gate blocker.
     },
   });
+
+  // P0-7: create the 7 ScopeAtoms for this package.
+  for (const sa of CLASSROOM_ELEC_SCOPE_ATOMS) {
+    await prisma.scopeAtom.create({
+      data: {
+        id: sa.id,
+        subcontractPackageId: packageId,
+        name: sa.name,
+        description: sa.description,
+      },
+    });
+  }
+  const scopeAtomsInput = CLASSROOM_ELEC_SCOPE_ATOMS.map((sa) => ({
+    id: sa.id,
+    name: sa.name,
+    description: sa.description,
+  }));
 
   // Link the electrical estimate line to the package.
   const elecLine = estimate.lines.find(
@@ -1646,18 +1769,26 @@ async function seedSubcontractForClassroom(
   const quoteAExclusions = ['Scaffolding', 'Delivery to site', 'Installation at level 3'];
   const quoteAAssumptions = ['Quotation valid 30 days', 'Excludes VAT'];
 
+  const voltTechScopeCoverages = VOLTTECH_COVERAGES.map((c) => ({
+    scopeAtomId: CLASSROOM_ELEC_SCOPE_ATOMS[c.atomIdx].id,
+    status: c.status,
+    note: c.note ?? undefined,
+  }));
+
   const reconA = reconcileSubcontract({
     requiredLines,
+    scopeAtoms: scopeAtomsInput,
     quote: {
+      id: 'subq-classroom-volttech',
       totalAmount: 18500,
       exclusionsJson: JSON.stringify(quoteAExclusions),
       assumptionsJson: JSON.stringify(quoteAAssumptions),
-      // No line detail — whole-quote heuristic.
+      scopeCoverages: voltTechScopeCoverages,
     },
   });
 
   console.log(
-    `  • Quote A (VoltTech): coveragePct=${reconA.coveragePct} status=${reconA.status} warnings=${reconA.warnings.length}`,
+    `  • Quote A (VoltTech): coveragePct=${reconA.coveragePct} status=${reconA.status} basis=${reconA.coverageBasis} coveredAtoms=${reconA.coveredAtoms.length} excludedAtoms=${reconA.excludedAtoms.length} unstatedAtoms=${reconA.unstatedAtoms.length}`,
   );
 
   await prisma.subcontractQuote.create({
@@ -1675,21 +1806,42 @@ async function seedSubcontractForClassroom(
     },
   });
 
-  // Quote B — PowerLine Solutions.
+  // Persist QuoteScopeCoverage rows for VoltTech.
+  for (let i = 0; i < VOLTTECH_COVERAGES.length; i++) {
+    const c = VOLTTECH_COVERAGES[i];
+    await prisma.quoteScopeCoverage.create({
+      data: {
+        id: `qsc-volttech-${i + 1}`,
+        quoteId: 'subq-classroom-volttech',
+        scopeAtomId: CLASSROOM_ELEC_SCOPE_ATOMS[c.atomIdx].id,
+        status: c.status,
+        note: c.note,
+      },
+    });
+  }
+
+  // Quote B — PowerLine Solutions (full coverage on every atom).
+  const powerLineScopeCoverages = CLASSROOM_ELEC_SCOPE_ATOMS.map((sa) => ({
+    scopeAtomId: sa.id,
+    status: 'covered' as const,
+  }));
+
   const reconB = reconcileSubcontract({
     requiredLines,
+    scopeAtoms: scopeAtomsInput,
     quote: {
+      id: 'subq-classroom-powerline',
       totalAmount: 21000,
       exclusionsJson: JSON.stringify([]),
       assumptionsJson: JSON.stringify(['Includes delivery']),
+      scopeCoverages: powerLineScopeCoverages,
     },
   });
 
   console.log(
-    `  • Quote B (PowerLine): coveragePct=${reconB.coveragePct} status=${reconB.status}`,
+    `  • Quote B (PowerLine): coveragePct=${reconB.coveragePct} status=${reconB.status} basis=${reconB.coverageBasis}`,
   );
 
-  // Force coveragePct = 1.0 per spec.
   await prisma.subcontractQuote.create({
     data: {
       id: 'subq-classroom-powerline',
@@ -1700,12 +1852,67 @@ async function seedSubcontractForClassroom(
       receivedAt: daysAgo(1),
       exclusionsJson: JSON.stringify([]),
       assumptionsJson: JSON.stringify(['Includes delivery']),
-      coveragePct: 1.0,
+      coveragePct: reconB.coveragePct, // 1.0 — all atoms covered
       status: 'received',
     },
   });
 
-  console.log('  ✓ 1 subcontract package, 2 quotes (UNSELECTED).');
+  // Persist QuoteScopeCoverage rows for PowerLine.
+  for (let i = 0; i < CLASSROOM_ELEC_SCOPE_ATOMS.length; i++) {
+    const sa = CLASSROOM_ELEC_SCOPE_ATOMS[i];
+    await prisma.quoteScopeCoverage.create({
+      data: {
+        id: `qsc-powerline-${i + 1}`,
+        quoteId: 'subq-classroom-powerline',
+        scopeAtomId: sa.id,
+        status: 'covered',
+        note: null,
+      },
+    });
+  }
+
+  console.log(
+    `  ✓ 1 subcontract package, ${CLASSROOM_ELEC_SCOPE_ATOMS.length} scope atoms, 2 quotes (UNSELECTED), ${CLASSROOM_ELEC_SCOPE_ATOMS.length * 2} quote-scope-coverage rows.`,
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commercial Exception for the unsourced electrical line (P0-8)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function seedCommercialExceptionForUnsourced(
+  ctx: SeedCtx,
+  estimate: ClassroomEstimateResult,
+): Promise<void> {
+  console.log('• Seeding CommercialException for unsourced electrical line...');
+
+  const elecLine = estimate.lines.find((l) => l.lineId === 'el-classroom-6');
+  if (!elecLine) throw new Error('Electrical estimate line not found for CommercialException');
+
+  await prisma.commercialException.create({
+    data: {
+      id: 'ce-classroom-6',
+      organizationId: ctx.orgId,
+      estimateLineId: elecLine.lineId,
+      entityType: 'estimate-line',
+      entityId: elecLine.lineId,
+      type: 'unsourced-rate',
+      reason:
+        'Awaiting subcontractor quote for electrical first-fix — electrician resource has no price observation',
+      exposure: elecLine.sellPrice,
+      // Not yet acknowledged — awaiting estimator + director sign-off.
+      acknowledgedById: null,
+      acknowledgedAt: null,
+      approvalRequired: true, // high-value unsourced rate
+      // Not yet approved — director must approve before the line can be committed.
+      approvedById: null,
+      approvedAt: null,
+    },
+  });
+
+  console.log(
+    `  ✓ 1 commercial exception (type=unsourced-rate, exposure=${formatGHS(elecLine.sellPrice)}, approvalRequired=true, UNACKNOWLEDGED).`,
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1820,7 +2027,10 @@ const OFFICE_LINES: EstimateLineSeed[] = [
   {
     wdId: 'wd-msry-001',
     description: '150mm Sandcrete blockwork — external & internal walls',
-    quantity: 250,
+    // Set to 380 m² so planned productivity (12 m²/crew-day) implies a ~32-day
+    // planned duration, matching the ProjectActual seeded below (380/12 ≈ 32 days,
+    // actual 40 days → 9.5 m²/crew-day → 20.8% below standard).
+    quantity: 380,
     scopeItemId: null,
     executionStrategy: 'self-perform',
   },
@@ -1854,10 +2064,16 @@ const OFFICE_LINES: EstimateLineSeed[] = [
   },
 ];
 
+interface OfficeEstimateResult {
+  estimateId: string;
+  lines: LinePricingResult[];
+  finalPrice: number;
+}
+
 async function seedEstimateAndBidForOffice(
   ctx: SeedCtx,
   oppId: string,
-): Promise<void> {
+): Promise<OfficeEstimateResult> {
   console.log('• Seeding Estimate + Revision + Bid for Office Complex (won)...');
 
   const estimateId = 'est-office';
@@ -1955,6 +2171,68 @@ async function seedEstimateAndBidForOffice(
   });
 
   console.log('  ✓ 1 estimate, 1 revision, 1 bid (outcome=won).');
+  return { estimateId, lines, finalPrice };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Knowledge Loop (P1-12) — ProjectActual + CalibrationProposal for the won bid
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function seedProjectActualAndCalibration(
+  ctx: SeedCtx,
+  office: OfficeEstimateResult,
+): Promise<void> {
+  console.log('• Seeding ProjectActual + CalibrationProposal for Office Complex (won bid)...');
+
+  // Use the blockwork line (el-office-1) — its WD productivityRule is 12 m²/crew-day.
+  const blockLine = office.lines.find((l) => l.lineId === 'el-office-1');
+  if (!blockLine) throw new Error('Office blockwork line (el-office-1) not found');
+
+  const plannedProductivity = 12; // from wd-msry-001-v1 productivityRule
+  const plannedCost = blockLine.breakdown.directCost;
+  const actualCost = 45000;
+  const actualProductivity = round2(380 / 40); // = 9.5
+  const productivityVariance = round2((actualProductivity - plannedProductivity) / plannedProductivity); // = -0.21 (engine rounds to 2 dp)
+  const costVariance = plannedCost > 0 ? round2((actualCost - plannedCost) / plannedCost) : 0;
+
+  await prisma.projectActual.create({
+    data: {
+      id: 'pa-zenith-1',
+      organizationId: ctx.orgId,
+      estimateLineId: blockLine.lineId,
+      quantityCompleted: 380,
+      daysTaken: 40,
+      crewSize: 2,
+      materialConsumed: 0, // not tracked at this granularity for MVP
+      materialCost: 42000,
+      subcontractFinalCost: 0, // self-perform line — no subcontract
+      plannedProductivity,
+      actualProductivity,
+      productivityVariance,
+      plannedCost,
+      actualCost,
+      costVariance,
+    },
+  });
+
+  await prisma.calibrationProposal.create({
+    data: {
+      id: 'cp-zenith-1',
+      organizationId: ctx.orgId,
+      workDefinitionId: 'wd-msry-001',
+      projectActualId: 'pa-zenith-1',
+      type: 'productivity-update',
+      currentValue: '12 m²/crew-day',
+      proposedValue: '9.5 m²/crew-day',
+      rationale:
+        'Actual productivity on Office Complex (P-zenith-001) was 9.5 m²/crew-day, 20.8% below standard. Consider revising the approved WorkDefinition.',
+      status: 'pending',
+    },
+  });
+
+  console.log(
+    `  ✓ 1 project actual (plannedCost=${formatGHS(plannedCost)}, actualCost=${formatGHS(actualCost)}, productivityVariance=${productivityVariance}, costVariance=${costVariance}), 1 calibration proposal (pending).`,
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2061,11 +2339,17 @@ async function printCounts(): Promise<void> {
     resourcePriceObservations: await prisma.resourcePriceObservation.count(),
     estimates: await prisma.estimate.count(),
     estimateLines: await prisma.estimateLine.count(),
+    executionSegments: await prisma.executionSegment.count(),
     estimateRevisions: await prisma.estimateRevision.count(),
     subcontractPackages: await prisma.subcontractPackage.count(),
     subcontractPackageLines: await prisma.subcontractPackageLine.count(),
     subcontractQuotes: await prisma.subcontractQuote.count(),
     subcontractQuoteLines: await prisma.subcontractQuoteLine.count(),
+    scopeAtoms: await prisma.scopeAtom.count(),
+    quoteScopeCoverages: await prisma.quoteScopeCoverage.count(),
+    commercialExceptions: await prisma.commercialException.count(),
+    projectActuals: await prisma.projectActual.count(),
+    calibrationProposals: await prisma.calibrationProposal.count(),
     bids: await prisma.bid.count(),
     auditLogs: await prisma.auditLog.count(),
     knowledgeAlerts: await prisma.knowledgeAlert.count(),
@@ -2094,8 +2378,10 @@ async function main(): Promise<void> {
   const scope = await seedScopeForClassroom(ctx, oppIds.classroom);
   const classroomEstimate = await seedEstimateForClassroom(ctx, oppIds.classroom, scope);
   await seedSubcontractForClassroom(ctx, oppIds.classroom, classroomEstimate);
+  await seedCommercialExceptionForUnsourced(ctx, classroomEstimate);
   await seedAuditLogsForClassroom(ctx, oppIds.classroom, classroomEstimate);
-  await seedEstimateAndBidForOffice(ctx, oppIds.office);
+  const officeResult = await seedEstimateAndBidForOffice(ctx, oppIds.office);
+  await seedProjectActualAndCalibration(ctx, officeResult);
   await seedKnowledgeAlerts(ctx);
   await seedWaitlist();
 

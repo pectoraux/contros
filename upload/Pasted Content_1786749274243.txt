@@ -1,0 +1,1586 @@
+I checked the actual `pectoraux/contros` repository rather than trusting Z.ai's completion summary. My assessment is:
+
+**The implementation is a good visual/domain prototype, but it is not yet the architecture we froze, and I would not let Z.ai continue adding features until it fixes several P0 issues.**
+
+The most important problems are not cosmetic. They are **security/tenant isolation, estimate correctness, revision semantics, subcontract reconciliation correctness, and the fact that the current "completed" system is still a single Next.js prototype rather than the GenOffice-based product architecture we specified.**
+
+The repo is public and currently has 7 commits. Its schema does use PostgreSQL via `DATABASE_URL`/`DIRECT_DATABASE_URL`, so the Neon choice is now reflected in the code. ([GitHub][1])
+
+## What Z.ai actually got right
+
+There is real substance here.
+
+The schema explicitly declares PostgreSQL, and the domain model includes organizations, users, opportunities, work definitions, estimates, bids and audit logs. ([GitHub][2])
+
+The estimate API exposes Work Definition versions, cost recipes, productivity, hazards, controls, provenance and revisions, which is directionally consistent with our architecture. ([GitHub][3])
+
+The pricing engine is deterministic and records provenance rather than asking the LLM to produce arbitrary prices. ([GitHub][4])
+
+The pre-submission gate also exists as a deterministic engine and checks scope completeness, assumptions, unpriced lines, unsourced rates, subcontract coverage, deliverables and commercial approval. ([GitHub][5])
+
+The repo also has a real separation between the UI and `src/lib/engines`, which is a good foundation. ([GitHub][6])
+
+So I would **not throw this away**.
+
+But there are serious problems.
+
+---
+
+# P0 — The API is currently not enforcing tenant isolation
+
+This is the biggest issue I found.
+
+The database schema has `organizationId` on the major records and the auth implementation puts `organizationId` into the NextAuth JWT/session. ([GitHub][2])
+
+But the actual API routes are not consistently using that authenticated identity to scope queries.
+
+For example, the dashboard route simply does:
+
+```ts
+db.opportunity.count(...)
+db.subcontractPackage.count(...)
+db.estimate.count(...)
+db.knowledgeAlert.count(...)
+db.auditLog.findMany(...)
+db.opportunity.groupBy(...)
+```
+
+with **no organization filter**. ([GitHub][7])
+
+The opportunities list likewise calls:
+
+```ts
+db.opportunity.findMany(...)
+```
+
+without an organization constraint. ([GitHub][8])
+
+That's incompatible with the architecture we froze:
+
+> Every organization must be isolated from every other organization.
+
+Having `organizationId` in the schema is not enough.
+
+### Required fix
+
+Create one mandatory server-side auth/context function, something like:
+
+```ts
+requireAuth()
+requireOrganization()
+requireRole()
+```
+
+and make every API route obtain:
+
+```ts
+const ctx = await requireRequestContext()
+
+ctx.userId
+ctx.organizationId
+ctx.role
+```
+
+Then every query must be scoped through server-derived `ctx.organizationId`.
+
+Even better, centralize repositories so application code cannot accidentally issue an unscoped query.
+
+For example:
+
+```ts
+opportunityRepository.list(ctx, ...)
+```
+
+rather than:
+
+```ts
+db.opportunity.findMany(...)
+```
+
+throughout the app.
+
+### Do not allow this pattern
+
+```ts
+where: { id }
+```
+
+for organization-owned entities.
+
+It must be:
+
+```ts
+where: {
+  id,
+  organizationId: ctx.organizationId
+}
+```
+
+or, preferably, enforced at a repository/service boundary.
+
+---
+
+# P0 — The current `db.ts` is doing something we should explicitly remove
+
+Z.ai added this:
+
+```ts
+if (
+  process.env.DATABASE_URL &&
+  !process.env.DATABASE_URL.startsWith('postgresql://') &&
+  process.env.DIRECT_DATABASE_URL
+) {
+  process.env.DATABASE_URL = process.env.DIRECT_DATABASE_URL
+}
+```
+
+The comment says it is compensating for a stale SQLite URL in the sandbox. ([GitHub][9])
+
+This is exactly the wrong direction for production architecture.
+
+The canonical architecture is now **Neon PostgreSQL**.
+
+There should not be a hidden runtime mutation of the database configuration.
+
+### Fix
+
+Make the environment configuration explicit:
+
+```text
+DATABASE_URL = Neon pooled connection
+DIRECT_DATABASE_URL = Neon direct connection
+```
+
+Validate them at startup.
+
+Fail loudly when the provider is wrong.
+
+Do not rewrite environment variables in application code.
+
+Also document the Prisma/Neon connection strategy clearly.
+
+---
+
+# P0 — The estimator can currently produce materially wrong costs
+
+This is more serious than a normal MVP approximation.
+
+The pricing engine explicitly says:
+
+> Missing price observation → unsourced, line contributes 0. ([GitHub][4])
+
+That means:
+
+```text
+Cement
+GHS 45
+Sand
+GHS 30
+Labour
+MISSING
+```
+
+can produce a direct cost that silently excludes labour.
+
+The UI later flags the line as unsourced, but **the mathematical estimate is already wrong**.
+
+Our invariant was not:
+
+> "Flag bad estimates."
+
+It was:
+
+> **"Never let an unsupported number silently become the commercial truth."**
+
+### Correct behavior
+
+A missing mandatory price should produce:
+
+```text
+calculationStatus = incomplete
+```
+
+not:
+
+```text
+cost contribution = 0
+```
+
+The engine should return something like:
+
+```ts
+{
+  status: "incomplete",
+  blockingInputs: [
+    {
+      kind: "missing-price",
+      resourceId,
+      resourceName
+    }
+  ]
+}
+```
+
+and should not produce a commit-ready `sellPrice`.
+
+The UI can still show a provisional estimate, but it must be explicitly provisional.
+
+---
+
+# P0 — The hybrid subcontracting logic is an unacceptable heuristic
+
+This is probably the most concerning piece of the actual pricing engine.
+
+Z.ai has:
+
+```ts
+// Heuristic: 50% of equivalent self-perform cost is subcontracted.
+subcontractCost = subcontractFromRecipe + selfPerformTotal * 0.5;
+```
+
+and:
+
+```ts
+// The quote (if any) is ignored under this heuristic.
+```
+
+([GitHub][4])
+
+That cannot exist in the commercial engine.
+
+We explicitly designed:
+
+```text
+Self-perform
+Subcontract
+Hybrid
+```
+
+as **real execution strategies**, not arbitrary assumptions.
+
+A 50/50 heuristic can materially distort a bid.
+
+### Required model
+
+Hybrid must define the actual split.
+
+For example:
+
+```text
+WorkPackage
+ ├── selfPerformComponents
+ └── subcontractComponents
+```
+
+or:
+
+```text
+EstimateLine
+ ├── executionSegments[]
+ │     ├── strategy
+ │     ├── scope
+ │     ├── quantity
+ │     └── cost basis
+```
+
+Then:
+
+```text
+70% self-perform
+30% subcontract
+```
+
+must actually mean 70/30, based on a structured allocation.
+
+If there is no allocation:
+
+> **The estimate is incomplete.**
+
+Never invent 50%.
+
+---
+
+# P0 — The current "margin" is wrong
+
+This is subtle but important.
+
+The pricing engine calculates:
+
+```ts
+marginPct = (sellPrice - projectCost) / sellPrice
+```
+
+where `projectCost = directCost`. ([GitHub][4])
+
+But the actual sell price already includes:
+
+```text
+risk
+overhead
+profit
+```
+
+So this metric is not the actual profit margin.
+
+The API also exposes:
+
+```ts
+averageMarginPct = (totalSell - totalDirect) / totalSell
+```
+
+which has the same conceptual problem. ([GitHub][3])
+
+We need at least distinguish:
+
+```text
+gross margin
+contribution margin
+operating margin
+target profit margin
+```
+
+For this MVP, the simplest correct model is:
+
+```text
+direct cost
++ project overhead
++ contingency/risk
+= estimated total cost
+
+sell price
+- estimated total cost
+= expected profit
+
+expected profit / sell price
+= expected margin
+```
+
+The UI must not label a cost-to-sell spread as "margin" if it includes no overhead/risk treatment.
+
+---
+
+# P0 — The subcontract reconciliation algorithm is far too weak
+
+This is the biggest domain-model problem after pricing.
+
+The current matching algorithm is literally bidirectional substring matching:
+
+```ts
+la.includes(lb) || lb.includes(la)
+```
+
+and then matches the first unused quote line. ([GitHub][10])
+
+That is not sufficient for real subcontract packages.
+
+Example:
+
+```text Required:
+Supply and install aluminum windows, 1,000m²
+
+Sub quote:
+Aluminium windows
+Supply only
+```
+
+A textual match can report coverage even though **installation is absent**.
+
+Worse, if a subcontractor sends a lump-sum quote without line detail, the implementation says:
+
+> treat whole quote.totalAmount as coverage. ([GitHub][10])
+
+That defeats the entire purpose of scope reconciliation.
+
+### Correct architecture
+
+Reconciliation should be based on **scope atoms**, not descriptions.
+
+Example:
+
+```text
+Package:
+Aluminium windows
+
+Required scope atoms:
+  manufacture
+  delivery
+  installation
+  sealant
+  scaffolding
+  testing
+  finishing
+
+Sub quote:
+  manufacture ✓
+  delivery ✓
+  installation ✗
+  sealant ✗
+  scaffolding ✗
+```
+
+Then coverage becomes semantic and auditable.
+
+AI can assist with mapping quote language to scope atoms, but the mapping must enter structured data and be reviewable.
+
+---
+
+# P0 — The pre-submission gate can be gamed
+
+The gate allows an unsourced rate to become merely a warning once:
+
+```text
+acknowledged = true
+```
+
+([GitHub][5])
+
+That's reasonable as a workflow concept, but there is a deeper problem:
+
+**What does acknowledgement actually mean?**
+
+The system needs to record:
+
+```text
+who acknowledged
+when
+why
+what source class was considered
+what value was used
+who approved the exception
+```
+
+A bare boolean is insufficient for a commercial exception.
+
+Replace:
+
+```text
+acknowledged Boolean
+```
+
+with an auditable exception record.
+
+---
+
+# P1 — The API is acting as the domain service layer
+
+The architectural prompt called for:
+
+```text
+UI
+ ↓
+Application services
+ ↓
+Domain services
+ ↓
+Database
+```
+
+But the repository currently has large API routes that fetch and flatten domain data directly. The opportunity endpoint is already more than 1,000 lines. ([GitHub][3])
+
+That is going to become a maintenance disaster.
+
+The API shouldn't be where the business model lives.
+
+Move toward:
+
+```text
+src/
+  domain/
+  application/
+  infrastructure/
+  web/
+```
+
+or equivalent.
+
+For example:
+
+```text
+application/estimate/getEstimateWorkspace()
+application/estimate/recomputeLine()
+application/subcontract/reconcilePackage()
+application/bid/runSubmissionGate()
+```
+
+Then API routes become thin adapters.
+
+---
+
+# P1 — The repo is currently a Next.js prototype, not the GenOffice fork architecture
+
+This is important.
+
+The repo root currently contains:
+
+```text
+src/
+prisma/
+public/
+```
+
+and the implementation is a Next.js 16 application with Prisma, not the GenOffice Electron monorepo + `apps/contractor` + `apps/plan` structure we specified. The package file confirms Next.js 16, Prisma 6.11 and React 19. ([GitHub][11])
+
+That's not inherently bad for proving the domain.
+
+But Z.ai's completion report is misleading when it says:
+
+> "The Contractor OS is complete and verified end-to-end."
+
+It is **not the requested product architecture yet**.
+
+What has been built is essentially:
+
+> **a web prototype of the domain workflow.**
+
+That may actually be useful. I would keep it as the domain/UI prototype and then integrate the validated domain into the GenOffice fork rather than throwing the work away.
+
+But Z.ai needs to understand the distinction.
+
+---
+
+# P1 — Revision architecture isn't complete enough
+
+The schema has `EstimateRevision`, which is good. The opportunity API exposes revisions. ([GitHub][3])
+
+But the implementation needs to prove a critical invariant:
+
+> A finalized bid can be reconstructed exactly without querying current mutable state.
+
+Right now I don't see enough evidence that the submitted bid stores a full immutable snapshot of:
+
+```text
+estimate
+work definition versions
+price observations
+subcontract quotes
+commercial policy
+assumptions
+programme revision
+document versions
+```
+
+An `EstimateRevision` row by itself is not enough if it still references mutable records.
+
+The actual snapshot should have immutable references/version IDs or a snapshot payload/hash strategy.
+
+---
+
+# P1 — No proper document binding implementation yet
+
+The report talks extensively about:
+
+```text
+BOQ
+Programme
+MS
+JHA
+Tender Pack
+```
+
+but the actual repo is still predominantly a web UI/prototype.
+
+The core `xlsx-binding`, `docx-binding`, `mspxml-binding`, etc. architecture we specified isn't represented as the structured binding layer we wanted.
+
+That needs to be implemented rather than simulated with UI tabs.
+
+---
+
+# P1 — The Work Definition model is too JSON-heavy
+
+The schema stores important work knowledge in fields such as:
+
+```text
+productivityRule
+hazardsJson
+controlsJson
+methodStatementFragment
+costRecipeJson
+```
+
+The opportunity endpoint exposes these directly. ([GitHub][3])
+
+JSON is fine for genuinely flexible structures.
+
+But some of these are core business objects and should eventually become structured relational entities or typed domain structures.
+
+Especially:
+
+```text
+CostRecipe
+RecipeComponent
+Hazard
+Control
+QARequirement
+SequencingRule
+```
+
+because we need:
+
+* versioning
+* provenance
+* querying
+* reuse
+* analytics
+* validation
+* references from multiple work definitions
+
+Don't let JSON blobs become the next spreadsheet.
+
+---
+
+# P1 — The system doesn't yet have the actual learning loop
+
+The schema has `KnowledgeAlert`, which is useful. But that's not the same as:
+
+```text
+Estimate
+ ↓
+Project Actuals
+ ↓
+Variance
+ ↓
+WorkDefinition calibration proposal
+ ↓
+Approval
+ ↓
+new WorkDefinitionVersion
+```
+
+That needs to be implemented as a first-class loop.
+
+Without it, the "operating memory" claim isn't yet real.
+
+---
+
+# P1 — The tests do not validate the product claims
+
+The `tests/` directory currently contains build/runtime scripts rather than a serious application test suite. ([GitHub][12])
+
+So Z.ai saying:
+
+> "Lint clean, no runtime errors"
+
+is not sufficient evidence.
+
+We need actual tests for:
+
+```text
+pricing
+scope
+subcontracting
+revision
+tenancy
+authorization
+submission gate
+schedule
+```
+
+Especially cross-organization security tests.
+
+---
+
+# What I would tell Z.ai to do next
+
+I would **stop feature development now** and give it this correction prompt.
+
+# CONTRACTOR OS — STOP FEATURE WORK AND HARDEN THE CURRENT IMPLEMENTATION
+
+You have made good progress on the Contractor OS prototype, but after reviewing the actual public repository `pectoraux/contros`, the current implementation is NOT yet compliant with the frozen architecture.
+
+Repository:
+[https://github.com/pectoraux/contros](https://github.com/pectoraux/contros)
+
+Do not add more user-facing features yet.
+
+Do not start another visual polish pass.
+
+Do not claim the system is complete.
+
+Your next task is to harden the existing implementation against the architectural invariants below.
+
+## 1. IMPORTANT: ACTUAL CURRENT STATE
+
+The current repository is a Next.js 16 + Prisma application with PostgreSQL schema support, not yet the full GenOffice-integrated architecture.
+
+That is acceptable as a domain/product prototype.
+
+Do NOT throw away the existing work.
+
+However, treat the current implementation as the validated prototype of the Contractor OS domain and now bring its foundations into compliance before continuing.
+
+The production target remains:
+
+```text
+Contractor Workspace
++
+GenOffice office surfaces
++
+Project/Programme clone
++
+shared domain model
++
+Neon PostgreSQL
+```
+
+The current prototype can remain web-based while the domain hardening is performed.
+
+---
+
+# 2. P0 — TENANT ISOLATION AND AUTHORIZATION
+
+This is the highest priority.
+
+The current schema contains `organizationId` and NextAuth puts `organizationId` into the session/JWT, which is good.
+
+However, several API routes currently query organization-owned tables without organization scoping.
+
+For example, the dashboard currently performs unscoped queries over opportunities, subcontract packages, estimates, knowledge alerts and audit logs.
+
+The opportunities API also performs an unscoped `Opportunity.findMany`.
+
+This violates the invariant:
+
+> Every organization must be isolated from every other organization.
+
+## Required implementation
+
+Create a mandatory request context abstraction:
+
+```ts
+interface RequestContext {
+  userId: string
+  organizationId: string
+  role: 'estimator' | 'manager' | 'director' | 'admin'
+  isDemo: boolean
+}
+```
+
+Create functions along the lines of:
+
+```ts
+requireAuth()
+requireRole(...)
+```
+
+The exact names may follow project conventions.
+
+Every protected API route MUST obtain the server-side context.
+
+Never trust:
+
+```text
+organizationId
+userId
+role
+```
+
+from the request body or query string.
+
+## Repository rule
+
+Every query involving organization-owned data must be organization-scoped.
+
+Bad:
+
+```ts
+db.opportunity.findUnique({
+  where: { id }
+})
+```
+
+Good:
+
+```ts
+db.opportunity.findFirst({
+  where: {
+    id,
+    organizationId: ctx.organizationId
+  }
+})
+```
+
+For updates/deletes, require the same compound scope.
+
+Prefer a repository/service layer so developers cannot accidentally issue unscoped queries.
+
+## Add security tests
+
+Create at least these tests:
+
+```text
+User from Org A cannot GET Org B opportunity
+User from Org A cannot GET Org B estimate
+User from Org A cannot GET Org B work definition
+User from Org A cannot GET Org B subcontract quote
+User from Org A cannot modify Org B estimate
+User from Org A cannot modify Org B work definition
+User from Org A cannot see Org B audit logs
+User from Org A cannot access Org B AI context
+```
+
+These tests are P0.
+
+Do not proceed until they pass.
+
+---
+
+# 3. P0 — REMOVE DATABASE URL MUTATION
+
+Current `src/lib/db.ts` contains logic that mutates `DATABASE_URL` at runtime when it appears to contain a non-PostgreSQL URL.
+
+Do not do this.
+
+Neon PostgreSQL is the canonical database.
+
+Required behavior:
+
+```text
+DATABASE_URL
+    = Neon pooled PostgreSQL connection
+
+DIRECT_DATABASE_URL
+    = Neon direct PostgreSQL connection
+```
+
+Validate the environment at startup.
+
+Fail clearly if the provider is wrong.
+
+Do not silently rewrite environment variables.
+
+Document the Neon/Prisma connection strategy.
+
+---
+
+# 4. P0 — FIX UNSOURCED PRICE MATHEMATICS
+
+Current pricing behavior treats a missing price observation as:
+
+```text
+unsourced = true
+cost contribution = 0
+```
+
+This is unacceptable.
+
+A missing price is not zero cost.
+
+Implement:
+
+```ts
+calculationStatus:
+  | 'complete'
+  | 'incomplete'
+```
+
+or an equivalent typed state.
+
+If a mandatory recipe component has no valid price observation:
+
+```text
+calculationStatus = incomplete
+blockingInputs = [...]
+```
+
+The engine may return a provisional result for UI display, but it must NOT produce a commit-ready canonical price.
+
+Do not let:
+
+```text
+missing material price
+missing labour price
+missing equipment price
+```
+
+silently reduce estimated cost.
+
+The pre-submission gate must treat incomplete calculations as blockers.
+
+Add tests.
+
+Example:
+
+```text
+recipe:
+  cement = priced
+  sand = priced
+  mason = missing
+
+expected:
+  status = incomplete
+  blocking input = mason
+  canonical sellPrice cannot be finalized
+```
+
+---
+
+# 5. P0 — REMOVE THE 50% HYBRID SUBCONTRACT HEURISTIC
+
+The current pricing engine contains a heuristic equivalent to:
+
+```text
+hybrid =
+50% self-perform
+50% subcontract
+```
+
+This must be removed.
+
+The system must NEVER invent the split.
+
+Implement a structured hybrid allocation.
+
+For example:
+
+```ts
+interface ExecutionSegment {
+  strategy: 'self-perform' | 'subcontract'
+  scopeDefinition: string
+  quantity?: number
+  quantityPct?: number
+  costBasis: ...
+}
+```
+
+The exact model can follow project conventions.
+
+But:
+
+```text
+hybrid without an explicit split
+```
+
+must be:
+
+```text
+incomplete
+```
+
+not:
+
+```text
+50/50
+```
+
+If a subcontract quote exists, use it only against the scope explicitly assigned to the subcontractor.
+
+If the quote is incomplete, surface the uncovered scope.
+
+Add tests:
+
+```text
+70% self-perform / 30% subcontract
+100% subcontract
+100% self-perform
+hybrid with missing allocation
+hybrid with subcontract quote
+```
+
+---
+
+# 6. P0 — FIX MARGIN SEMANTICS
+
+The current pricing engine calls:
+
+```ts
+(sellPrice - projectCost) / sellPrice
+```
+
+"margin", while `projectCost` is currently effectively direct cost.
+
+This is semantically incorrect for the commercial model we defined.
+
+Implement explicit financial concepts:
+
+```text
+directCost
+projectCost
+riskCost
+overheadCost
+estimatedTotalCost
+sellPrice
+expectedProfit
+expectedMargin
+```
+
+At minimum:
+
+```text
+estimatedTotalCost =
+    directCost
+    + project overhead
+    + contingency/risk
+```
+
+Then:
+
+```text
+expectedProfit =
+    sellPrice - estimatedTotalCost
+```
+
+and:
+
+```text
+expectedMargin =
+    expectedProfit / sellPrice
+```
+
+Use these terms consistently in:
+
+```text
+engine
+API
+UI
+provenance
+adjudication
+pre-submission gate
+```
+
+Do not display "margin" when the number is actually markup/spread over direct cost.
+
+Add tests.
+
+---
+
+# 7. P0 — REBUILD SUBCONTRACT SCOPE RECONCILIATION
+
+The current algorithm uses simple bidirectional substring matching and, when quote line detail is absent, treats the entire quote amount as scope coverage.
+
+That is insufficient.
+
+We explicitly designed subcontract reconciliation as a commercial protection mechanism.
+
+Do not fake semantic coverage with string matching.
+
+## New model
+
+Represent required scope as structured scope atoms.
+
+Example:
+
+```text
+Aluminium Windows Package
+
+required scope:
+  manufacturing
+  delivery
+  installation
+  sealant
+  scaffolding
+  finishing
+  testing
+```
+
+A subcontract quote can cover each atom explicitly:
+
+```text
+manufacturing      covered
+delivery           covered
+installation       excluded
+sealant            excluded
+scaffolding        unknown
+finishing          covered
+testing            not stated
+```
+
+Coverage must be calculated from these structured assignments.
+
+AI may propose a mapping from supplier language to required scope atoms.
+
+But the mapping must be stored and reviewable.
+
+## Important
+
+Never treat:
+
+```text
+lump-sum quote
+```
+
+as:
+
+```text
+100% scope coverage
+```
+
+unless an explicit user or verified document analysis establishes that coverage.
+
+A lump-sum quote with no scope detail should be:
+
+```text
+scopeCoverageStatus = unknown
+```
+
+and should trigger review.
+
+## Required result
+
+For every selected subcontract quote show:
+
+```text
+required scope
+covered scope
+excluded scope
+unstated scope
+assumptions
+commercial exposure
+```
+
+Add adversarial tests:
+
+```text
+"Supply only" vs "supply and install"
+"windows" vs "windows + installation"
+"all works" with explicit exclusions
+lump sum with no line breakdown
+overlapping quote lines
+duplicate quote lines
+partial package
+```
+
+---
+
+# 8. P0 — MAKE COMMERCIAL EXCEPTIONS AUDITABLE
+
+Current unsourced-rate acknowledgement is represented too simply.
+
+Do not allow:
+
+```text
+acknowledged = true
+```
+
+without context.
+
+Create an explicit exception record containing at minimum:
+
+```text
+type
+reason
+amount/exposure
+acknowledgedBy
+acknowledgedAt
+approvalRequired
+approvedBy
+approvedAt
+```
+
+For example:
+
+```text
+UnsourcedRateException
+```
+
+A user acknowledgement is not equivalent to director approval.
+
+The pre-submission gate must distinguish:
+
+```text
+acknowledged
+approved
+```
+
+where appropriate.
+
+---
+
+# 9. P1 — INTRODUCE APPLICATION SERVICES
+
+The current opportunity API route is very large and contains substantial aggregation/projection behavior.
+
+Do not keep expanding API routes into the domain layer.
+
+Create a clear application-service boundary.
+
+For example:
+
+```text
+src/
+  domain/
+  application/
+  infrastructure/
+  web/
+```
+
+or another structure consistent with the repository.
+
+At minimum introduce services corresponding to:
+
+```text
+OpportunityService
+ScopeService
+EstimateService
+PricingService
+SubcontractService
+BidService
+KnowledgeService
+```
+
+The services own orchestration.
+
+API routes become thin HTTP adapters.
+
+UI calls API/application contracts.
+
+AI tools call application services.
+
+This is required because the same business operation will eventually be invoked by:
+
+```text
+web UI
+GenOffice surfaces
+AI
+mobile site app
+automation
+```
+
+and must not be duplicated.
+
+---
+
+# 10. P1 — MAKE ESTIMATE REVISIONS ACTUALLY REPRODUCIBLE
+
+The existence of an `EstimateRevision` table is not sufficient.
+
+A finalized estimate revision must be reproducible even after the live Work Library and resource prices change.
+
+When a revision is finalized, capture immutable references/snapshots for:
+
+```text
+WorkDefinitionVersion
+resource price observations
+execution strategy
+subcontract quote versions
+pricing policy
+risk assumptions
+commercial policy
+estimate line calculations
+```
+
+The exact implementation can use immutable foreign-key versions, normalized snapshots, or a combination.
+
+But this invariant must hold:
+
+> Replaying a finalized EstimateRevision five years later produces the same commercial result, even if current prices and current WorkDefinitions have changed.
+
+Write a reproducibility test.
+
+---
+
+# 11. P1 — STRUCTURE THE WORK DEFINITION KNOWLEDGE MODEL
+
+JSON is acceptable for flexible payloads, but do not allow core business knowledge to become opaque blobs.
+
+At minimum identify which of the following should become typed structured entities:
+
+```text
+CostRecipe
+RecipeComponent
+ProductivityRule
+Hazard
+Control
+QARequirement
+SequencingRule
+PPERequirement
+PermitRequirement
+```
+
+Keep JSON only where it provides genuine flexibility.
+
+The system must be able to query things like:
+
+```text
+all work definitions using resource X
+all work definitions containing hazard Y
+all work definitions requiring permit Z
+all work definitions with productivity observations
+```
+
+without parsing arbitrary application-owned JSON strings everywhere.
+
+---
+
+# 12. P1 — IMPLEMENT THE ACTUAL KNOWLEDGE LOOP
+
+Current Knowledge Alerts are not enough.
+
+Implement the first complete closed loop:
+
+```text
+Estimate
+    ↓
+Project execution
+    ↓
+Actual quantity / days / crew / material / subcontract cost
+    ↓
+Variance
+    ↓
+WorkDefinition calibration proposal
+    ↓
+Review
+    ↓
+New WorkDefinitionVersion
+```
+
+At minimum support actuals for:
+
+```text
+quantity completed
+days
+crew size
+resource consumption
+purchase/subcontract final cost
+```
+
+Then calculate:
+
+```text
+planned productivity
+actual productivity
+variance
+```
+
+and:
+
+```text
+planned cost
+actual cost
+variance
+```
+
+Do not automatically modify approved WorkDefinitions.
+
+Create an amendment proposal.
+
+---
+
+# 13. P1 — TESTING MUST MOVE BEYOND LINT
+
+The current repository has not demonstrated the test coverage required by the architecture.
+
+Create a real test suite.
+
+At minimum:
+
+```text
+pricing.test
+pricing-provenance.test
+pricing-revision.test
+scope-completeness.test
+scope-ambiguity.test
+subcontract-reconciliation.test
+submission-gate.test
+authorization.test
+tenant-isolation.test
+estimate-reproducibility.test
+```
+
+Use realistic fixtures.
+
+At least one fixture must include:
+
+```text
+ambiguous item
+subcontracted package
+missing price observation
+approved WorkDefinition
+commercial adjustment
+```
+
+---
+
+# 14. P1 — HISTORICAL BID FIXTURES
+
+Do not use only synthetic demo data.
+
+Create a fixture structure capable of importing real historical bid reconstructions later.
+
+Target validation set:
+
+```text
+3 straightforward
+3 subcontract-heavy
+2 ambiguous
+1 client-provided BOQ
+1 estimator-created scope
+```
+
+The objective is not just to get the final total close.
+
+The system must explain:
+
+```text
+scope interpretation
+assumptions
+rates
+subcontract treatment
+commercial adjustment
+```
+
+---
+
+# 15. DO NOT ADD NEW FEATURES UNTIL THESE GATES PASS
+
+Do NOT implement:
+
+```text
+advanced AI
+new dashboard widgets
+more visual polish
+Monte Carlo
+full site capture
+more construction templates
+advanced Project features
+```
+
+until:
+
+```text
+tenant isolation passes
+pricing correctness passes
+hybrid pricing passes
+subcontract reconciliation passes
+revision reproducibility passes
+authorization passes
+```
+
+---
+
+# 16. KEEP THE CURRENT PROTOTYPE
+
+Do not discard the current UI.
+
+It is useful and already demonstrates:
+
+```text
+Dashboard
+Opportunity workspace
+Scope
+Estimate
+BOQ
+Subcontract
+Programme
+Method Statement
+JHA
+Tender Pack
+Work Library
+Provenance
+AI assistant
+```
+
+Retain it as the prototype surface while hardening the domain.
+
+However, stop describing it as the final GenOffice-based product until the actual GenOffice integration is implemented.
+
+---
+
+# 17. NEXT ARCHITECTURAL STEP AFTER HARDENING
+
+Once the above P0/P1 gates pass, begin the actual GenOffice integration.
+
+Target:
+
+```text
+GenOffice shell
+    │
+    ├── Docs
+    ├── Sheets
+    ├── Slides
+    ├── PDF
+    ├── Markdown
+    │
+    ├── Contractor Workspace
+    │
+    └── Plan / Project
+```
+
+The existing domain services must remain independent of Electron.
+
+The web prototype's domain logic should be reusable by the GenOffice surfaces.
+
+Do not rewrite the engines merely to fit the Electron UI.
+
+---
+
+# 18. FINAL ACCEPTANCE TEST
+
+Before reporting completion of this hardening stage, prove all of the following:
+
+### Tenant isolation
+
+Two organizations cannot read or mutate one another's data.
+
+### Pricing correctness
+
+Missing evidence cannot silently become zero cost.
+
+### Hybrid strategy
+
+No arbitrary 50/50 pricing exists anywhere.
+
+### Margin
+
+Displayed margin reflects actual estimated total cost.
+
+### Subcontracting
+
+Scope coverage is based on structured scope, not substring heuristics.
+
+### Reproducibility
+
+A finalized estimate can be reconstructed exactly.
+
+### Exceptions
+
+All commercial overrides are auditable.
+
+### AI
+
+AI cannot directly commit an unsourced commercial value.
+
+### Database
+
+Neon PostgreSQL is the only canonical persistence layer.
+
+### Tests
+
+The above behaviors are covered by automated tests.
+
+---
+
+# 19. REQUIRED RESPONSE AFTER IMPLEMENTATION
+
+Report:
+
+```text
+1. P0 issues fixed
+2. P1 issues fixed
+3. Files changed
+4. Database migrations
+5. Security tests
+6. Pricing tests
+7. Subcontract tests
+8. Reproducibility test
+9. Remaining architectural gaps
+10. Exact next implementation phase
+```
+
+Do not say "complete" unless every required acceptance test has actually been run and passed.
+
+The objective is not to add more screens.
+
+The objective is to make the Contractor OS commercially trustworthy before we build additional capability.
+
+[1]: https://github.com/pectoraux/contros "GitHub - pectoraux/contros: Contractor OS — AI-native estimating & operating memory for contractor SMEs (construction, Ghana) · GitHub"
+[2]: https://github.com/pectoraux/contros/blob/main/prisma/schema.prisma "contros/prisma/schema.prisma at main · pectoraux/contros · GitHub"
+[3]: https://github.com/pectoraux/contros/blob/main/src/app/api/opportunities/%5Bid%5D/route.ts "contros/src/app/api/opportunities/[id]/route.ts at main · pectoraux/contros · GitHub"
+[4]: https://github.com/pectoraux/contros/blob/main/src/lib/engines/pricing-engine.ts "contros/src/lib/engines/pricing-engine.ts at main · pectoraux/contros · GitHub"
+[5]: https://github.com/pectoraux/contros/blob/main/src/lib/engines/pre-submission-gate.ts "contros/src/lib/engines/pre-submission-gate.ts at main · pectoraux/contros · GitHub"
+[6]: https://github.com/pectoraux/contros/tree/main/src/lib "contros/src/lib at main · pectoraux/contros · GitHub"
+[7]: https://github.com/pectoraux/contros/blob/main/src/app/api/dashboard/route.ts "contros/src/app/api/dashboard/route.ts at main · pectoraux/contros · GitHub"
+[8]: https://github.com/pectoraux/contros/blob/main/src/app/api/opportunities/route.ts "contros/src/app/api/opportunities/route.ts at main · pectoraux/contros · GitHub"
+[9]: https://github.com/pectoraux/contros/blob/main/src/lib/db.ts "contros/src/lib/db.ts at main · pectoraux/contros · GitHub"
+[10]: https://github.com/pectoraux/contros/blob/main/src/lib/engines/subcontract-reconciliation.ts "contros/src/lib/engines/subcontract-reconciliation.ts at main · pectoraux/contros · GitHub"
+[11]: https://github.com/pectoraux/contros/blob/main/package.json "contros/package.json at main · pectoraux/contros · GitHub"
+[12]: https://github.com/pectoraux/contros/tree/main/tests "contros/tests at main · pectoraux/contros · GitHub"

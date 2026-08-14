@@ -1,12 +1,14 @@
 import { NextResponse } from 'next/server'
 import { getZAI } from '@/lib/zai'
 import { db } from '@/lib/db'
+import { requireAuth, authErrorResponse } from '@/lib/context'
 
 // Contractor AI Assistant
 // INVARIANT 5: AI cannot silently commit a price.
 // The AI may: read, extract, search, classify, suggest, draft, compare, explain, flag.
 // The AI may NOT: bypass pricing service, commit prices, bypass approval/audit.
 // All write tools validate inputs through domain services — the AI has NO write tools here.
+// INVARIANT 12: verify opportunityId belongs to ctx.organizationId before loading context.
 
 const SYSTEM_PROMPT = `You are the Contractor OS assistant for a Ghana-based construction SME (currency: GHS).
 You operate OVER the canonical domain model — you are NOT the domain model itself.
@@ -36,6 +38,15 @@ interface AssistantRequest {
 }
 
 export async function POST(req: Request) {
+  let ctx
+  try {
+    ctx = await requireAuth()
+  } catch (e) {
+    const authErr = authErrorResponse(e)
+    if (authErr) return authErr
+    throw e
+  }
+
   const body = (await req.json().catch(() => ({}))) as AssistantRequest
   const { skill = 'general', question, opportunityId, estimateLineId } = body
 
@@ -43,11 +54,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'question required' }, { status: 400 })
   }
 
-  // Build deterministic domain context for the AI (read-only)
+  // Build deterministic domain context for the AI (read-only).
+  // INVARIANT 12: opportunity must belong to ctx.organizationId.
   let contextBlock = ''
   if (opportunityId) {
-    const opp = await db.opportunity.findUnique({
-      where: { id: opportunityId },
+    const opp = await db.opportunity.findFirst({
+      where: { id: opportunityId, organizationId: ctx.organizationId },
       include: {
         client: true,
         scopePackage: { include: { items: true, questions: true, assumptions: true, evidence: true } },
@@ -64,7 +76,7 @@ export async function POST(req: Request) {
           orderBy: { updatedAt: 'desc' },
           take: 1,
         },
-        subcontractPackages: { include: { lines: true, quotes: true } },
+        subcontractPackages: { include: { lines: true, quotes: true, scopeAtoms: true } },
         bid: true,
       },
     })
@@ -87,8 +99,12 @@ export async function POST(req: Request) {
               : 'UNSOURCED'
             return `- Line ${l.id}: "${l.description}" — qty ${l.quantity} ${l.unit}, strategy ${l.executionStrategy}
     WorkDefinition: ${l.workDefinition ? `${l.workDefinition.code} v${wdv?.version} (${wdv?.approvalState})` : 'NONE'}
-    Unit rate: GHS ${l.unitRate.toFixed(2)}/${l.unit}, sell price: GHS ${l.sellPrice.toFixed(2)}, margin ${(l.marginPct * 100).toFixed(1)}%, confidence ${(l.confidence * 100).toFixed(0)}%
+    Calculation status: ${l.calculationStatus.toUpperCase()}
+    Unit rate: GHS ${l.unitRate.toFixed(2)}/${l.unit}, sell price: GHS ${l.sellPrice.toFixed(2)}, margin ${(l.marginPct * 100).toFixed(1)}%, expected margin ${(l.expectedMarginPct * 100).toFixed(1)}%
+    Estimated total cost: GHS ${l.estimatedTotalCost.toFixed(2)}, expected profit: GHS ${l.expectedProfit.toFixed(2)}
+    Confidence: ${(l.confidence * 100).toFixed(0)}%
     Unsourced: ${l.isUnsourced ? `YES — ${l.unsourcedRationale ?? 'no rationale'}` : 'no'}
+    Acknowledged: ${l.acknowledged ? 'yes' : 'no'}
     Provenance: ${provenance}
     Recipe: ${recipe.length} resource lines`
           })
@@ -114,6 +130,7 @@ ${scopePkg.evidence.map((e) => `  - [${e.type}] ${e.summary}${e.reference ? ` ($
               .map((q) => `    - ${q.supplierName}: GHS ${q.totalAmount} (coverage ${(q.coveragePct * 100).toFixed(0)}%, exclusions: ${JSON.parse(q.exclusionsJson || '[]').join(', ') || 'none'})${sp.selectedQuoteId === q.id ? ' [SELECTED]' : ''}`)
               .join('\n')
             return `  Package: ${sp.name} (${sp.executionStrategy}, status ${sp.status})
+  Scope atoms: ${sp.scopeAtoms.length ? sp.scopeAtoms.map((a) => a.name).join(', ') : '(none — lump-sum risk)'}
 ${quotes}`
           })
           .join('\n')
@@ -140,11 +157,15 @@ BID: ${opp.bid ? `${opp.bid.tenderPackStatus}, outcome ${opp.bid.outcome ?? 'pen
     contextBlock = 'No specific opportunity context provided. Answer generally and recommend opening an opportunity for detailed analysis.'
   }
 
-  // If a specific estimate line is targeted, fetch full provenance
+  // If a specific estimate line is targeted, fetch full provenance.
+  // INVARIANT 12: verify the line's estimate belongs to ctx.organizationId.
   let lineContext = ''
   if (estimateLineId) {
-    const line = await db.estimateLine.findUnique({
-      where: { id: estimateLineId },
+    const line = await db.estimateLine.findFirst({
+      where: {
+        id: estimateLineId,
+        estimate: { organizationId: ctx.organizationId },
+      },
       include: {
         workDefinition: true,
         workDefinitionVersion: { include: { priceObservations: { include: { resource: true } } } },
@@ -159,7 +180,9 @@ BID: ${opp.bid ? `${opp.bid.tenderPackStatus}, outcome ${opp.bid.outcome ?? 'pen
 Description: ${line.description}
 Quantity: ${line.quantity} ${line.unit}
 Strategy: ${line.executionStrategy}
+Calculation status: ${line.calculationStatus.toUpperCase()}
 Unit rate: GHS ${line.unitRate.toFixed(2)}, Sell price: GHS ${line.sellPrice.toFixed(2)}, Margin ${(line.marginPct * 100).toFixed(1)}%
+Estimated total cost: GHS ${line.estimatedTotalCost.toFixed(2)}, Expected profit: GHS ${line.expectedProfit.toFixed(2)}, Expected margin: ${(line.expectedMarginPct * 100).toFixed(1)}%
 Confidence: ${(line.confidence * 100).toFixed(0)}%
 Unsourced: ${line.isUnsourced ? `YES — ${line.unsourcedRationale}` : 'no'}
 Provenance summary: ${line.provenanceSummary}
@@ -178,7 +201,7 @@ Linked scope item: ${line.scopeItem ? `[${line.scopeItem.status}] ${line.scopeIt
     'explain-rate': `\n\nThe user is asking about a specific rate. Use the TARGETED ESTIMATE LINE context above. Explain WHY the unit rate is GHS ${estimateLineId ? '' : ''}what it is by walking through the cost recipe, resource prices, provenance (supplier quote #, invoice #), wastage, overhead, profit, and contingency. Never invent a price. If the line is unsourced, explain which resources lack price observations and recommend obtaining supplier quotations.`,
     'identify-gaps': `\n\nThe user wants to know what scope is missing or ambiguous. Use the SCOPE PACKAGE context. List the missing and ambiguous items, rank them by commercial impact where possible, and recommend: (a) what question to ask the client, (b) what evidence to obtain, (c) what assumption to record. Reference the open ScopeQuestions.`,
     'draft-clarification': `\n\nThe user wants a draft clarification to send to the client. Use the SCOPE PACKAGE context (especially open questions and ambiguous items). Draft a professional, concise clarification email in plain text. Sign off as the estimating team. Do not commit to a price.`,
-    'tender-readiness': `\n\nThe user wants to know if they are ready to submit. Summarize: scope completeness, unresolved assumptions, unsourced lines, subcontract coverage gaps, and missing deliverables. Recommend the next concrete actions. Do not override the pre-submission gate — defer to it for the verdict.`,
+    'tender-readiness': `\n\nThe user wants to know if they are ready to submit. Summarize: scope completeness, unresolved assumptions, incomplete calculations, unsourced lines, subcontract coverage gaps (including lump-sum quotes), and missing deliverables. Recommend the next concrete actions. Do not override the pre-submission gate — defer to it for the verdict.`,
     'general': '',
   }
 
@@ -201,18 +224,16 @@ ${question}`
 
     // Audit the AI interaction (read-only — no domain mutation)
     if (opportunityId) {
-      const opp = await db.opportunity.findUnique({ where: { id: opportunityId } })
-      if (opp) {
-        await db.auditLog.create({
-          data: {
-            organizationId: opp.organizationId,
-            action: 'ai.assistant-queried',
-            entityType: 'Opportunity',
-            entityId: opp.id,
-            summary: `AI skill "${skill}": ${question.slice(0, 100)}`,
-          },
-        })
-      }
+      await db.auditLog.create({
+        data: {
+          organizationId: ctx.organizationId,
+          actorId: ctx.userId,
+          action: 'ai.assistant-queried',
+          entityType: 'Opportunity',
+          entityId: opportunityId,
+          summary: `AI skill "${skill}": ${question.slice(0, 100)}`,
+        },
+      })
     }
 
     return NextResponse.json({

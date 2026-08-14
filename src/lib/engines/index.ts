@@ -19,6 +19,9 @@ export { round2, sum, formatGHS } from './money';
 export type {
   CostRecipeLine,
   PricingWorkDefinitionVersion,
+  ExecutionSegmentInput,
+  BlockingInput,
+  CalculationStatus,
   PricingInput,
   PricingProvenanceEntry,
   PricingBreakdown,
@@ -44,6 +47,9 @@ export type {
   RequiredLine,
   SubcontractQuoteInput,
   ReconcileSubcontractInput,
+  ScopeAtomInput,
+  QuoteScopeCoverageInput,
+  AtomReconciliation,
 } from './subcontract-reconciliation';
 export { reconcileSubcontract } from './subcontract-reconciliation';
 
