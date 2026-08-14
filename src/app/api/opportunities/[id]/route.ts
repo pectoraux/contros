@@ -42,17 +42,33 @@ export async function GET(
         },
       },
       bid: true,
-      auditLogs: {
-        include: { actor: true },
-        orderBy: { createdAt: 'desc' },
-        take: 30,
-      },
     },
   })
 
   if (!opportunity) {
     return NextResponse.json({ error: 'Opportunity not found' }, { status: 404 })
   }
+
+  // Audit logs: fetch those referencing this opportunity OR its child entities.
+  // AuditLog has no direct FK to Opportunity, so query by organization + relevant entity ids.
+  const estimateIds = opportunity.estimates.map((e) => e.id)
+  const lineIds = opportunity.estimates.flatMap((e) => e.lines.map((l) => l.id))
+  const scopeItemId = opportunity.scopePackage?.items.map((i) => i.id) ?? []
+  const quoteIds = opportunity.subcontractPackages.flatMap((sp) => sp.quotes.map((q) => q.id))
+  const relevantEntityIds = [opportunity.id, ...estimateIds, ...lineIds, ...scopeItemId, ...quoteIds]
+
+  const auditLogs = await db.auditLog.findMany({
+    where: {
+      organizationId: opportunity.organizationId,
+      OR: [
+        { entityId: { in: relevantEntityIds } },
+        { action: { contains: 'ai.assistant' } },
+      ],
+    },
+    include: { actor: true },
+    orderBy: { createdAt: 'desc' },
+    take: 30,
+  })
 
   // Serialize + flatten estimates for the UI
   const estimates = opportunity.estimates.map((e) => {
@@ -188,7 +204,7 @@ export async function GET(
         })),
       })),
       bid: opportunity.bid,
-      auditLogs: opportunity.auditLogs.map((a) => ({
+      auditLogs: auditLogs.map((a) => ({
         id: a.id,
         action: a.action,
         summary: a.summary,

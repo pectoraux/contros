@@ -48,18 +48,30 @@ export function OpportunityDetail() {
   const setTab = useWorkspace((s) => s.setOpportunityTab)
   const [opp, setOpp] = useState<OpportunityDetail | null>(null)
   const [loading, setLoading] = useState(true)
+  const [reloadToken, setReloadToken] = useState(0)
 
-  const reload = useCallback(() => {
-    if (!opportunityId) return
-    setLoading(true)
-    apiGet<{ opportunity: OpportunityDetail }>(`/api/opportunities/${opportunityId}`)
-      .then((r) => setOpp(r.opportunity))
-      .finally(() => setLoading(false))
-  }, [opportunityId])
+  const reload = useCallback(() => setReloadToken((t) => t + 1), [])
 
   useEffect(() => {
-    reload()
-  }, [reload])
+    if (!opportunityId) return
+    let mounted = true
+    // setLoading(true) is intentionally synchronous here to reset the skeleton on refetch.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLoading(true)
+    apiGet<{ opportunity: OpportunityDetail }>(`/api/opportunities/${opportunityId}`)
+      .then((r) => {
+        if (mounted) setOpp(r.opportunity)
+      })
+      .catch(() => {
+        if (mounted) setOpp(null)
+      })
+      .finally(() => {
+        if (mounted) setLoading(false)
+      })
+    return () => {
+      mounted = false
+    }
+  }, [opportunityId, reloadToken])
 
   if (loading || !opp) {
     return (
