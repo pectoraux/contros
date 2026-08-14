@@ -1,0 +1,2992 @@
+# MASTER IMPLEMENTATION PROMPT — CONTRACTOR OS
+
+## 0. ROLE AND EXECUTION MODE
+
+You are the principal engineer responsible for implementing this product inside the supplied GenOffice codebase.
+
+Do not merely describe what should be built. Inspect the repository, understand the existing implementation, modify the codebase, run the application, write tests, and implement the system incrementally until the acceptance gates in this document pass.
+
+You must make engineering decisions autonomously. Do not stop to ask me to choose between obvious implementation alternatives. When the repository differs from assumptions in this document, inspect the actual code and adapt the implementation while preserving the architectural principles and domain invariants below.
+
+Before modifying anything:
+
+1. Inspect the actual repository structure.
+2. Inspect the existing package/workspace configuration.
+3. Inspect the existing shell/tab architecture.
+4. Inspect `agent-core`.
+5. Inspect the existing Docs, Sheets, Slides and PDF application boundaries.
+6. Inspect the existing persistence abstractions.
+7. Inspect existing tests and test conventions.
+8. Inspect the current AI provider implementation.
+9. Inspect licensing and trademark-related files.
+10. Determine the smallest, safest patch surface against upstream GenOffice.
+
+Do not assume the repository is identical to an older architecture description.
+
+The current upstream GenOffice repository provides Microsoft-compatible Word (`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`), PDF and Markdown editing through Electron applications, with shared engine packages and an agent skill architecture. The shell currently embeds editor views directly, while `agent-core` exposes an `AgentSkill` interface and `composeSkills()` mechanism. Build on these actual abstractions rather than rewriting them unnecessarily.
+
+---
+
+# 1. PRODUCT MISSION
+
+Build an AI-native operating system for contractor SMEs.
+
+Construction is the first industry vertical. The architecture must ultimately support other contractor/service industries without rewriting the domain core.
+
+The product's primary job is to turn an incoming opportunity/RFQ into a defensible, professional and internally standardized commercial response.
+
+The primary workflow is:
+
+```text
+Opportunity / RFQ
+    ↓
+Scope understanding
+    ↓
+Scope completeness / ambiguity analysis
+    ↓
+Estimate
+    ↓
+Self-perform / subcontract decisions
+    ↓
+Commercial adjudication
+    ↓
+Programme
+    ↓
+BOQ
+    ↓
+Method Statement
+    ↓
+JHA
+    ↓
+Tender / Bid Pack
+    ↓
+Submission
+    ↓
+Win / Loss
+    ↓
+Project
+    ↓
+Actuals
+    ↓
+Knowledge / SOP / price / productivity calibration
+```
+
+The product must not feel like:
+
+> "Microsoft Office with construction features."
+
+It must feel like:
+
+> "The estimating and operating memory of a contractor, with Office-compatible work surfaces."
+
+GenOffice's document editors are an important substrate, not the product's center of gravity.
+
+---
+
+# 2. NON-NEGOTIABLE ARCHITECTURAL PRINCIPLE
+
+The canonical source of truth is NOT an `.xlsx`, `.docx`, `.pptx`, MSP file, or PDF.
+
+The canonical source of truth is the structured contractor domain model.
+
+The central commercial object is:
+
+```text
+Estimate
+```
+
+not:
+
+```text
+BOQ
+```
+
+A BOQ is a projection of an estimate.
+
+A programme is a projection of an estimate.
+
+A Method Statement is a projection of execution knowledge associated with the estimate.
+
+A JHA is a projection of work definitions + hazard controls.
+
+A tender package is a projection of the bid and its approved deliverables.
+
+The architecture must preserve this distinction everywhere.
+
+---
+
+# 3. CANONICAL SYSTEM MODEL
+
+The system should conceptually behave as:
+
+```text
+                       OPPORTUNITY
+                           │
+                           ▼
+                     SCOPE PACKAGE
+                           │
+            ┌──────────────┼──────────────┐
+            │              │              │
+         Evidence       Questions      Assumptions
+            │              │              │
+            └──────────────┼──────────────┘
+                           ▼
+                        ESTIMATE
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+     Cost Model       Execution Strategy    Risk
+        │                  │                  │
+        │          ┌───────┼───────┐          │
+        │          │       │       │          │
+        │       Self     Hybrid  Subcontract │
+        │          │       │       │          │
+        └──────────┴───────┴───────┴──────────┘
+                           │
+                           ▼
+                    COMMERCIAL DECISION
+                           │
+             ┌─────────────┼─────────────┐
+             │             │             │
+            BOQ        PROGRAMME       TENDER DOCS
+                           │             │
+                           │       ┌─────┼─────┐
+                           │       │     │     │
+                           │      MS    JHA   Other
+                           │
+                           ▼
+                         BID
+                           │
+                    ┌──────┴──────┐
+                    │             │
+                   WON           LOST
+                    │
+                    ▼
+                  PROJECT
+                    │
+                  ACTUALS
+                    │
+                    ▼
+              KNOWLEDGE LOOP
+                    │
+         ┌──────────┼──────────┐
+         ▼          ▼          ▼
+       Prices   Productivity  SOPs
+```
+
+---
+
+# 4. GENOFFICE INTEGRATION STRATEGY
+
+Do not rewrite GenOffice.
+
+Retain the existing office applications and engines wherever practical:
+
+```text
+Docs
+Sheets
+Slides
+PDF
+Markdown
+Shell
+agent-core
+existing document engines
+existing UI primitives
+```
+
+Add:
+
+```text
+apps/contractor
+apps/plan
+```
+
+where:
+
+* `apps/contractor` is the primary Contractor Workspace.
+* `apps/plan` is the Microsoft Project-style Programme / Planning application.
+
+The Contractor Workspace should orchestrate the workflow.
+
+Users should primarily think in terms of:
+
+```text
+Client
+    ↓
+Opportunity / Project
+    ↓
+Scope
+    ↓
+Estimate
+    ↓
+Programme
+    ↓
+Deliverables
+```
+
+not:
+
+```text
+Excel
+Word
+PowerPoint
+Project
+```
+
+The existing office editors should appear as work surfaces within the contractor workflow.
+
+---
+
+# 5. REPOSITORY RULES
+
+Before implementation:
+
+## Inspect, don't assume
+
+Inspect:
+
+```text
+apps/
+packages/
+e2e/
+scripts/
+package.json
+tsconfig*
+vitest*
+CLAUDE.md
+LICENSE
+ee/
+```
+
+Inspect the current shell implementation and identify every place a new application/tab must be registered.
+
+Inspect the current `agent-core` implementation and conform to its actual interfaces.
+
+Inspect existing tests and follow existing conventions.
+
+Do not create parallel infrastructure when an existing upstream abstraction can safely be reused.
+
+Do not blindly upgrade dependencies simply because a newer version exists.
+
+Do not perform unrelated refactors.
+
+Do not modify upstream office engines unless required to integrate the Contractor OS.
+
+Keep a file:
+
+```text
+docs/UPSTREAM_PATCHES.md
+```
+
+documenting every upstream file modified and why.
+
+Prefer additive architecture over invasive modifications.
+
+---
+
+# 6. APPLICATION ARCHITECTURE
+
+Create:
+
+```text
+apps/
+  contractor/
+  plan/
+```
+
+The Contractor Workspace owns:
+
+```text
+Dashboard
+Opportunities
+Scope
+Estimates
+Subcontracting
+Bids
+Projects
+Knowledge
+Templates
+Settings
+```
+
+An opportunity/project workspace should provide navigation such as:
+
+```text
+Overview
+Scope
+Estimate
+BOQ
+Subcontractors
+Programme
+Method Statement
+JHA
+Tender Pack
+Activity / History
+```
+
+Opening a BOQ should use the existing Sheets surface where practical.
+
+Opening a Method Statement should use the existing Docs surface where practical.
+
+Opening the Programme should use `apps/plan`.
+
+Opening supporting PDFs should use the existing PDF editor.
+
+Do not create a second spreadsheet editor.
+
+Do not create a second word processor.
+
+Do not create a second PDF editor.
+
+---
+
+# 7. PACKAGE ARCHITECTURE
+
+Create business logic in packages, not inside the UI applications.
+
+Recommended structure:
+
+```text
+packages/
+  domain/
+    organizations
+    opportunities
+    scope
+    estimates
+    pricing
+    procurement
+    bids
+    projects
+    knowledge
+    hse
+    documents
+
+  engines/
+    estimate-engine
+    pricing-engine
+    risk-engine
+    schedule-engine
+    measurement-engine
+
+  bindings/
+    xlsx-binding
+    docx-binding
+    pptx-binding
+    mspxml-binding
+    pdf-binding
+
+  ai/
+    contractor-agent
+    skills/
+      intake
+      scope
+      estimating
+      procurement
+      planning
+      hse
+      knowledge
+      documents
+
+  storage/
+    db
+    repositories
+    sync
+    audit
+    attachments
+
+  industry/
+    construction
+      generic
+      ghana
+```
+
+Use exact names that fit the existing repository conventions, but preserve these boundaries.
+
+### Core rule
+
+Domain packages must not depend on Electron.
+
+Application packages may depend on domain/application services.
+
+UI must never contain pricing/business rules.
+
+AI skills must call domain services rather than duplicating business calculations.
+
+---
+
+# 8. DOMAIN MODEL
+
+Implement the core domain around the following concepts.
+
+## Organization
+
+The future multi-tenant boundary.
+
+Fields should include at minimum:
+
+```text
+id
+name
+industryPackId
+createdAt
+updatedAt
+```
+
+## User
+
+Include:
+
+```text
+id
+organizationId
+name
+email
+role
+createdAt
+updatedAt
+```
+
+Design authorization so organization isolation is explicit.
+
+---
+
+# 9. OPPORTUNITY MODEL
+
+Create:
+
+```text
+Opportunity
+```
+
+An opportunity represents an incoming commercial opportunity before and during estimating.
+
+Fields should include:
+
+```text
+id
+organizationId
+clientId
+title
+reference
+status
+receivedAt
+submissionDeadline
+source
+description
+createdBy
+createdAt
+updatedAt
+```
+
+Statuses should support at least:
+
+```text
+received
+qualifying
+no-bid
+scope-development
+estimating
+internal-review
+adjudication
+submitted
+clarification
+won
+lost
+withdrawn
+lapsed
+```
+
+---
+
+# 10. SCOPE MODEL
+
+Scope is a first-class domain object.
+
+Create:
+
+```text
+ScopePackage
+ScopeItem
+ScopeEvidence
+ScopeQuestion
+ScopeAssumption
+ScopeRevision
+```
+
+A ScopePackage should capture:
+
+```text
+where the scope came from
+what documents/evidence exist
+what is explicitly specified
+what is inferred
+what is missing
+what is ambiguous
+what assumptions are being made
+```
+
+Support evidence types such as:
+
+```text
+RFQ document
+drawing
+specification
+client BOQ
+photo
+site observation
+email
+manual note
+AI extraction
+historical reference
+```
+
+Do not assume an incoming RFQ has a complete scope.
+
+The system must distinguish:
+
+```text
+complete client scope
+partial client scope
+client BOQ requiring interpretation
+estimator-created scope
+site-derived scope
+AI-inferred scope
+```
+
+---
+
+# 11. SCOPE COMPLETENESS ENGINE
+
+Build a deterministic scope completeness mechanism.
+
+It should be able to represent:
+
+```text
+Scope completeness: 63%
+
+Known:
+    structural frame
+    roofing
+    blockwork
+
+Missing:
+    electrical specification
+    drainage route
+    ground conditions
+    door schedule
+
+Ambiguous:
+    fire protection responsibility
+    external works extent
+```
+
+The system should rank gaps according to expected commercial impact where enough information exists.
+
+This ranking is not merely cosmetic.
+
+The AI should use it to recommend:
+
+```text
+what question to ask
+what evidence to obtain
+what site observation to make
+what assumption to include
+```
+
+---
+
+# 12. SCOPE QUESTION MODEL
+
+Create a first-class entity:
+
+```text
+ScopeQuestion
+```
+
+It should support:
+
+```text
+question
+category
+evidence
+possible interpretations
+selected interpretation
+cost impact
+programme impact
+safety impact
+contractual impact
+status
+resolution
+```
+
+This is broader than simply an ambiguity probability distribution.
+
+Example:
+
+```text
+Question:
+What roof specification applies?
+
+Interpretation A:
+corrugated steel
+
+Interpretation B:
+standing seam
+
+Evidence:
+Drawing A12
+Specification S-04
+
+Selected assumption:
+Interpretation B
+
+Cost impact:
++GHS X
+
+Programme impact:
++Y days
+
+Clarification:
+required
+```
+
+---
+
+# 13. ESTIMATE MODEL
+
+Create:
+
+```text
+Estimate
+EstimateRevision
+EstimateLine
+EstimateScenario
+```
+
+An Estimate must capture the commercial reasoning behind the BOQ.
+
+Each EstimateLine should support:
+
+```text
+description
+workDefinitionId
+measurement basis
+quantity
+unit
+executionStrategy
+costBuildUp
+risk
+assumptions
+provenance
+```
+
+Execution strategy:
+
+```text
+self-perform
+subcontract
+hybrid
+undecided
+```
+
+An EstimateRevision must be immutable after finalization.
+
+A submitted bid must reference an immutable EstimateRevision.
+
+---
+
+# 14. WORK LIBRARY
+
+Create the most important knowledge entity:
+
+```text
+WorkDefinition
+WorkDefinitionVersion
+```
+
+A WorkDefinition represents how the company understands and executes a unit of work.
+
+For construction, an example might be:
+
+```text
+150mm Sandcrete Blockwork
+```
+
+A WorkDefinition should support:
+
+```text
+id
+code
+name
+industry
+category
+unit
+measurementRule
+costRecipe
+productivityRule
+crewComposition
+equipment
+wastage
+sequencing
+methodStatementFragment
+hazards
+controls
+qualityChecklist
+requiredPPE
+requiredPermits
+subcontractability
+commonAssumptions
+commonExclusions
+approvalState
+version
+```
+
+The system must treat approved work definitions as versioned knowledge.
+
+Do not silently mutate an approved work definition.
+
+Changes create a new version.
+
+---
+
+# 15. THE CENTRAL STANDARDISATION MECHANISM
+
+A work definition should drive multiple outputs.
+
+For a single approved work definition, the system should be able to derive:
+
+```text
+BOQ item
+cost build-up
+unit price
+expected productivity
+duration
+crew requirement
+equipment requirement
+method statement fragment
+hazards
+controls
+QA checklist
+subcontract scope
+```
+
+This is a critical architectural invariant.
+
+Do not implement these as unrelated copies of the same knowledge.
+
+---
+
+# 16. COST MODEL
+
+Separate:
+
+```text
+cost
+```
+
+from:
+
+```text
+sell price
+```
+
+The system must never reduce pricing to:
+
+```text
+rate = cost + markup
+```
+
+Model the stages independently:
+
+```text
+resource cost
+    ↓
+direct work cost
+    ↓
+project-specific cost
+    ↓
+risk / contingency
+    ↓
+commercial strategy
+    ↓
+sell price
+```
+
+Support:
+
+```text
+material
+labour
+plant
+subcontract
+fee
+transport
+wastage
+overhead
+risk
+profit
+commercial adjustments
+```
+
+---
+
+# 17. RESOURCE MODEL
+
+Create:
+
+```text
+Resource
+ResourcePriceObservation
+```
+
+Resource kinds should include:
+
+```text
+labour
+material
+plant
+subcontract
+fee
+```
+
+Resource records should include:
+
+```text
+id
+code
+name
+unit
+kind
+currency
+regional metadata
+```
+
+Price observations must be append-only.
+
+Never overwrite historical resource prices.
+
+---
+
+# 18. PRICE PROVENANCE
+
+Every important price must be traceable.
+
+Represent source/provenance such as:
+
+```text
+supplier quotation
+purchase invoice
+market survey
+manual entry
+historical bid
+approved catalogue recipe
+subcontract quote
+```
+
+A computed rate should be reconstructable.
+
+Example:
+
+```text
+GHS 342.17/m²
+    ↓
+Work Definition version 14
+    ↓
+cement price observation 817
+sand price observation 942
+labour policy version 7
+productivity observation 113
+```
+
+The user must be able to inspect why a rate exists.
+
+---
+
+# 19. PROHIBITION ON SILENT AI PRICING
+
+This is non-negotiable.
+
+The LLM must never silently invent a live bid price.
+
+AI may:
+
+```text
+propose
+infer
+retrieve
+compare
+explain
+flag
+```
+
+AI may not directly commit a price to the canonical estimate.
+
+All committed prices must come through a deterministic domain calculation.
+
+Any unsourced estimate must be explicitly classified:
+
+```text
+unsourced estimate
+```
+
+with:
+
+```text
+rationale
+confidence
+user acknowledgement
+```
+
+and it must appear in the pre-submission control screen.
+
+---
+
+# 20. PRICING SERVICE
+
+Implement a deterministic pricing service.
+
+It must accept:
+
+```text
+workDefinition
+quantity
+resource prices
+productivity
+wastage
+execution strategy
+overhead policy
+profit policy
+risk treatment
+```
+
+and return:
+
+```text
+breakdown
+direct cost
+project cost
+risk
+overhead
+profit
+sell price
+provenance
+```
+
+The calculation must be deterministic.
+
+Do not perform financial arithmetic in LLM code.
+
+Do not use arbitrary floating-point calculations where precise monetary handling is required.
+
+Use a robust money representation and explicit rounding policy.
+
+---
+
+# 21. SUBCONTRACTING
+
+Treat subcontracting as an execution strategy, not as a side feature.
+
+A WorkPackage must support:
+
+```text
+name
+scope
+estimateLineIds
+executionStrategy
+supplier/subcontractor
+enquiries
+quotes
+selectedQuote
+scopeCoverage
+scopeGaps
+```
+
+Support:
+
+```text
+self-perform
+subcontract
+hybrid
+```
+
+The system must reconcile:
+
+```text
+required work package scope
+```
+
+against:
+
+```text
+supplier/subcontractor quoted scope
+```
+
+and identify:
+
+```text
+excluded work
+missing work
+ambiguous work
+assumptions
+commercial exclusions
+programme conflicts
+```
+
+Example:
+
+```text
+Package:
+Aluminium windows
+
+Required:
+GHS X package scope
+
+Subcontractor A quote:
+GHS Y
+
+Excluded:
+scaffolding
+delivery
+sealant
+installation at level 3
+
+Coverage:
+87%
+
+WARNING:
+GHS Z of required scope remains uncovered.
+```
+
+No subcontract quote should be selectable as the commercial basis without scope coverage being visible.
+
+---
+
+# 22. SUPPLIER QUOTE MODEL
+
+Support:
+
+```text
+SubcontractEnquiry
+SubcontractQuote
+QuoteLine
+QuoteExclusion
+QuoteAssumption
+QuoteRevision
+```
+
+The AI may parse incoming quote documents.
+
+The parsed information must enter structured records and remain reviewable.
+
+Never silently overwrite supplier data with AI interpretation.
+
+---
+
+# 23. COMMERCIAL ADJUDICATION
+
+Create a deliberate commercial decision layer.
+
+An adjudication should contain:
+
+```text
+computed cost
+computed risk
+target margin
+submitted price before adjustment
+director adjustment
+adjustment rationale
+final submitted price
+approver
+approval timestamp
+```
+
+The system should preserve the difference between:
+
+```text
+system-calculated recommendation
+```
+
+and:
+
+```text
+human commercial decision
+```
+
+This enables future analysis of commercial judgement.
+
+---
+
+# 24. RISK
+
+Implement basic risk support, but do not over-engineer advanced Monte Carlo in the first milestone.
+
+The initial model should support:
+
+```text
+risk
+probability
+impact
+mitigation
+affected estimate lines
+```
+
+and:
+
+```text
+optimistic
+likely
+pessimistic
+```
+
+where appropriate.
+
+Build the domain interfaces so a more advanced stochastic engine can be added later.
+
+---
+
+# 25. PROGRAMME / PROJECT CLONE
+
+Create:
+
+```text
+apps/plan
+packages/engines/schedule-engine
+```
+
+Do NOT attempt to build `.mpp` parsing initially.
+
+Native project data should live in the Contractor domain.
+
+Initial export priority:
+
+```text
+MS Project XML
+PDF / printable Gantt
+PNG
+XLSX
+```
+
+Import priority:
+
+```text
+MS Project XML
+```
+
+Treat `.mpp` support as out of scope for the first implementation unless a reliable library already exists and licensing is acceptable.
+
+---
+
+# 26. SCHEDULE ENGINE
+
+Implement deterministic schedule functionality including:
+
+```text
+activities
+durations
+dependencies
+calendars
+working days
+lags
+constraints
+forward pass
+backward pass
+critical path
+float
+baselines
+```
+
+Support dependency types:
+
+```text
+FS
+SS
+FF
+SF
+```
+
+with lag.
+
+Do not build an attractive Gantt UI on top of a fake scheduling engine.
+
+The engine must calculate actual CPM values.
+
+Write unit/property tests for scheduling invariants.
+
+---
+
+# 27. BOQ → PROGRAMME GENERATION
+
+This is a flagship capability.
+
+Work definitions should have productivity data.
+
+For example:
+
+```text
+quantity = 2,400 m²
+productivity = 12 m² / crew-day
+crews = 2
+```
+
+Then:
+
+```text
+duration = quantity / (productivity × crews)
+```
+
+The generated programme should combine:
+
+```text
+estimate quantities
+work definitions
+productivity
+crew assumptions
+sequencing rules
+calendars
+dependencies
+```
+
+Produce a draft programme from the estimate.
+
+The planner can edit it afterward.
+
+The goal is:
+
+> The planner modifies a useful generated programme instead of drawing the programme from zero.
+
+---
+
+# 28. METHOD STATEMENT / JHA
+
+Method Statements and JHAs must be generated from structured work knowledge.
+
+A WorkDefinition can contribute:
+
+```text
+method fragment
+hazards
+controls
+QA
+PPE
+permits
+```
+
+The document assembly engine combines these into project-specific deliverables.
+
+Do not generate every Method Statement from scratch with an LLM.
+
+Prefer:
+
+```text
+approved work definition
++
+project conditions
++
+project-specific assumptions
++
+programme
+=
+draft method statement
+```
+
+Likewise:
+
+```text
+work definitions
++
+hazard library
++
+project conditions
+=
+draft JHA
+```
+
+AI can improve wording, detect omissions, and suggest additions.
+
+It must not erase approved controls without explicit human action.
+
+---
+
+# 29. TENDER PACKAGE
+
+Create a first-class tender package entity.
+
+A package should support:
+
+```text
+cover letter
+BOQ
+pricing summary
+programme
+method statement
+JHA
+assumptions
+clarifications
+company information
+certificates
+supporting documents
+```
+
+It must have a completeness checklist.
+
+Example:
+
+```text
+Scope                    ✓
+BOQ                      ✓
+Programme                ✓
+Method Statement         ✓
+JHA                      ✓
+Clarifications           ✓
+Assumptions              ✓
+Company Profile          ✓
+Required Certificates    ⚠
+Director Approval        ⚠
+```
+
+The system should provide one explicit:
+
+```text
+Generate Tender Pack
+```
+
+operation.
+
+---
+
+# 30. DOCUMENT BINDING
+
+Create domain-to-document bindings.
+
+Support at minimum:
+
+```text
+Estimate → XLSX
+Programme → MSP XML/PDF/XLSX
+Estimate + WorkDefinitions → DOCX Method Statement
+Estimate + Hazards → DOCX JHA
+Bid → tender package
+```
+
+Do not assume the generated file remains the canonical record.
+
+---
+
+# 31. DOCUMENT EDITING CONFLICT POLICY
+
+When a domain object generates an Office file, treat the generated file as a working representation.
+
+Do not blindly synchronize every edit back into the canonical model.
+
+Use:
+
+```text
+Generate
+    ↓
+Working copy
+    ↓
+User edits
+    ↓
+Detect differences
+    ↓
+Review / Reconcile
+    ↓
+Adopt selected changes
+    ↓
+Update canonical domain model
+```
+
+Financially meaningful changes must require explicit reconciliation.
+
+Formatting-only changes should remain presentation-owned.
+
+---
+
+# 32. TENDER TEMPLATES
+
+Templates must be data/configuration-driven.
+
+A template should map:
+
+```text
+domain entity/field
+        ↓
+document location
+```
+
+Support template authoring without requiring developers to hard-code each client format.
+
+Examples:
+
+```text
+generic BOQ
+client-specific BOQ
+public procurement template
+method statement template
+JHA template
+programme template
+cover letter
+```
+
+---
+
+# 33. KNOWLEDGE / SOP SYSTEM
+
+The Work Library is the company's institutional memory.
+
+It must be easy for an SME to:
+
+```text
+create work definition
+clone an existing one
+compare versions
+approve
+deprecate
+update from actuals
+```
+
+Knowledge should be versioned.
+
+Approved definitions must be immutable.
+
+---
+
+# 34. META-SOP: CREATING A NEW SOP
+
+Implement the process for creating a new work definition as data-driven workflow.
+
+Default workflow:
+
+```text
+1. Detect knowledge gap
+2. Gather evidence
+3. Find similar known work
+4. Draft WorkDefinition
+5. Capture cost recipe
+6. Capture productivity
+7. Capture execution method
+8. Capture hazards
+9. Capture controls
+10. Capture QA
+11. Capture PPE / permits
+12. Capture subcontract treatment
+13. Validate
+14. Review
+15. Approve
+16. Publish version
+17. Calibrate after actual work
+```
+
+The workflow itself should be configurable later.
+
+The system should be able to say:
+
+> "This estimate contains a work item that has no approved WorkDefinition. Create one?"
+
+and guide the estimator through the workflow.
+
+---
+
+# 35. LEARNING FROM ACTUALS
+
+The system must support the loop:
+
+```text
+planned
+    ↓
+executed
+    ↓
+actual
+    ↓
+variance
+    ↓
+knowledge improvement
+```
+
+Capture lightweight actuals initially:
+
+```text
+quantity completed
+days taken
+crew size
+material consumed
+material purchase price
+subcontract final cost
+```
+
+Then calculate:
+
+```text
+planned productivity
+vs
+actual productivity
+```
+
+and:
+
+```text
+planned cost
+vs
+actual cost
+```
+
+Generate suggestions such as:
+
+```text
+Your standard blockwork productivity is 12 m²/day.
+
+The last 4 comparable projects averaged 9.6 m²/day.
+
+Consider revising the standard or creating a restricted-access variant.
+```
+
+Do not automatically modify approved knowledge.
+
+Generate an amendment proposal.
+
+---
+
+# 36. KNOWLEDGE HEALTH
+
+Create a mechanism for identifying stale or unreliable knowledge.
+
+Examples:
+
+```text
+Price observation older than X days
+Productivity variance > threshold
+Repeated subcontract exclusion
+Repeated cost overrun
+WorkDefinition never reviewed
+Unapproved rate repeatedly used
+```
+
+Expose these as:
+
+```text
+Knowledge Health
+```
+
+or equivalent.
+
+---
+
+# 37. BID OUTCOME LEARNING
+
+Every submitted bid should support:
+
+```text
+won
+lost
+withdrawn
+unknown
+```
+
+For lost bids, capture where known:
+
+```text
+price
+programme
+technical
+prequalification
+relationship
+unknown
+```
+
+Support:
+
+```text
+winning price if known
+our rank if known
+client feedback
+loss reason
+```
+
+This should eventually enable analysis like:
+
+```text
+win rate by margin
+win rate by client
+win rate by market
+win rate by execution strategy
+win rate by bid size
+win rate by subcontract percentage
+```
+
+Do not build sophisticated predictive ML initially.
+
+First make the data correct.
+
+---
+
+# 38. DATABASE — NEON POSTGRESQL
+
+Use **Neon PostgreSQL as the canonical database**.
+
+Do not use SQLite as the authoritative source of truth.
+
+The target architecture is:
+
+```text
+Client
+  ↓
+API / application layer
+  ↓
+Domain services
+  ↓
+Neon PostgreSQL
+```
+
+A client-side local cache/offline store may exist, but it is a cache/working replica, not canonical truth.
+
+---
+
+# 39. DATABASE PRINCIPLES
+
+Design the database for multi-user and multi-organization use from day one.
+
+Major entities should carry:
+
+```text
+id
+organization_id
+created_by
+updated_by
+created_at
+updated_at
+```
+
+Where appropriate also support:
+
+```text
+version
+revision
+status
+```
+
+Use relational integrity.
+
+Use foreign keys.
+
+Use database transactions for commercially important operations.
+
+Do not put the canonical business state in JSON blobs merely because they are convenient.
+
+Use JSON/JSONB where flexibility is genuinely useful, but core relationships should be relational.
+
+---
+
+# 40. REVISIONS
+
+Commercially significant state must be reproducible.
+
+At minimum:
+
+```text
+WorkDefinitionVersion
+EstimateRevision
+BidSubmission
+ProgrammeRevision
+DocumentSnapshot
+```
+
+A submitted bid must identify exactly which versions were used.
+
+For example:
+
+```text
+BidSubmission
+    → EstimateRevision 17
+    → Work Library snapshot 8
+    → ProgrammeRevision 5
+    → DocumentSnapshot 23
+```
+
+Historical bids must remain reproducible even after the company updates its standard rates.
+
+---
+
+# 41. AUDIT LOG
+
+Create an append-only audit mechanism.
+
+Track important actions such as:
+
+```text
+estimate created
+rate changed
+assumption added
+assumption resolved
+subcontract quote selected
+commercial adjustment made
+bid approved
+bid submitted
+catalog approved
+catalog deprecated
+document generated
+document reconciled
+actual recorded
+```
+
+The audit record should capture:
+
+```text
+who
+what
+when
+entity
+entity id
+before/after where appropriate
+```
+
+---
+
+# 42. API / APPLICATION LAYER
+
+Do not allow renderers to connect directly to PostgreSQL.
+
+Use an application/API layer to enforce:
+
+```text
+authentication
+authorization
+tenant isolation
+business invariants
+transactions
+auditing
+AI tool authorization
+document generation
+```
+
+The precise API technology should follow the existing repository and deployment constraints, but the boundary itself is mandatory.
+
+---
+
+# 43. OFFLINE SUPPORT
+
+Construction environments may have poor connectivity.
+
+The product should support offline work where practical.
+
+Architecture:
+
+```text
+Neon PostgreSQL
+      ↑
+   sync/API
+      ↑
+local client cache
+      +
+pending mutations
+```
+
+Initial implementation may limit offline functionality to already-synced project data and non-conflicting operations.
+
+Do not build an elaborate distributed synchronization system before the core domain works.
+
+But structure the client data layer so one can be added without rewriting domain logic.
+
+---
+
+# 44. FILE STORAGE
+
+Do not put large document/image binaries directly in PostgreSQL unless there is a very specific reason.
+
+Use object storage for:
+
+```text
+RFQs
+drawings
+photos
+supplier quotations
+generated PDFs
+Office files
+site media
+certificates
+```
+
+PostgreSQL stores:
+
+```text
+metadata
+object key
+hash
+mime type
+size
+owner
+organization
+version
+```
+
+Implement content hashing so attachments can be deduplicated/referenced safely.
+
+---
+
+# 45. AI ARCHITECTURE
+
+Use GenOffice's existing `agent-core` skill architecture.
+
+Create a Contractor Agent composed from skills such as:
+
+```text
+intake
+scope
+estimating
+procurement
+planning
+hse
+knowledge
+documents
+```
+
+Namespace tools to avoid collisions.
+
+Examples:
+
+```text
+scope_extract_rfq
+scope_identify_gaps
+scope_create_question
+
+estimate_find_work_definition
+estimate_price_line
+estimate_explain_rate
+estimate_compare_history
+
+procurement_create_subcontract_rfq
+procurement_parse_quote
+procurement_reconcile_scope
+
+plan_generate_programme
+plan_test_compression
+
+hse_generate_jha
+hse_generate_method_statement
+
+knowledge_draft_work_definition
+knowledge_compare_versions
+knowledge_propose_calibration
+```
+
+Tool names must be globally unique.
+
+---
+
+# 46. AI SAFETY MODEL
+
+The AI should be treated as an assistant over the domain model, not as the domain model.
+
+AI is allowed to:
+
+```text
+read
+extract
+search
+classify
+suggest
+draft
+compare
+explain
+flag
+```
+
+AI should not directly bypass:
+
+```text
+pricing service
+approval workflow
+revision mechanism
+audit system
+tenant isolation
+document reconciliation
+```
+
+All write tools must validate inputs through domain/application services.
+
+---
+
+# 47. AI RETRIEVAL
+
+The highest-value retrieval corpus is the company's own knowledge:
+
+```text
+approved WorkDefinitions
+price observations
+historical estimates
+past bids
+supplier/subcontract quotes
+actual project outcomes
+SOPs
+templates
+assumptions
+clarifications
+```
+
+Do not make generic LLM knowledge the source of construction prices.
+
+The system should prefer internal evidence.
+
+A model may know general construction concepts; it should not be trusted to know the company's current local prices.
+
+---
+
+# 48. AI ORCHESTRATION
+
+The flagship user command should eventually support:
+
+> "Price this RFQ."
+
+The system should orchestrate:
+
+```text
+ingest RFQ
+extract scope
+identify missing scope
+find matching WorkDefinitions
+create estimate lines
+identify subcontract packages
+find historical prices
+calculate rates
+flag ambiguity
+prepare programme
+prepare MS
+prepare JHA
+run tender checklist
+present unresolved issues
+```
+
+The user should be able to intervene at important decision points.
+
+Do not build an opaque autonomous agent that makes unreviewable commercial decisions.
+
+---
+
+# 49. SITE VISITS — ARCHITECTURAL SEAM
+
+Do not fully implement the mobile site-capture system in the first MVP.
+
+But create the data model needed for:
+
+```text
+SiteObservation
+```
+
+with:
+
+```text
+bid/opportunity reference
+timestamp
+location when available
+media
+transcript
+measurements
+checklist item
+linked ScopeQuestions
+```
+
+Future workflow:
+
+```text
+Scope gaps
+    ↓
+AI generates site-visit checklist
+    ↓
+mobile field capture
+    ↓
+ScopeEvidence
+    ↓
+ScopeQuestions resolved
+    ↓
+Estimate updated
+```
+
+No domain rewrite should be necessary to add this later.
+
+---
+
+# 50. PROJECT CLONE UI
+
+The Project clone should look and behave like a serious professional planning application.
+
+Minimum initial UX:
+
+```text
+activity table
+Gantt timeline
+task hierarchy
+dependencies
+duration editing
+calendar
+milestones
+critical path
+baseline
+resource assignment
+```
+
+The visual quality must be professional enough that a user familiar with Microsoft Project can understand it immediately.
+
+But do not spend months copying every Microsoft Project feature.
+
+Prioritize construction tender/programming workflows.
+
+---
+
+# 51. CONSTRUCTION-SPECIFIC PROGRAMME FEATURES
+
+The Construction industry pack should eventually support:
+
+```text
+working-day calendars
+six-day weeks
+public holidays
+rain-sensitive activities
+curing periods
+lead times
+mobilization
+site establishment
+inspection hold points
+handover milestones
+```
+
+Keep these in the construction industry pack or schedule configuration, not hard-coded into generic scheduling algorithms.
+
+---
+
+# 52. FIRST VERSION UX
+
+The first screen should not be an empty office suite.
+
+It should show something like:
+
+```text
+Good morning.
+
+Open Opportunities
+    7
+
+Bids Due This Week
+    3
+
+Awaiting Subcontractor Quotes
+    5
+
+Estimates Needing Review
+    2
+
+Knowledge Alerts
+    4
+```
+
+Primary action:
+
+```text
+New Opportunity
+```
+
+The user should be led into the contractor workflow immediately.
+
+---
+
+# 53. ESTIMATE UX
+
+The estimate UI should allow the user to see:
+
+```text
+Scope item
+Work definition
+Quantity
+Unit
+Direct cost
+Risk
+Subcontract
+Sell price
+Margin
+Confidence
+Source
+```
+
+Every important rate should expose:
+
+```text
+Why this price?
+```
+
+Clicking it should reveal the calculation lineage.
+
+Example:
+
+```text
+GHS 342.17/m²
+
+Based on:
+Work Definition v14
+Cement: supplier quote #183
+Sand: invoice #982
+Labour: labour policy v7
+Productivity: project P-102
+Wastage: 5%
+```
+
+---
+
+# 54. ESTIMATE CONFIDENCE
+
+Confidence should not be one arbitrary number generated by the LLM.
+
+Derive it from evidence.
+
+Potential factors:
+
+```text
+price freshness
+price source
+work definition approval
+historical similarity
+scope completeness
+subcontract quote availability
+productivity evidence
+measurement certainty
+```
+
+Expose the contributors.
+
+---
+
+# 55. PRE-SUBMISSION CONTROL
+
+Before a bid can be finalized, run a deterministic validation pipeline.
+
+At minimum check:
+
+```text
+scope completeness
+unresolved assumptions
+unpriced lines
+unapproved rates
+subcontract scope gaps
+missing required deliverables
+programme compliance
+JHA coverage
+method statement coverage
+commercial approval
+```
+
+Display:
+
+```text
+PASS
+WARNING
+BLOCKER
+```
+
+A blocker requires explicit resolution or an explicit authorized override.
+
+---
+
+# 56. SECURITY / TENANCY
+
+Every query that accesses organization-owned data must be organization-scoped.
+
+Never trust a renderer-provided organization ID.
+
+Resolve organization membership server-side from authenticated identity.
+
+All AI retrieval must be tenant-aware.
+
+A user's model context must never contain another organization's data.
+
+Attachments must obey the same access rules.
+
+---
+
+# 57. TESTING STRATEGY
+
+The highest test priority is money and reproducibility.
+
+### Unit tests
+
+At minimum:
+
+```text
+pricing engine
+measurement engine
+estimate calculations
+scope completeness
+scope reconciliation
+schedule engine
+document bindings
+revision logic
+permission checks
+```
+
+### Property tests
+
+For scheduling where practical:
+
+```text
+critical path invariants
+float invariants
+dependency ordering
+```
+
+### Golden tests
+
+For:
+
+```text
+xlsx generation
+docx generation
+MS Project XML
+tender package
+```
+
+### Integration tests
+
+Cover:
+
+```text
+RFQ
+→ scope
+→ estimate
+→ subcontract
+→ bid
+→ deliverables
+```
+
+### End-to-end
+
+The final MVP must have at least one real-world-style end-to-end fixture.
+
+---
+
+# 58. HISTORICAL BID VALIDATION GATE
+
+This is the most important gate.
+
+Before declaring the estimating system working:
+
+Use multiple historical bids as fixtures.
+
+Required test set:
+
+```text
+3 straightforward bids
+3 subcontract-heavy bids
+2 ambiguous bids
+1 client-provided BOQ
+1 estimator-created scope
+```
+
+For each, compare:
+
+```text
+scope
+major assumptions
+quantities
+cost
+subcontract treatment
+submitted price
+programme assumptions
+```
+
+The system must reproduce the historical commercial reasoning closely enough that an experienced estimator can explain the differences.
+
+Do not optimize the application to one fixture.
+
+The point is to discover model errors.
+
+---
+
+# 59. IMPLEMENTATION PHASES
+
+## PHASE 0 — REPOSITORY HARDENING
+
+Tasks:
+
+```text
+inspect repository
+document architecture
+confirm build
+confirm tests
+rebrand application
+remove/segregate any non-permissible licensed components
+replace inappropriate AI provider coupling
+document upstream patches
+```
+
+Acceptance:
+
+```text
+existing GenOffice applications still build
+existing tests pass
+new application naming is consistent
+```
+
+---
+
+# 60. PHASE 1 — DOMAIN + DATABASE
+
+Implement:
+
+```text
+organization
+user
+opportunity
+scope
+scope questions
+work definitions
+resources
+prices
+estimates
+estimate revisions
+subcontract packages
+bids
+audit
+```
+
+Use Neon PostgreSQL.
+
+Create migrations.
+
+Create repositories/data-access layer.
+
+Create application/domain services.
+
+Do not build polished UI before the domain model and tests exist.
+
+Acceptance gate:
+
+Historical bids can be represented and calculated without relying on spreadsheet cells as canonical storage.
+
+---
+
+# 61. PHASE 2 — CONTRACTOR WORKSPACE
+
+Implement:
+
+```text
+dashboard
+opportunities
+scope workspace
+estimate workspace
+work library
+subcontract workspace
+bid status
+```
+
+Acceptance:
+
+A user can take an opportunity from intake to estimate inside the product.
+
+---
+
+# 62. PHASE 3 — BOQ + OFFICE INTEGRATION
+
+Implement:
+
+```text
+estimate → BOQ
+BOQ templates
+XLSX projection
+working-copy model
+reconciliation
+```
+
+Acceptance:
+
+A generated BOQ opens correctly in Excel-compatible software and preserves required formatting.
+
+A modified BOQ can be reconciled back into the estimate intentionally.
+
+---
+
+# 63. PHASE 4 — PROGRAMME CLONE
+
+Implement:
+
+```text
+schedule engine
+Gantt UI
+dependencies
+calendar
+critical path
+BOQ → programme
+MS Project XML export
+PDF export
+```
+
+Acceptance:
+
+A programme can be generated from the estimate and then manually adjusted.
+
+---
+
+# 64. PHASE 5 — METHOD STATEMENT / JHA
+
+Implement:
+
+```text
+WorkDefinition → method fragments
+WorkDefinition → hazards
+Project-specific assembly
+DOCX generation
+```
+
+Acceptance:
+
+One opportunity can generate a tender-ready:
+
+```text
+BOQ
+Programme
+Method Statement
+JHA
+```
+
+from shared domain data.
+
+---
+
+# 65. PHASE 6 — AI
+
+Only after the deterministic domain workflows work.
+
+Implement:
+
+```text
+intake skill
+scope skill
+estimating skill
+procurement skill
+planning skill
+hse skill
+knowledge skill
+document skill
+```
+
+AI should accelerate existing workflows, not define them.
+
+Acceptance:
+
+The AI can help execute the full tender flow without bypassing provenance, approval, or calculation rules.
+
+---
+
+# 66. PHASE 7 — LEARNING LOOP
+
+Implement:
+
+```text
+bid outcomes
+project actuals
+variance
+productivity observations
+price calibration
+knowledge amendment proposals
+```
+
+Acceptance:
+
+A completed project can create an evidence-backed proposal to update a WorkDefinition.
+
+---
+
+# 67. DO NOT BUILD YET
+
+Explicitly defer:
+
+```text
+advanced Monte Carlo
+earned value
+full ERP/accounting
+inventory management
+payroll
+full site project management
+Primavera XER
+complex .mpp reverse engineering
+deep mobile application
+advanced predictive ML
+automatic autonomous bidding
+```
+
+Build them only when justified by actual user workflows.
+
+---
+
+# 68. GENERALIZATION BEYOND CONSTRUCTION
+
+The core domain must remain industry-neutral.
+
+Construction-specific concepts should live in:
+
+```text
+industry/construction/*
+```
+
+rather than inside:
+
+```text
+estimate-engine
+pricing-engine
+schedule-engine
+knowledge-core
+```
+
+A generic WorkDefinition should work for any contractor.
+
+Industry packs define:
+
+```text
+terminology
+taxonomies
+units
+measurement standards
+hazards
+starter work definitions
+document templates
+sequencing defaults
+```
+
+The core must not know what concrete is.
+
+---
+
+# 69. CODE QUALITY RULES
+
+Follow these strictly:
+
+1. No business logic in React components.
+2. No direct SQL from UI.
+3. No direct PostgreSQL from renderer code.
+4. No financial calculations in LLM prompts.
+5. No hidden AI mutations of commercial records.
+6. No mutable approved WorkDefinitions.
+7. No mutable submitted EstimateRevisions.
+8. No silent changes to bid history.
+9. No hard-coded construction concepts in generic engines.
+10. No duplicate business logic between AI tools and UI actions.
+11. No unnecessary rewrites of GenOffice internals.
+12. Every new domain rule gets tests.
+
+---
+
+# 70. PERFORMANCE
+
+The app should remain responsive for normal SME workloads.
+
+Do not load every historical bid and document into the renderer.
+
+Use:
+
+```text
+pagination
+lazy loading
+indexed queries
+background document generation
+incremental search
+```
+
+Large document/file processing should not freeze the main UI.
+
+---
+
+# 71. ERROR HANDLING
+
+Never allow a failed AI call to corrupt canonical state.
+
+Never partially commit an estimate mutation.
+
+Use transactions for related commercial updates.
+
+Surface meaningful errors.
+
+Examples:
+
+```text
+Unable to price line because WorkDefinition is missing an approved recipe.
+
+Unable to submit because subcontract package coverage is incomplete.
+
+Unable to generate JHA because the work definition lacks approved hazard controls.
+```
+
+---
+
+# 72. OBSERVABILITY
+
+At minimum provide structured logging for:
+
+```text
+database errors
+document generation
+AI tool calls
+AI failures
+pricing calculations
+bid submissions
+sync operations
+```
+
+Do not log secrets or sensitive document contents unnecessarily.
+
+---
+
+# 73. AI PROVIDER ABSTRACTION
+
+Do not couple the product to GenOffice's upstream AI-credit assumptions.
+
+Provide a clean provider layer supporting future:
+
+```text
+OpenAI
+Anthropic
+Google
+hosted gateway
+```
+
+The application must still function without AI.
+
+AI is an enhancement, not a hard dependency for deterministic estimating.
+
+---
+
+# 74. UI DESIGN PRINCIPLE
+
+The visual system should feel:
+
+```text
+professional
+calm
+business-critical
+information-dense
+clear
+fast
+```
+
+Avoid making it look like a generic AI chatbot.
+
+AI should be integrated into workflows.
+
+Examples:
+
+```text
+Explain this rate
+Find similar work
+Identify missing scope
+Draft clarification
+Compare subcontract quotes
+Generate programme
+Review JHA
+```
+
+not merely:
+
+```text
+Ask AI
+```
+
+everywhere.
+
+---
+
+# 75. MASTER USER EXPERIENCE
+
+A user should ultimately be able to perform:
+
+```text
+"New Opportunity"
+        ↓
+Upload RFQ
+        ↓
+AI extracts scope
+        ↓
+System says:
+"63% complete"
+        ↓
+User resolves / accepts assumptions
+        ↓
+System creates estimate
+        ↓
+Known WorkDefinitions price known work
+        ↓
+Unknown work creates Knowledge Gap
+        ↓
+Subcontract packages created
+        ↓
+Supplier quotes imported
+        ↓
+Coverage reconciled
+        ↓
+Estimate adjudicated
+        ↓
+Programme generated
+        ↓
+Method Statement generated
+        ↓
+JHA generated
+        ↓
+Tender checklist passed
+        ↓
+Tender pack generated
+        ↓
+Submitted
+        ↓
+Outcome recorded
+```
+
+That should be the north-star workflow.
+
+---
+
+# 76. SUCCESS CRITERIA
+
+The MVP is successful only if a real SME can take a real RFQ and materially reduce the work required to produce a professional bid.
+
+Specifically:
+
+### Estimating
+
+The system can reconstruct historical bids with explainable pricing lineage.
+
+### Standardization
+
+An approved WorkDefinition can drive cost, productivity, programme, method statement, JHA and QA outputs.
+
+### Ambiguity
+
+The system explicitly surfaces incomplete/ambiguous scope rather than burying it in estimator memory.
+
+### Subcontracting
+
+The system exposes uncovered scope in subcontractor quotations.
+
+### Documents
+
+The system produces usable Office-compatible tender deliverables.
+
+### Programme
+
+The system generates a useful first draft of the Programme from the estimate.
+
+### Knowledge
+
+The organization accumulates reusable pricing, productivity and SOP knowledge.
+
+### AI
+
+AI accelerates these workflows without becoming the authority for financial truth.
+
+---
+
+# 77. IMPORTANT IMPLEMENTATION ORDER
+
+Do NOT start by building the Project clone.
+
+Do NOT start by building the AI chatbot.
+
+Do NOT start by making the dashboard beautiful.
+
+Do NOT start by cloning Microsoft Project's feature list.
+
+Start with:
+
+```text
+repository inspection
+    ↓
+database/domain model
+    ↓
+estimate engine
+    ↓
+Work Library
+    ↓
+historical bid fixtures
+    ↓
+Contractor Workspace
+    ↓
+BOQ projection
+```
+
+Only after that:
+
+```text
+Programme
+MS/JHA
+AI
+analytics
+```
+
+---
+
+# 78. FIRST IMPLEMENTATION TASK
+
+Your first task is NOT to write thousands of lines of code.
+
+Perform a repository audit.
+
+Produce an internal implementation map covering:
+
+```text
+existing applications
+existing packages
+existing shell integration points
+existing persistence
+existing AI architecture
+existing document engines
+existing tests
+current build commands
+license boundaries
+branding locations
+```
+
+Then implement Phase 0.
+
+After Phase 0 is green, implement Phase 1.
+
+Do not prematurely implement later phases.
+
+---
+
+# 79. REQUIRED DEVELOPMENT BEHAVIOR
+
+At the end of each meaningful implementation phase:
+
+1. Run typechecking.
+2. Run unit tests.
+3. Run relevant integration tests.
+4. Run the application.
+5. Verify the actual user flow.
+6. Fix failures before proceeding.
+7. Record architectural decisions in documentation.
+8. Keep the working tree coherent.
+
+Do not claim something is implemented merely because source files exist.
+
+Verify that it actually works.
+
+---
+
+# 80. REQUIRED FINAL DELIVERABLES FROM THE IMPLEMENTATION
+
+When the implementation reaches a stable checkpoint, provide:
+
+```text
+1. What was implemented
+2. Files/packages added
+3. Existing files modified
+4. Database migrations
+5. Environment variables required
+6. Tests added
+7. Tests passed
+8. Known limitations
+9. Upstream GenOffice patches
+10. Next implementation gate
+```
+
+Do not claim tests passed unless they were actually run.
+
+---
+
+# 81. FINAL ARCHITECTURAL INVARIANTS
+
+These are the rules you must preserve even when making implementation decisions:
+
+```text
+INVARIANT 1
+The domain model is the source of truth, not Office files.
+
+INVARIANT 2
+Estimate is the canonical commercial object; BOQ is a projection.
+
+INVARIANT 3
+Every important price has provenance.
+
+INVARIANT 4
+Approved WorkDefinitions are versioned and immutable.
+
+INVARIANT 5
+AI cannot silently commit a price.
+
+INVARIANT 6
+Financial logic is deterministic and testable.
+
+INVARIANT 7
+Subcontract scope must be reconciled against required scope.
+
+INVARIANT 8
+Submitted bids are reproducible from immutable revisions.
+
+INVARIANT 9
+Documents are projections/working copies, not canonical financial state.
+
+INVARIANT 10
+Neon PostgreSQL is the canonical persistence layer.
+
+INVARIANT 11
+Client-side local data is cache/offline state, not canonical truth.
+
+INVARIANT 12
+Every organization is isolated from every other organization.
+
+INVARIANT 13
+Generic engines are industry-neutral.
+
+INVARIANT 14
+Construction-specific behavior belongs in the construction industry pack.
+
+INVARIANT 15
+The Contractor Workspace is the primary UX.
+
+INVARIANT 16
+The Project clone is downstream of estimating.
+
+INVARIANT 17
+The Work Library is a first-class product feature.
+
+INVARIANT 18
+Actual project outcomes feed the knowledge loop.
+
+INVARIANT 19
+GenOffice is a reusable office/document substrate, not the business domain.
+
+INVARIANT 20
+Do not build complexity before proving the commercial workflow.
+```
+
+---
+
+# 82. FINAL NORTH STAR
+
+Build this product so that, after sufficient use, the company can answer:
+
+> What work are we being asked to do?
+
+> What don't we know yet?
+
+> How have we priced this work before?
+
+> Why is this rate what it is?
+
+> Should we self-perform or subcontract it?
+
+> What does the subcontractor actually cover?
+
+> What assumptions are protecting us commercially?
+
+> How long should this work take?
+
+> What is the expected programme?
+
+> What method and hazards apply?
+
+> What should go into the tender pack?
+
+> Why did we win or lose?
+
+> How did we actually perform?
+
+> What should we change in our standard price or SOP?
+
+And the system should progressively answer those questions from the company's own accumulated knowledge.
+
+That is the product.
+
+Build the system around that loop, not around the office editors.

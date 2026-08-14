@@ -1,0 +1,2002 @@
+     1→# MASTER IMPLEMENTATION PROMPT — CONTRACTOR OS
+     2→
+     3→## 0. ROLE AND EXECUTION MODE
+     4→
+     5→You are the principal engineer responsible for implementing this product inside the supplied GenOffice codebase.
+     6→
+     7→Do not merely describe what should be built. Inspect the repository, understand the existing implementation, modify the codebase, run the application, write tests, and implement the system incrementally until the acceptance gates in this document pass.
+     8→
+     9→You must make engineering decisions autonomously. Do not stop to ask me to choose between obvious implementation alternatives. When the repository differs from assumptions in this document, inspect the actual code and adapt the implementation while preserving the architectural principles and domain invariants below.
+    10→
+    11→Before modifying anything:
+    12→
+    13→1. Inspect the actual repository structure.
+    14→2. Inspect the existing package/workspace configuration.
+    15→3. Inspect the existing shell/tab architecture.
+    16→4. Inspect `agent-core`.
+    17→5. Inspect the existing Docs, Sheets, Slides and PDF application boundaries.
+    18→6. Inspect the existing persistence abstractions.
+    19→7. Inspect existing tests and test conventions.
+    20→8. Inspect the current AI provider implementation.
+    21→9. Inspect licensing and trademark-related files.
+    22→10. Determine the smallest, safest patch surface against upstream GenOffice.
+    23→
+    24→Do not assume the repository is identical to an older architecture description.
+    25→
+    26→The current upstream GenOffice repository provides Microsoft-compatible Word (`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`), PDF and Markdown editing through Electron applications, with shared engine packages and an agent skill architecture. The shell currently embeds editor views directly, while `agent-core` exposes an `AgentSkill` interface and `composeSkills()` mechanism. Build on these actual abstractions rather than rewriting them unnecessarily.
+    27→
+    28→---
+    29→
+    30→# 1. PRODUCT MISSION
+    31→
+    32→Build an AI-native operating system for contractor SMEs.
+    33→
+    34→Construction is the first industry vertical. The architecture must ultimately support other contractor/service industries without rewriting the domain core.
+    35→
+    36→The product's primary job is to turn an incoming opportunity/RFQ into a defensible, professional and internally standardized commercial response.
+    37→
+    38→The primary workflow is:
+    39→
+    40→```text
+    41→Opportunity / RFQ
+    42→    ↓
+    43→Scope understanding
+    44→    ↓
+    45→Scope completeness / ambiguity analysis
+    46→    ↓
+    47→Estimate
+    48→    ↓
+    49→Self-perform / subcontract decisions
+    50→    ↓
+    51→Commercial adjudication
+    52→    ↓
+    53→Programme
+    54→    ↓
+    55→BOQ
+    56→    ↓
+    57→Method Statement
+    58→    ↓
+    59→JHA
+    60→    ↓
+    61→Tender / Bid Pack
+    62→    ↓
+    63→Submission
+    64→    ↓
+    65→Win / Loss
+    66→    ↓
+    67→Project
+    68→    ↓
+    69→Actuals
+    70→    ↓
+    71→Knowledge / SOP / price / productivity calibration
+    72→```
+    73→
+    74→The product must not feel like:
+    75→
+    76→> "Microsoft Office with construction features."
+    77→
+    78→It must feel like:
+    79→
+    80→> "The estimating and operating memory of a contractor, with Office-compatible work surfaces."
+    81→
+    82→GenOffice's document editors are an important substrate, not the product's center of gravity.
+    83→
+    84→---
+    85→
+    86→# 2. NON-NEGOTIABLE ARCHITECTURAL PRINCIPLE
+    87→
+    88→The canonical source of truth is NOT an `.xlsx`, `.docx`, `.pptx`, MSP file, or PDF.
+    89→
+    90→The canonical source of truth is the structured contractor domain model.
+    91→
+    92→The central commercial object is:
+    93→
+    94→```text
+    95→Estimate
+    96→```
+    97→
+    98→not:
+    99→
+   100→```text
+   101→BOQ
+   102→```
+   103→
+   104→A BOQ is a projection of an estimate.
+   105→
+   106→A programme is a projection of an estimate.
+   107→
+   108→A Method Statement is a projection of execution knowledge associated with the estimate.
+   109→
+   110→A JHA is a projection of work definitions + hazard controls.
+   111→
+   112→A tender package is a projection of the bid and its approved deliverables.
+   113→
+   114→The architecture must preserve this distinction everywhere.
+   115→
+   116→---
+   117→
+   118→# 3. CANONICAL SYSTEM MODEL
+   119→
+   120→The system should conceptually behave as:
+   121→
+   122→```text
+   123→                       OPPORTUNITY
+   124→                           │
+   125→                           ▼
+   126→                     SCOPE PACKAGE
+   127→                           │
+   128→            ┌──────────────┼──────────────┐
+   129→            │              │              │
+   130→         Evidence       Questions      Assumptions
+   131→            │              │              │
+   132→            └──────────────┼──────────────┘
+   133→                           ▼
+   134→                        ESTIMATE
+   135→                           │
+   136→        ┌──────────────────┼──────────────────┐
+   137→        │                  │                  │
+   138→     Cost Model       Execution Strategy    Risk
+   139→        │                  │                  │
+   140→        │          ┌───────┼───────┐          │
+   141→        │          │       │       │          │
+   142→        │       Self     Hybrid  Subcontract │
+   143→        │          │       │       │          │
+   144→        └──────────┴───────┴───────┴──────────┘
+   145→                           │
+   146→                           ▼
+   147→                    COMMERCIAL DECISION
+   148→                           │
+   149→             ┌─────────────┼─────────────┐
+   150→             │             │             │
+   151→            BOQ        PROGRAMME       TENDER DOCS
+   152→                           │             │
+   153→                           │       ┌─────┼─────┐
+   154→                           │       │     │     │
+   155→                           │      MS    JHA   Other
+   156→                           │
+   157→                           ▼
+   158→                         BID
+   159→                           │
+   160→                    ┌──────┴──────┐
+   161→                    │             │
+   162→                   WON           LOST
+   163→                    │
+   164→                    ▼
+   165→                  PROJECT
+   166→                    │
+   167→                  ACTUALS
+   168→                    │
+   169→                    ▼
+   170→              KNOWLEDGE LOOP
+   171→                    │
+   172→         ┌──────────┼──────────┐
+   173→         ▼          ▼          ▼
+   174→       Prices   Productivity  SOPs
+   175→```
+   176→
+   177→---
+   178→
+   179→# 4. GENOFFICE INTEGRATION STRATEGY
+   180→
+   181→Do not rewrite GenOffice.
+   182→
+   183→Retain the existing office applications and engines wherever practical:
+   184→
+   185→```text
+   186→Docs
+   187→Sheets
+   188→Slides
+   189→PDF
+   190→Markdown
+   191→Shell
+   192→agent-core
+   193→existing document engines
+   194→existing UI primitives
+   195→```
+   196→
+   197→Add:
+   198→
+   199→```text
+   200→apps/contractor
+   201→apps/plan
+   202→```
+   203→
+   204→where:
+   205→
+   206→* `apps/contractor` is the primary Contractor Workspace.
+   207→* `apps/plan` is the Microsoft Project-style Programme / Planning application.
+   208→
+   209→The Contractor Workspace should orchestrate the workflow.
+   210→
+   211→Users should primarily think in terms of:
+   212→
+   213→```text
+   214→Client
+   215→    ↓
+   216→Opportunity / Project
+   217→    ↓
+   218→Scope
+   219→    ↓
+   220→Estimate
+   221→    ↓
+   222→Programme
+   223→    ↓
+   224→Deliverables
+   225→```
+   226→
+   227→not:
+   228→
+   229→```text
+   230→Excel
+   231→Word
+   232→PowerPoint
+   233→Project
+   234→```
+   235→
+   236→The existing office editors should appear as work surfaces within the contractor workflow.
+   237→
+   238→---
+   239→
+   240→# 5. REPOSITORY RULES
+   241→
+   242→Before implementation:
+   243→
+   244→## Inspect, don't assume
+   245→
+   246→Inspect:
+   247→
+   248→```text
+   249→apps/
+   250→packages/
+   251→e2e/
+   252→scripts/
+   253→package.json
+   254→tsconfig*
+   255→vitest*
+   256→CLAUDE.md
+   257→LICENSE
+   258→ee/
+   259→```
+   260→
+   261→Inspect the current shell implementation and identify every place a new application/tab must be registered.
+   262→
+   263→Inspect the current `agent-core` implementation and conform to its actual interfaces.
+   264→
+   265→Inspect existing tests and follow existing conventions.
+   266→
+   267→Do not create parallel infrastructure when an existing upstream abstraction can safely be reused.
+   268→
+   269→Do not blindly upgrade dependencies simply because a newer version exists.
+   270→
+   271→Do not perform unrelated refactors.
+   272→
+   273→Do not modify upstream office engines unless required to integrate the Contractor OS.
+   274→
+   275→Keep a file:
+   276→
+   277→```text
+   278→docs/UPSTREAM_PATCHES.md
+   279→```
+   280→
+   281→documenting every upstream file modified and why.
+   282→
+   283→Prefer additive architecture over invasive modifications.
+   284→
+   285→---
+   286→
+   287→# 6. APPLICATION ARCHITECTURE
+   288→
+   289→Create:
+   290→
+   291→```text
+   292→apps/
+   293→  contractor/
+   294→  plan/
+   295→```
+   296→
+   297→The Contractor Workspace owns:
+   298→
+   299→```text
+   300→Dashboard
+   301→Opportunities
+   302→Scope
+   303→Estimates
+   304→Subcontracting
+   305→Bids
+   306→Projects
+   307→Knowledge
+   308→Templates
+   309→Settings
+   310→```
+   311→
+   312→An opportunity/project workspace should provide navigation such as:
+   313→
+   314→```text
+   315→Overview
+   316→Scope
+   317→Estimate
+   318→BOQ
+   319→Subcontractors
+   320→Programme
+   321→Method Statement
+   322→JHA
+   323→Tender Pack
+   324→Activity / History
+   325→```
+   326→
+   327→Opening a BOQ should use the existing Sheets surface where practical.
+   328→
+   329→Opening a Method Statement should use the existing Docs surface where practical.
+   330→
+   331→Opening the Programme should use `apps/plan`.
+   332→
+   333→Opening supporting PDFs should use the existing PDF editor.
+   334→
+   335→Do not create a second spreadsheet editor.
+   336→
+   337→Do not create a second word processor.
+   338→
+   339→Do not create a second PDF editor.
+   340→
+   341→---
+   342→
+   343→# 7. PACKAGE ARCHITECTURE
+   344→
+   345→Create business logic in packages, not inside the UI applications.
+   346→
+   347→Recommended structure:
+   348→
+   349→```text
+   350→packages/
+   351→  domain/
+   352→    organizations
+   353→    opportunities
+   354→    scope
+   355→    estimates
+   356→    pricing
+   357→    procurement
+   358→    bids
+   359→    projects
+   360→    knowledge
+   361→    hse
+   362→    documents
+   363→
+   364→  engines/
+   365→    estimate-engine
+   366→    pricing-engine
+   367→    risk-engine
+   368→    schedule-engine
+   369→    measurement-engine
+   370→
+   371→  bindings/
+   372→    xlsx-binding
+   373→    docx-binding
+   374→    pptx-binding
+   375→    mspxml-binding
+   376→    pdf-binding
+   377→
+   378→  ai/
+   379→    contractor-agent
+   380→    skills/
+   381→      intake
+   382→      scope
+   383→      estimating
+   384→      procurement
+   385→      planning
+   386→      hse
+   387→      knowledge
+   388→      documents
+   389→
+   390→  storage/
+   391→    db
+   392→    repositories
+   393→    sync
+   394→    audit
+   395→    attachments
+   396→
+   397→  industry/
+   398→    construction
+   399→      generic
+   400→      ghana
+   401→```
+   402→
+   403→Use exact names that fit the existing repository conventions, but preserve these boundaries.
+   404→
+   405→### Core rule
+   406→
+   407→Domain packages must not depend on Electron.
+   408→
+   409→Application packages may depend on domain/application services.
+   410→
+   411→UI must never contain pricing/business rules.
+   412→
+   413→AI skills must call domain services rather than duplicating business calculations.
+   414→
+   415→---
+   416→
+   417→# 8. DOMAIN MODEL
+   418→
+   419→Implement the core domain around the following concepts.
+   420→
+   421→## Organization
+   422→
+   423→The future multi-tenant boundary.
+   424→
+   425→Fields should include at minimum:
+   426→
+   427→```text
+   428→id
+   429→name
+   430→industryPackId
+   431→createdAt
+   432→updatedAt
+   433→```
+   434→
+   435→## User
+   436→
+   437→Include:
+   438→
+   439→```text
+   440→id
+   441→organizationId
+   442→name
+   443→email
+   444→role
+   445→createdAt
+   446→updatedAt
+   447→```
+   448→
+   449→Design authorization so organization isolation is explicit.
+   450→
+   451→---
+   452→
+   453→# 9. OPPORTUNITY MODEL
+   454→
+   455→Create:
+   456→
+   457→```text
+   458→Opportunity
+   459→```
+   460→
+   461→An opportunity represents an incoming commercial opportunity before and during estimating.
+   462→
+   463→Fields should include:
+   464→
+   465→```text
+   466→id
+   467→organizationId
+   468→clientId
+   469→title
+   470→reference
+   471→status
+   472→receivedAt
+   473→submissionDeadline
+   474→source
+   475→description
+   476→createdBy
+   477→createdAt
+   478→updatedAt
+   479→```
+   480→
+   481→Statuses should support at least:
+   482→
+   483→```text
+   484→received
+   485→qualifying
+   486→no-bid
+   487→scope-development
+   488→estimating
+   489→internal-review
+   490→adjudication
+   491→submitted
+   492→clarification
+   493→won
+   494→lost
+   495→withdrawn
+   496→lapsed
+   497→```
+   498→
+   499→---
+   500→
+   501→# 10. SCOPE MODEL
+   502→
+   503→Scope is a first-class domain object.
+   504→
+   505→Create:
+   506→
+   507→```text
+   508→ScopePackage
+   509→ScopeItem
+   510→ScopeEvidence
+   511→ScopeQuestion
+   512→ScopeAssumption
+   513→ScopeRevision
+   514→```
+   515→
+   516→A ScopePackage should capture:
+   517→
+   518→```text
+   519→where the scope came from
+   520→what documents/evidence exist
+   521→what is explicitly specified
+   522→what is inferred
+   523→what is missing
+   524→what is ambiguous
+   525→what assumptions are being made
+   526→```
+   527→
+   528→Support evidence types such as:
+   529→
+   530→```text
+   531→RFQ document
+   532→drawing
+   533→specification
+   534→client BOQ
+   535→photo
+   536→site observation
+   537→email
+   538→manual note
+   539→AI extraction
+   540→historical reference
+   541→```
+   542→
+   543→Do not assume an incoming RFQ has a complete scope.
+   544→
+   545→The system must distinguish:
+   546→
+   547→```text
+   548→complete client scope
+   549→partial client scope
+   550→client BOQ requiring interpretation
+   551→estimator-created scope
+   552→site-derived scope
+   553→AI-inferred scope
+   554→```
+   555→
+   556→---
+   557→
+   558→# 11. SCOPE COMPLETENESS ENGINE
+   559→
+   560→Build a deterministic scope completeness mechanism.
+   561→
+   562→It should be able to represent:
+   563→
+   564→```text
+   565→Scope completeness: 63%
+   566→
+   567→Known:
+   568→    structural frame
+   569→    roofing
+   570→    blockwork
+   571→
+   572→Missing:
+   573→    electrical specification
+   574→    drainage route
+   575→    ground conditions
+   576→    door schedule
+   577→
+   578→Ambiguous:
+   579→    fire protection responsibility
+   580→    external works extent
+   581→```
+   582→
+   583→The system should rank gaps according to expected commercial impact where enough information exists.
+   584→
+   585→This ranking is not merely cosmetic.
+   586→
+   587→The AI should use it to recommend:
+   588→
+   589→```text
+   590→what question to ask
+   591→what evidence to obtain
+   592→what site observation to make
+   593→what assumption to include
+   594→```
+   595→
+   596→---
+   597→
+   598→# 12. SCOPE QUESTION MODEL
+   599→
+   600→Create a first-class entity:
+   601→
+   602→```text
+   603→ScopeQuestion
+   604→```
+   605→
+   606→It should support:
+   607→
+   608→```text
+   609→question
+   610→category
+   611→evidence
+   612→possible interpretations
+   613→selected interpretation
+   614→cost impact
+   615→programme impact
+   616→safety impact
+   617→contractual impact
+   618→status
+   619→resolution
+   620→```
+   621→
+   622→This is broader than simply an ambiguity probability distribution.
+   623→
+   624→Example:
+   625→
+   626→```text
+   627→Question:
+   628→What roof specification applies?
+   629→
+   630→Interpretation A:
+   631→corrugated steel
+   632→
+   633→Interpretation B:
+   634→standing seam
+   635→
+   636→Evidence:
+   637→Drawing A12
+   638→Specification S-04
+   639→
+   640→Selected assumption:
+   641→Interpretation B
+   642→
+   643→Cost impact:
+   644→+GHS X
+   645→
+   646→Programme impact:
+   647→+Y days
+   648→
+   649→Clarification:
+   650→required
+   651→```
+   652→
+   653→---
+   654→
+   655→# 13. ESTIMATE MODEL
+   656→
+   657→Create:
+   658→
+   659→```text
+   660→Estimate
+   661→EstimateRevision
+   662→EstimateLine
+   663→EstimateScenario
+   664→```
+   665→
+   666→An Estimate must capture the commercial reasoning behind the BOQ.
+   667→
+   668→Each EstimateLine should support:
+   669→
+   670→```text
+   671→description
+   672→workDefinitionId
+   673→measurement basis
+   674→quantity
+   675→unit
+   676→executionStrategy
+   677→costBuildUp
+   678→risk
+   679→assumptions
+   680→provenance
+   681→```
+   682→
+   683→Execution strategy:
+   684→
+   685→```text
+   686→self-perform
+   687→subcontract
+   688→hybrid
+   689→undecided
+   690→```
+   691→
+   692→An EstimateRevision must be immutable after finalization.
+   693→
+   694→A submitted bid must reference an immutable EstimateRevision.
+   695→
+   696→---
+   697→
+   698→# 14. WORK LIBRARY
+   699→
+   700→Create the most important knowledge entity:
+   701→
+   702→```text
+   703→WorkDefinition
+   704→WorkDefinitionVersion
+   705→```
+   706→
+   707→A WorkDefinition represents how the company understands and executes a unit of work.
+   708→
+   709→For construction, an example might be:
+   710→
+   711→```text
+   712→150mm Sandcrete Blockwork
+   713→```
+   714→
+   715→A WorkDefinition should support:
+   716→
+   717→```text
+   718→id
+   719→code
+   720→name
+   721→industry
+   722→category
+   723→unit
+   724→measurementRule
+   725→costRecipe
+   726→productivityRule
+   727→crewComposition
+   728→equipment
+   729→wastage
+   730→sequencing
+   731→methodStatementFragment
+   732→hazards
+   733→controls
+   734→qualityChecklist
+   735→requiredPPE
+   736→requiredPermits
+   737→subcontractability
+   738→commonAssumptions
+   739→commonExclusions
+   740→approvalState
+   741→version
+   742→```
+   743→
+   744→The system must treat approved work definitions as versioned knowledge.
+   745→
+   746→Do not silently mutate an approved work definition.
+   747→
+   748→Changes create a new version.
+   749→
+   750→---
+   751→
+   752→# 15. THE CENTRAL STANDARDISATION MECHANISM
+   753→
+   754→A work definition should drive multiple outputs.
+   755→
+   756→For a single approved work definition, the system should be able to derive:
+   757→
+   758→```text
+   759→BOQ item
+   760→cost build-up
+   761→unit price
+   762→expected productivity
+   763→duration
+   764→crew requirement
+   765→equipment requirement
+   766→method statement fragment
+   767→hazards
+   768→controls
+   769→QA checklist
+   770→subcontract scope
+   771→```
+   772→
+   773→This is a critical architectural invariant.
+   774→
+   775→Do not implement these as unrelated copies of the same knowledge.
+   776→
+   777→---
+   778→
+   779→# 16. COST MODEL
+   780→
+   781→Separate:
+   782→
+   783→```text
+   784→cost
+   785→```
+   786→
+   787→from:
+   788→
+   789→```text
+   790→sell price
+   791→```
+   792→
+   793→The system must never reduce pricing to:
+   794→
+   795→```text
+   796→rate = cost + markup
+   797→```
+   798→
+   799→Model the stages independently:
+   800→
+   801→```text
+   802→resource cost
+   803→    ↓
+   804→direct work cost
+   805→    ↓
+   806→project-specific cost
+   807→    ↓
+   808→risk / contingency
+   809→    ↓
+   810→commercial strategy
+   811→    ↓
+   812→sell price
+   813→```
+   814→
+   815→Support:
+   816→
+   817→```text
+   818→material
+   819→labour
+   820→plant
+   821→subcontract
+   822→fee
+   823→transport
+   824→wastage
+   825→overhead
+   826→risk
+   827→profit
+   828→commercial adjustments
+   829→```
+   830→
+   831→---
+   832→
+   833→# 17. RESOURCE MODEL
+   834→
+   835→Create:
+   836→
+   837→```text
+   838→Resource
+   839→ResourcePriceObservation
+   840→```
+   841→
+   842→Resource kinds should include:
+   843→
+   844→```text
+   845→labour
+   846→material
+   847→plant
+   848→subcontract
+   849→fee
+   850→```
+   851→
+   852→Resource records should include:
+   853→
+   854→```text
+   855→id
+   856→code
+   857→name
+   858→unit
+   859→kind
+   860→currency
+   861→regional metadata
+   862→```
+   863→
+   864→Price observations must be append-only.
+   865→
+   866→Never overwrite historical resource prices.
+   867→
+   868→---
+   869→
+   870→# 18. PRICE PROVENANCE
+   871→
+   872→Every important price must be traceable.
+   873→
+   874→Represent source/provenance such as:
+   875→
+   876→```text
+   877→supplier quotation
+   878→purchase invoice
+   879→market survey
+   880→manual entry
+   881→historical bid
+   882→approved catalogue recipe
+   883→subcontract quote
+   884→```
+   885→
+   886→A computed rate should be reconstructable.
+   887→
+   888→Example:
+   889→
+   890→```text
+   891→GHS 342.17/m²
+   892→    ↓
+   893→Work Definition version 14
+   894→    ↓
+   895→cement price observation 817
+   896→sand price observation 942
+   897→labour policy version 7
+   898→productivity observation 113
+   899→```
+   900→
+   901→The user must be able to inspect why a rate exists.
+   902→
+   903→---
+   904→
+   905→# 19. PROHIBITION ON SILENT AI PRICING
+   906→
+   907→This is non-negotiable.
+   908→
+   909→The LLM must never silently invent a live bid price.
+   910→
+   911→AI may:
+   912→
+   913→```text
+   914→propose
+   915→infer
+   916→retrieve
+   917→compare
+   918→explain
+   919→flag
+   920→```
+   921→
+   922→AI may not directly commit a price to the canonical estimate.
+   923→
+   924→All committed prices must come through a deterministic domain calculation.
+   925→
+   926→Any unsourced estimate must be explicitly classified:
+   927→
+   928→```text
+   929→unsourced estimate
+   930→```
+   931→
+   932→with:
+   933→
+   934→```text
+   935→rationale
+   936→confidence
+   937→user acknowledgement
+   938→```
+   939→
+   940→and it must appear in the pre-submission control screen.
+   941→
+   942→---
+   943→
+   944→# 20. PRICING SERVICE
+   945→
+   946→Implement a deterministic pricing service.
+   947→
+   948→It must accept:
+   949→
+   950→```text
+   951→workDefinition
+   952→quantity
+   953→resource prices
+   954→productivity
+   955→wastage
+   956→execution strategy
+   957→overhead policy
+   958→profit policy
+   959→risk treatment
+   960→```
+   961→
+   962→and return:
+   963→
+   964→```text
+   965→breakdown
+   966→direct cost
+   967→project cost
+   968→risk
+   969→overhead
+   970→profit
+   971→sell price
+   972→provenance
+   973→```
+   974→
+   975→The calculation must be deterministic.
+   976→
+   977→Do not perform financial arithmetic in LLM code.
+   978→
+   979→Do not use arbitrary floating-point calculations where precise monetary handling is required.
+   980→
+   981→Use a robust money representation and explicit rounding policy.
+   982→
+   983→---
+   984→
+   985→# 21. SUBCONTRACTING
+   986→
+   987→Treat subcontracting as an execution strategy, not as a side feature.
+   988→
+   989→A WorkPackage must support:
+   990→
+   991→```text
+   992→name
+   993→scope
+   994→estimateLineIds
+   995→executionStrategy
+   996→supplier/subcontractor
+   997→enquiries
+   998→quotes
+   999→selectedQuote
+  1000→scopeCoverage
+  1001→scopeGaps
+  1002→```
+  1003→
+  1004→Support:
+  1005→
+  1006→```text
+  1007→self-perform
+  1008→subcontract
+  1009→hybrid
+  1010→```
+  1011→
+  1012→The system must reconcile:
+  1013→
+  1014→```text
+  1015→required work package scope
+  1016→```
+  1017→
+  1018→against:
+  1019→
+  1020→```text
+  1021→supplier/subcontractor quoted scope
+  1022→```
+  1023→
+  1024→and identify:
+  1025→
+  1026→```text
+  1027→excluded work
+  1028→missing work
+  1029→ambiguous work
+  1030→assumptions
+  1031→commercial exclusions
+  1032→programme conflicts
+  1033→```
+  1034→
+  1035→Example:
+  1036→
+  1037→```text
+  1038→Package:
+  1039→Aluminium windows
+  1040→
+  1041→Required:
+  1042→GHS X package scope
+  1043→
+  1044→Subcontractor A quote:
+  1045→GHS Y
+  1046→
+  1047→Excluded:
+  1048→scaffolding
+  1049→delivery
+  1050→sealant
+  1051→installation at level 3
+  1052→
+  1053→Coverage:
+  1054→87%
+  1055→
+  1056→WARNING:
+  1057→GHS Z of required scope remains uncovered.
+  1058→```
+  1059→
+  1060→No subcontract quote should be selectable as the commercial basis without scope coverage being visible.
+  1061→
+  1062→---
+  1063→
+  1064→# 22. SUPPLIER QUOTE MODEL
+  1065→
+  1066→Support:
+  1067→
+  1068→```text
+  1069→SubcontractEnquiry
+  1070→SubcontractQuote
+  1071→QuoteLine
+  1072→QuoteExclusion
+  1073→QuoteAssumption
+  1074→QuoteRevision
+  1075→```
+  1076→
+  1077→The AI may parse incoming quote documents.
+  1078→
+  1079→The parsed information must enter structured records and remain reviewable.
+  1080→
+  1081→Never silently overwrite supplier data with AI interpretation.
+  1082→
+  1083→---
+  1084→
+  1085→# 23. COMMERCIAL ADJUDICATION
+  1086→
+  1087→Create a deliberate commercial decision layer.
+  1088→
+  1089→An adjudication should contain:
+  1090→
+  1091→```text
+  1092→computed cost
+  1093→computed risk
+  1094→target margin
+  1095→submitted price before adjustment
+  1096→director adjustment
+  1097→adjustment rationale
+  1098→final submitted price
+  1099→approver
+  1100→approval timestamp
+  1101→```
+  1102→
+  1103→The system should preserve the difference between:
+  1104→
+  1105→```text
+  1106→system-calculated recommendation
+  1107→```
+  1108→
+  1109→and:
+  1110→
+  1111→```text
+  1112→human commercial decision
+  1113→```
+  1114→
+  1115→This enables future analysis of commercial judgement.
+  1116→
+  1117→---
+  1118→
+  1119→# 24. RISK
+  1120→
+  1121→Implement basic risk support, but do not over-engineer advanced Monte Carlo in the first milestone.
+  1122→
+  1123→The initial model should support:
+  1124→
+  1125→```text
+  1126→risk
+  1127→probability
+  1128→impact
+  1129→mitigation
+  1130→affected estimate lines
+  1131→```
+  1132→
+  1133→and:
+  1134→
+  1135→```text
+  1136→optimistic
+  1137→likely
+  1138→pessimistic
+  1139→```
+  1140→
+  1141→where appropriate.
+  1142→
+  1143→Build the domain interfaces so a more advanced stochastic engine can be added later.
+  1144→
+  1145→---
+  1146→
+  1147→# 25. PROGRAMME / PROJECT CLONE
+  1148→
+  1149→Create:
+  1150→
+  1151→```text
+  1152→apps/plan
+  1153→packages/engines/schedule-engine
+  1154→```
+  1155→
+  1156→Do NOT attempt to build `.mpp` parsing initially.
+  1157→
+  1158→Native project data should live in the Contractor domain.
+  1159→
+  1160→Initial export priority:
+  1161→
+  1162→```text
+  1163→MS Project XML
+  1164→PDF / printable Gantt
+  1165→PNG
+  1166→XLSX
+  1167→```
+  1168→
+  1169→Import priority:
+  1170→
+  1171→```text
+  1172→MS Project XML
+  1173→```
+  1174→
+  1175→Treat `.mpp` support as out of scope for the first implementation unless a reliable library already exists and licensing is acceptable.
+  1176→
+  1177→---
+  1178→
+  1179→# 26. SCHEDULE ENGINE
+  1180→
+  1181→Implement deterministic schedule functionality including:
+  1182→
+  1183→```text
+  1184→activities
+  1185→durations
+  1186→dependencies
+  1187→calendars
+  1188→working days
+  1189→lags
+  1190→constraints
+  1191→forward pass
+  1192→backward pass
+  1193→critical path
+  1194→float
+  1195→baselines
+  1196→```
+  1197→
+  1198→Support dependency types:
+  1199→
+  1200→```text
+  1201→FS
+  1202→SS
+  1203→FF
+  1204→SF
+  1205→```
+  1206→
+  1207→with lag.
+  1208→
+  1209→Do not build an attractive Gantt UI on top of a fake scheduling engine.
+  1210→
+  1211→The engine must calculate actual CPM values.
+  1212→
+  1213→Write unit/property tests for scheduling invariants.
+  1214→
+  1215→---
+  1216→
+  1217→# 27. BOQ → PROGRAMME GENERATION
+  1218→
+  1219→This is a flagship capability.
+  1220→
+  1221→Work definitions should have productivity data.
+  1222→
+  1223→For example:
+  1224→
+  1225→```text
+  1226→quantity = 2,400 m²
+  1227→productivity = 12 m² / crew-day
+  1228→crews = 2
+  1229→```
+  1230→
+  1231→Then:
+  1232→
+  1233→```text
+  1234→duration = quantity / (productivity × crews)
+  1235→```
+  1236→
+  1237→The generated programme should combine:
+  1238→
+  1239→```text
+  1240→estimate quantities
+  1241→work definitions
+  1242→productivity
+  1243→crew assumptions
+  1244→sequencing rules
+  1245→calendars
+  1246→dependencies
+  1247→```
+  1248→
+  1249→Produce a draft programme from the estimate.
+  1250→
+  1251→The planner can edit it afterward.
+  1252→
+  1253→The goal is:
+  1254→
+  1255→> The planner modifies a useful generated programme instead of drawing the programme from zero.
+  1256→
+  1257→---
+  1258→
+  1259→# 28. METHOD STATEMENT / JHA
+  1260→
+  1261→Method Statements and JHAs must be generated from structured work knowledge.
+  1262→
+  1263→A WorkDefinition can contribute:
+  1264→
+  1265→```text
+  1266→method fragment
+  1267→hazards
+  1268→controls
+  1269→QA
+  1270→PPE
+  1271→permits
+  1272→```
+  1273→
+  1274→The document assembly engine combines these into project-specific deliverables.
+  1275→
+  1276→Do not generate every Method Statement from scratch with an LLM.
+  1277→
+  1278→Prefer:
+  1279→
+  1280→```text
+  1281→approved work definition
+  1282→+
+  1283→project conditions
+  1284→+
+  1285→project-specific assumptions
+  1286→+
+  1287→programme
+  1288→=
+  1289→draft method statement
+  1290→```
+  1291→
+  1292→Likewise:
+  1293→
+  1294→```text
+  1295→work definitions
+  1296→+
+  1297→hazard library
+  1298→+
+  1299→project conditions
+  1300→=
+  1301→draft JHA
+  1302→```
+  1303→
+  1304→AI can improve wording, detect omissions, and suggest additions.
+  1305→
+  1306→It must not erase approved controls without explicit human action.
+  1307→
+  1308→---
+  1309→
+  1310→# 29. TENDER PACKAGE
+  1311→
+  1312→Create a first-class tender package entity.
+  1313→
+  1314→A package should support:
+  1315→
+  1316→```text
+  1317→cover letter
+  1318→BOQ
+  1319→pricing summary
+  1320→programme
+  1321→method statement
+  1322→JHA
+  1323→assumptions
+  1324→clarifications
+  1325→company information
+  1326→certificates
+  1327→supporting documents
+  1328→```
+  1329→
+  1330→It must have a completeness checklist.
+  1331→
+  1332→Example:
+  1333→
+  1334→```text
+  1335→Scope                    ✓
+  1336→BOQ                      ✓
+  1337→Programme                ✓
+  1338→Method Statement         ✓
+  1339→JHA                      ✓
+  1340→Clarifications           ✓
+  1341→Assumptions              ✓
+  1342→Company Profile          ✓
+  1343→Required Certificates    ⚠
+  1344→Director Approval        ⚠
+  1345→```
+  1346→
+  1347→The system should provide one explicit:
+  1348→
+  1349→```text
+  1350→Generate Tender Pack
+  1351→```
+  1352→
+  1353→operation.
+  1354→
+  1355→---
+  1356→
+  1357→# 30. DOCUMENT BINDING
+  1358→
+  1359→Create domain-to-document bindings.
+  1360→
+  1361→Support at minimum:
+  1362→
+  1363→```text
+  1364→Estimate → XLSX
+  1365→Programme → MSP XML/PDF/XLSX
+  1366→Estimate + WorkDefinitions → DOCX Method Statement
+  1367→Estimate + Hazards → DOCX JHA
+  1368→Bid → tender package
+  1369→```
+  1370→
+  1371→Do not assume the generated file remains the canonical record.
+  1372→
+  1373→---
+  1374→
+  1375→# 31. DOCUMENT EDITING CONFLICT POLICY
+  1376→
+  1377→When a domain object generates an Office file, treat the generated file as a working representation.
+  1378→
+  1379→Do not blindly synchronize every edit back into the canonical model.
+  1380→
+  1381→Use:
+  1382→
+  1383→```text
+  1384→Generate
+  1385→    ↓
+  1386→Working copy
+  1387→    ↓
+  1388→User edits
+  1389→    ↓
+  1390→Detect differences
+  1391→    ↓
+  1392→Review / Reconcile
+  1393→    ↓
+  1394→Adopt selected changes
+  1395→    ↓
+  1396→Update canonical domain model
+  1397→```
+  1398→
+  1399→Financially meaningful changes must require explicit reconciliation.
+  1400→
+  1401→Formatting-only changes should remain presentation-owned.
+  1402→
+  1403→---
+  1404→
+  1405→# 32. TENDER TEMPLATES
+  1406→
+  1407→Templates must be data/configuration-driven.
+  1408→
+  1409→A template should map:
+  1410→
+  1411→```text
+  1412→domain entity/field
+  1413→        ↓
+  1414→document location
+  1415→```
+  1416→
+  1417→Support template authoring without requiring developers to hard-code each client format.
+  1418→
+  1419→Examples:
+  1420→
+  1421→```text
+  1422→generic BOQ
+  1423→client-specific BOQ
+  1424→public procurement template
+  1425→method statement template
+  1426→JHA template
+  1427→programme template
+  1428→cover letter
+  1429→```
+  1430→
+  1431→---
+  1432→
+  1433→# 33. KNOWLEDGE / SOP SYSTEM
+  1434→
+  1435→The Work Library is the company's institutional memory.
+  1436→
+  1437→It must be easy for an SME to:
+  1438→
+  1439→```text
+  1440→create work definition
+  1441→clone an existing one
+  1442→compare versions
+  1443→approve
+  1444→deprecate
+  1445→update from actuals
+  1446→```
+  1447→
+  1448→Knowledge should be versioned.
+  1449→
+  1450→Approved definitions must be immutable.
+  1451→
+  1452→---
+  1453→
+  1454→# 34. META-SOP: CREATING A NEW SOP
+  1455→
+  1456→Implement the process for creating a new work definition as data-driven workflow.
+  1457→
+  1458→Default workflow:
+  1459→
+  1460→```text
+  1461→1. Detect knowledge gap
+  1462→2. Gather evidence
+  1463→3. Find similar known work
+  1464→4. Draft WorkDefinition
+  1465→5. Capture cost recipe
+  1466→6. Capture productivity
+  1467→7. Capture execution method
+  1468→8. Capture hazards
+  1469→9. Capture controls
+  1470→10. Capture QA
+  1471→11. Capture PPE / permits
+  1472→12. Capture subcontract treatment
+  1473→13. Validate
+  1474→14. Review
+  1475→15. Approve
+  1476→16. Publish version
+  1477→17. Calibrate after actual work
+  1478→```
+  1479→
+  1480→The workflow itself should be configurable later.
+  1481→
+  1482→The system should be able to say:
+  1483→
+  1484→> "This estimate contains a work item that has no approved WorkDefinition. Create one?"
+  1485→
+  1486→and guide the estimator through the workflow.
+  1487→
+  1488→---
+  1489→
+  1490→# 35. LEARNING FROM ACTUALS
+  1491→
+  1492→The system must support the loop:
+  1493→
+  1494→```text
+  1495→planned
+  1496→    ↓
+  1497→executed
+  1498→    ↓
+  1499→actual
+  1500→    ↓
+  1501→variance
+  1502→    ↓
+  1503→knowledge improvement
+  1504→```
+  1505→
+  1506→Capture lightweight actuals initially:
+  1507→
+  1508→```text
+  1509→quantity completed
+  1510→days taken
+  1511→crew size
+  1512→material consumed
+  1513→material purchase price
+  1514→subcontract final cost
+  1515→```
+  1516→
+  1517→Then calculate:
+  1518→
+  1519→```text
+  1520→planned productivity
+  1521→vs
+  1522→actual productivity
+  1523→```
+  1524→
+  1525→and:
+  1526→
+  1527→```text
+  1528→planned cost
+  1529→vs
+  1530→actual cost
+  1531→```
+  1532→
+  1533→Generate suggestions such as:
+  1534→
+  1535→```text
+  1536→Your standard blockwork productivity is 12 m²/day.
+  1537→
+  1538→The last 4 comparable projects averaged 9.6 m²/day.
+  1539→
+  1540→Consider revising the standard or creating a restricted-access variant.
+  1541→```
+  1542→
+  1543→Do not automatically modify approved knowledge.
+  1544→
+  1545→Generate an amendment proposal.
+  1546→
+  1547→---
+  1548→
+  1549→# 36. KNOWLEDGE HEALTH
+  1550→
+  1551→Create a mechanism for identifying stale or unreliable knowledge.
+  1552→
+  1553→Examples:
+  1554→
+  1555→```text
+  1556→Price observation older than X days
+  1557→Productivity variance > threshold
+  1558→Repeated subcontract exclusion
+  1559→Repeated cost overrun
+  1560→WorkDefinition never reviewed
+  1561→Unapproved rate repeatedly used
+  1562→```
+  1563→
+  1564→Expose these as:
+  1565→
+  1566→```text
+  1567→Knowledge Health
+  1568→```
+  1569→
+  1570→or equivalent.
+  1571→
+  1572→---
+  1573→
+  1574→# 37. BID OUTCOME LEARNING
+  1575→
+  1576→Every submitted bid should support:
+  1577→
+  1578→```text
+  1579→won
+  1580→lost
+  1581→withdrawn
+  1582→unknown
+  1583→```
+  1584→
+  1585→For lost bids, capture where known:
+  1586→
+  1587→```text
+  1588→price
+  1589→programme
+  1590→technical
+  1591→prequalification
+  1592→relationship
+  1593→unknown
+  1594→```
+  1595→
+  1596→Support:
+  1597→
+  1598→```text
+  1599→winning price if known
+  1600→our rank if known
+  1601→client feedback
+  1602→loss reason
+  1603→```
+  1604→
+  1605→This should eventually enable analysis like:
+  1606→
+  1607→```text
+  1608→win rate by margin
+  1609→win rate by client
+  1610→win rate by market
+  1611→win rate by execution strategy
+  1612→win rate by bid size
+  1613→win rate by subcontract percentage
+  1614→```
+  1615→
+  1616→Do not build sophisticated predictive ML initially.
+  1617→
+  1618→First make the data correct.
+  1619→
+  1620→---
+  1621→
+  1622→# 38. DATABASE — NEON POSTGRESQL
+  1623→
+  1624→Use **Neon PostgreSQL as the canonical database**.
+  1625→
+  1626→Do not use SQLite as the authoritative source of truth.
+  1627→
+  1628→The target architecture is:
+  1629→
+  1630→```text
+  1631→Client
+  1632→  ↓
+  1633→API / application layer
+  1634→  ↓
+  1635→Domain services
+  1636→  ↓
+  1637→Neon PostgreSQL
+  1638→```
+  1639→
+  1640→A client-side local cache/offline store may exist, but it is a cache/working replica, not canonical truth.
+  1641→
+  1642→---
+  1643→
+  1644→# 39. DATABASE PRINCIPLES
+  1645→
+  1646→Design the database for multi-user and multi-organization use from day one.
+  1647→
+  1648→Major entities should carry:
+  1649→
+  1650→```text
+  1651→id
+  1652→organization_id
+  1653→created_by
+  1654→updated_by
+  1655→created_at
+  1656→updated_at
+  1657→```
+  1658→
+  1659→Where appropriate also support:
+  1660→
+  1661→```text
+  1662→version
+  1663→revision
+  1664→status
+  1665→```
+  1666→
+  1667→Use relational integrity.
+  1668→
+  1669→Use foreign keys.
+  1670→
+  1671→Use database transactions for commercially important operations.
+  1672→
+  1673→Do not put the canonical business state in JSON blobs merely because they are convenient.
+  1674→
+  1675→Use JSON/JSONB where flexibility is genuinely useful, but core relationships should be relational.
+  1676→
+  1677→---
+  1678→
+  1679→# 40. REVISIONS
+  1680→
+  1681→Commercially significant state must be reproducible.
+  1682→
+  1683→At minimum:
+  1684→
+  1685→```text
+  1686→WorkDefinitionVersion
+  1687→EstimateRevision
+  1688→BidSubmission
+  1689→ProgrammeRevision
+  1690→DocumentSnapshot
+  1691→```
+  1692→
+  1693→A submitted bid must identify exactly which versions were used.
+  1694→
+  1695→For example:
+  1696→
+  1697→```text
+  1698→BidSubmission
+  1699→    → EstimateRevision 17
+  1700→    → Work Library snapshot 8
+  1701→    → ProgrammeRevision 5
+  1702→    → DocumentSnapshot 23
+  1703→```
+  1704→
+  1705→Historical bids must remain reproducible even after the company updates its standard rates.
+  1706→
+  1707→---
+  1708→
+  1709→# 41. AUDIT LOG
+  1710→
+  1711→Create an append-only audit mechanism.
+  1712→
+  1713→Track important actions such as:
+  1714→
+  1715→```text
+  1716→estimate created
+  1717→rate changed
+  1718→assumption added
+  1719→assumption resolved
+  1720→subcontract quote selected
+  1721→commercial adjustment made
+  1722→bid approved
+  1723→bid submitted
+  1724→catalog approved
+  1725→catalog deprecated
+  1726→document generated
+  1727→document reconciled
+  1728→actual recorded
+  1729→```
+  1730→
+  1731→The audit record should capture:
+  1732→
+  1733→```text
+  1734→who
+  1735→what
+  1736→when
+  1737→entity
+  1738→entity id
+  1739→before/after where appropriate
+  1740→```
+  1741→
+  1742→---
+  1743→
+  1744→# 42. API / APPLICATION LAYER
+  1745→
+  1746→Do not allow renderers to connect directly to PostgreSQL.
+  1747→
+  1748→Use an application/API layer to enforce:
+  1749→
+  1750→```text
+  1751→authentication
+  1752→authorization
+  1753→tenant isolation
+  1754→business invariants
+  1755→transactions
+  1756→auditing
+  1757→AI tool authorization
+  1758→document generation
+  1759→```
+  1760→
+  1761→The precise API technology should follow the existing repository and deployment constraints, but the boundary itself is mandatory.
+  1762→
+  1763→---
+  1764→
+  1765→# 43. OFFLINE SUPPORT
+  1766→
+  1767→Construction environments may have poor connectivity.
+  1768→
+  1769→The product should support offline work where practical.
+  1770→
+  1771→Architecture:
+  1772→
+  1773→```text
+  1774→Neon PostgreSQL
+  1775→      ↑
+  1776→   sync/API
+  1777→      ↑
+  1778→local client cache
+  1779→      +
+  1780→pending mutations
+  1781→```
+  1782→
+  1783→Initial implementation may limit offline functionality to already-synced project data and non-conflicting operations.
+  1784→
+  1785→Do not build an elaborate distributed synchronization system before the core domain works.
+  1786→
+  1787→But structure the client data layer so one can be added without rewriting domain logic.
+  1788→
+  1789→---
+  1790→
+  1791→# 44. FILE STORAGE
+  1792→
+  1793→Do not put large document/image binaries directly in PostgreSQL unless there is a very specific reason.
+  1794→
+  1795→Use object storage for:
+  1796→
+  1797→```text
+  1798→RFQs
+  1799→drawings
+  1800→photos
+  1801→supplier quotations
+  1802→generated PDFs
+  1803→Office files
+  1804→site media
+  1805→certificates
+  1806→```
+  1807→
+  1808→PostgreSQL stores:
+  1809→
+  1810→```text
+  1811→metadata
+  1812→object key
+  1813→hash
+  1814→mime type
+  1815→size
+  1816→owner
+  1817→organization
+  1818→version
+  1819→```
+  1820→
+  1821→Implement content hashing so attachments can be deduplicated/referenced safely.
+  1822→
+  1823→---
+  1824→
+  1825→# 45. AI ARCHITECTURE
+  1826→
+  1827→Use GenOffice's existing `agent-core` skill architecture.
+  1828→
+  1829→Create a Contractor Agent composed from skills such as:
+  1830→
+  1831→```text
+  1832→intake
+  1833→scope
+  1834→estimating
+  1835→procurement
+  1836→planning
+  1837→hse
+  1838→knowledge
+  1839→documents
+  1840→```
+  1841→
+  1842→Namespace tools to avoid collisions.
+  1843→
+  1844→Examples:
+  1845→
+  1846→```text
+  1847→scope_extract_rfq
+  1848→scope_identify_gaps
+  1849→scope_create_question
+  1850→
+  1851→estimate_find_work_definition
+  1852→estimate_price_line
+  1853→estimate_explain_rate
+  1854→estimate_compare_history
+  1855→
+  1856→procurement_create_subcontract_rfq
+  1857→procurement_parse_quote
+  1858→procurement_reconcile_scope
+  1859→
+  1860→plan_generate_programme
+  1861→plan_test_compression
+  1862→
+  1863→hse_generate_jha
+  1864→hse_generate_method_statement
+  1865→
+  1866→knowledge_draft_work_definition
+  1867→knowledge_compare_versions
+  1868→knowledge_propose_calibration
+  1869→```
+  1870→
+  1871→Tool names must be globally unique.
+  1872→
+  1873→---
+  1874→
+  1875→# 46. AI SAFETY MODEL
+  1876→
+  1877→The AI should be treated as an assistant over the domain model, not as the domain model.
+  1878→
+  1879→AI is allowed to:
+  1880→
+  1881→```text
+  1882→read
+  1883→extract
+  1884→search
+  1885→classify
+  1886→suggest
+  1887→draft
+  1888→compare
+  1889→explain
+  1890→flag
+  1891→```
+  1892→
+  1893→AI should not directly bypass:
+  1894→
+  1895→```text
+  1896→pricing service
+  1897→approval workflow
+  1898→revision mechanism
+  1899→audit system
+  1900→tenant isolation
+  1901→document reconciliation
+  1902→```
+  1903→
+  1904→All write tools must validate inputs through domain/application services.
+  1905→
+  1906→---
+  1907→
+  1908→# 47. AI RETRIEVAL
+  1909→
+  1910→The highest-value retrieval corpus is the company's own knowledge:
+  1911→
+  1912→```text
+  1913→approved WorkDefinitions
+  1914→price observations
+  1915→historical estimates
+  1916→past bids
+  1917→supplier/subcontract quotes
+  1918→actual project outcomes
+  1919→SOPs
+  1920→templates
+  1921→assumptions
+  1922→clarifications
+  1923→```
+  1924→
+  1925→Do not make generic LLM knowledge the source of construction prices.
+  1926→
+  1927→The system should prefer internal evidence.
+  1928→
+  1929→A model may know general construction concepts; it should not be trusted to know the company's current local prices.
+  1930→
+  1931→---
+  1932→
+  1933→# 48. AI ORCHESTRATION
+  1934→
+  1935→The flagship user command should eventually support:
+  1936→
+  1937→> "Price this RFQ."
+  1938→
+  1939→The system should orchestrate:
+  1940→
+  1941→```text
+  1942→ingest RFQ
+  1943→extract scope
+  1944→identify missing scope
+  1945→find matching WorkDefinitions
+  1946→create estimate lines
+  1947→identify subcontract packages
+  1948→find historical prices
+  1949→calculate rates
+  1950→flag ambiguity
+  1951→prepare programme
+  1952→prepare MS
+  1953→prepare JHA
+  1954→run tender checklist
+  1955→present unresolved issues
+  1956→```
+  1957→
+  1958→The user should be able to intervene at important decision points.
+  1959→
+  1960→Do not build an opaque autonomous agent that makes unreviewable commercial decisions.
+  1961→
+  1962→---
+  1963→
+  1964→# 49. SITE VISITS — ARCHITECTURAL SEAM
+  1965→
+  1966→Do not fully implement the mobile site-capture system in the first MVP.
+  1967→
+  1968→But create the data model needed for:
+  1969→
+  1970→```text
+  1971→SiteObservation
+  1972→```
+  1973→
+  1974→with:
+  1975→
+  1976→```text
+  1977→bid/opportunity reference
+  1978→timestamp
+  1979→location when available
+  1980→media
+  1981→transcript
+  1982→measurements
+  1983→checklist item
+  1984→linked ScopeQuestions
+  1985→```
+  1986→
+  1987→Future workflow:
+  1988→
+  1989→```text
+  1990→Scope gaps
+  1991→    ↓
+  1992→AI generates site-visit checklist
+  1993→    ↓
+  1994→mobile field capture
+  1995→    ↓
+  1996→ScopeEvidence
+  1997→    ↓
+  1998→ScopeQuestions resolved
+  1999→    ↓
+  2000→Estimate updated
+
+[showing lines 1-2000 of 2993; use offset=2001 with limit to continue reading]

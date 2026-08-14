@@ -1,0 +1,464 @@
+// Contractor OS — Canonical Domain Model
+// Source of truth is the structured domain model, NOT Office files.
+// Estimate is the canonical commercial object; BOQ is a projection.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tenancy & Identity
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Organization {
+  id            String   @id @default(cuid())
+  name          String
+  industryPackId String  @default("construction-ghana")
+  currency      String   @default("GHS")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  users         User[]
+  clients       Client[]
+  opportunities Opportunity[]
+  workDefinitions WorkDefinition[]
+  resources     Resource[]
+  estimates     Estimate[]
+  bids          Bid[]
+  auditLogs     AuditLog[]
+  knowledgeAlerts KnowledgeAlert[]
+}
+
+model User {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  email          String   @unique
+  role           String   @default("estimator") // estimator | manager | director | admin
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  opportunities  Opportunity[] @relation("OpportunityOwner")
+  auditLogs      AuditLog[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Clients
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Client {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  contactName    String?
+  contactEmail   String?
+  contactPhone   String?
+  sector         String?  // public | private | ngo
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  opportunities  Opportunity[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Opportunity / RFQ
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Opportunity {
+  id                 String   @id @default(cuid())
+  organizationId     String
+  clientId           String
+  ownerId            String?
+  title              String
+  reference          String?
+  status             String   @default("received")
+  // received | qualifying | no-bid | scope-development | estimating |
+  // internal-review | adjudication | submitted | clarification | won | lost |
+  // withdrawn | lapsed
+  source             String?  // direct | tender-portal | referral
+  description        String?
+  receivedAt         DateTime @default(now())
+  submissionDeadline DateTime?
+  location           String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  organization       Organization @relation(fields: [organizationId], references: [id])
+  client             Client       @relation(fields: [clientId], references: [id])
+  owner              User?        @relation("OpportunityOwner", fields: [ownerId], references: [id])
+  scopePackage       ScopePackage?
+  estimates          Estimate[]
+  subcontractPackages SubcontractPackage[]
+  bid                Bid?
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scope — first-class domain object
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ScopePackage {
+  id             String   @id @default(cuid())
+  opportunityId  String   @unique
+  completeness   Float    @default(0) // 0..1 deterministic score
+  origin         String   @default("rfq") // rfq | client-boq | estimator | site | ai
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  opportunity    Opportunity @relation(fields: [opportunityId], references: [id])
+  items          ScopeItem[]
+  questions      ScopeQuestion[]
+  assumptions    ScopeAssumption[]
+  evidence       ScopeEvidence[]
+}
+
+model ScopeItem {
+  id              String   @id @default(cuid())
+  scopePackageId  String
+  description     String
+  category        String?  // structural | roofing | finishes | mep | external | etc.
+  origin          String   @default("client") // client | inferred | ai | estimator
+  status          String   @default("known") // known | missing | ambiguous
+  confidence      Float    @default(1)
+  createdAt       DateTime @default(now())
+
+  scopePackage    ScopePackage @relation(fields: [scopePackageId], references: [id])
+  estimateLines   EstimateLine[]
+}
+
+model ScopeQuestion {
+  id                String   @id @default(cuid())
+  scopePackageId    String
+  question          String
+  category          String?
+  interpretationA   String?
+  interpretationB   String?
+  selectedInterpretation String?
+  costImpact        Float    @default(0)
+  programmeImpact   Float    @default(0) // days
+  safetyImpact      String?
+  contractualImpact String?
+  status            String   @default("open") // open | clarified | assumed | resolved
+  resolution        String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  scopePackage      ScopePackage @relation(fields: [scopePackageId], references: [id])
+}
+
+model ScopeAssumption {
+  id             String   @id @default(cuid())
+  scopePackageId String
+  text           String
+  rationale      String?
+  riskLevel      String   @default("medium") // low | medium | high
+  acknowledged   Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  scopePackage   ScopePackage @relation(fields: [scopePackageId], references: [id])
+}
+
+model ScopeEvidence {
+  id             String   @id @default(cuid())
+  scopePackageId String
+  type           String   // rfq | drawing | specification | client-boq | photo | email | note | ai-extraction
+  reference      String?
+  summary        String
+  createdAt      DateTime @default(now())
+
+  scopePackage   ScopePackage @relation(fields: [scopePackageId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Work Library — institutional memory (versioned, immutable when approved)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model WorkDefinition {
+  id             String   @id @default(cuid())
+  organizationId String
+  code           String   // e.g. "WD-STRUCT-014"
+  name           String
+  industry       String   @default("construction")
+  category       String?  // structural | roofing | masonry | finishes | mep
+  unit           String   // m2 | m3 | m | nr | ton
+  approvalState  String   @default("draft") // draft | in-review | approved | deprecated
+  currentVersionId String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization   Organization       @relation(fields: [organizationId], references: [id])
+  versions       WorkDefinitionVersion[]
+  estimateLines  EstimateLine[]
+}
+
+model WorkDefinitionVersion {
+  id                  String   @id @default(cuid())
+  workDefinitionId    String
+  version             Int      @default(1)
+  measurementRule     String?
+  costRecipeJson      String   // deterministic recipe (resource quantities + wastage)
+  productivityRule    Float?   // output per crew-day
+  crewComposition     String?
+  equipment           String?
+  wastage             Float    @default(0.05)
+  sequencing          String?
+  methodStatementFragment String?
+  hazardsJson         String   // array of hazard strings
+  controlsJson        String   // array of control strings
+  qualityChecklistJson String
+  requiredPPE         String?
+  requiredPermits     String?
+  subcontractability  String   @default("yes") // yes | no | partial
+  commonAssumptions   String?
+  commonExclusions    String?
+  approvalState       String   @default("draft") // draft | approved
+  approvedAt          DateTime?
+  approvedById        String?
+  createdAt           DateTime @default(now())
+
+  workDefinition      WorkDefinition @relation(fields: [workDefinitionId], references: [id])
+  estimateLines       EstimateLine[]
+  priceObservations   ResourcePriceObservation[] @relation("PriceObservationWDV")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Resources & Price Provenance (append-only observations)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Resource {
+  id             String   @id @default(cuid())
+  organizationId String
+  code           String   // e.g. "RES-MAT-CEM"
+  name           String
+  unit           String
+  kind           String   // labour | material | plant | subcontract | fee
+  currency       String   @default("GHS")
+  region         String?  // e.g. "Greater Accra"
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  priceObservations ResourcePriceObservation[]
+}
+
+model ResourcePriceObservation {
+  id                       String   @id @default(cuid())
+  resourceId               String
+  workDefinitionVersionId  String?
+  price                    Float
+  currency                 String   @default("GHS")
+  provenance               String   // supplier-quote | invoice | market-survey | manual | historical-bid | subcontract-quote
+  sourceReference          String?  // quote #, invoice #, etc.
+  observedAt               DateTime @default(now())
+  recordedById             String?
+  createdAt                DateTime @default(now())
+
+  resource                 Resource              @relation(fields: [resourceId], references: [id])
+  workDefinitionVersion    WorkDefinitionVersion? @relation("PriceObservationWDV", fields: [workDefinitionVersionId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Estimate — the canonical commercial object
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Estimate {
+  id             String   @id @default(cuid())
+  organizationId String
+  opportunityId  String
+  version        Int      @default(1)
+  status         String   @default("draft") // draft | internal-review | adjudicated | submitted | superseded
+  overheadPct    Float    @default(0.10)
+  profitPct      Float    @default(0.12)
+  contingencyPct Float    @default(0.05)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  opportunity    Opportunity  @relation(fields: [opportunityId], references: [id])
+  lines          EstimateLine[]
+  revisions      EstimateRevision[]
+  bid            Bid?
+}
+
+model EstimateRevision {
+  id           String   @id @default(cuid())
+  estimateId   String
+  revisionNo   Int
+  snapshotJson String   // immutable snapshot of lines + pricing inputs
+  finalizedAt  DateTime @default(now())
+  finalizedById String?
+
+  estimate     Estimate @relation(fields: [estimateId], references: [id])
+}
+
+model EstimateLine {
+  id                    String   @id @default(cuid())
+  estimateId            String
+  scopeItemId           String?
+  workDefinitionId      String?
+  workDefinitionVersionId String?
+  description           String
+  quantity              Float
+  unit                  String
+  executionStrategy     String   @default("self-perform") // self-perform | subcontract | hybrid | undecided
+  // Cost build-up (deterministic, computed by pricing-engine on write)
+  materialCost          Float    @default(0)
+  labourCost            Float    @default(0)
+  plantCost             Float    @default(0)
+  subcontractCost      Float    @default(0)
+  directCost            Float    @default(0)
+  projectCost           Float    @default(0) // direct + project-specific
+  riskCost              Float    @default(0)
+  overheadCost          Float    @default(0)
+  profitCost            Float    @default(0)
+  sellPrice             Float    @default(0)
+  unitRate              Float    @default(0)
+  marginPct             Float    @default(0)
+  confidence            Float    @default(0.5) // 0..1 derived from evidence
+  provenanceSummary     String?  // human-readable lineage
+  isUnsourced           Boolean  @default(false)
+  unsourcedRationale    String?
+  unsourcedConfidence   Float?
+  acknowledged          Boolean  @default(false)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  estimate              Estimate              @relation(fields: [estimateId], references: [id])
+  scopeItem             ScopeItem?            @relation(fields: [scopeItemId], references: [id])
+  workDefinition        WorkDefinition?       @relation(fields: [workDefinitionId], references: [id])
+  workDefinitionVersion WorkDefinitionVersion? @relation(fields: [workDefinitionVersionId], references: [id])
+  subcontractPackageLine SubcontractPackageLine[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Subcontracting — execution strategy + scope reconciliation
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SubcontractPackage {
+  id             String   @id @default(cuid())
+  organizationId String
+  opportunityId  String
+  name           String
+  scope          String?
+  executionStrategy String @default("subcontract")
+  status         String   @default("draft") // draft | enquiry-sent | quotes-received | awarded | abandoned
+  selectedQuoteId String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  opportunity    Opportunity @relation(fields: [opportunityId], references: [id])
+  lines          SubcontractPackageLine[]
+  quotes         SubcontractQuote[]
+}
+
+model SubcontractPackageLine {
+  id                   String @id @default(cuid())
+  subcontractPackageId String
+  estimateLineId       String
+  requiredScope        String
+  createdAt            DateTime @default(now())
+
+  subcontractPackage   SubcontractPackage @relation(fields: [subcontractPackageId], references: [id])
+  estimateLine         EstimateLine       @relation(fields: [estimateLineId], references: [id])
+}
+
+model SubcontractQuote {
+  id                   String   @id @default(cuid())
+  subcontractPackageId String
+  supplierName         String
+  totalAmount          Float
+  currency             String   @default("GHS")
+  receivedAt           DateTime @default(now())
+  exclusionsJson       String   @default("[]")
+  assumptionsJson      String   @default("[]")
+  coveragePct          Float    @default(0) // 0..1 reconciled coverage
+  status               String   @default("received") // received | selected | rejected
+  createdAt            DateTime @default(now())
+
+  subcontractPackage   SubcontractPackage @relation(fields: [subcontractPackageId], references: [id])
+  lines                SubcontractQuoteLine[]
+}
+
+model SubcontractQuoteLine {
+  id              String   @id @default(cuid())
+  quoteId         String
+  description     String
+  amount          Float
+  currency        String   @default("GHS")
+
+  quote           SubcontractQuote @relation(fields: [quoteId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bid — submission + outcome (reproducible from immutable revisions)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Bid {
+  id                  String   @id @default(cuid())
+  organizationId      String
+  opportunityId       String   @unique
+  estimateId          String   @unique
+  estimateRevisionId  String?
+  programmeRevisionId String?
+  tenderPackStatus    String   @default("draft") // draft | ready | submitted | won | lost | withdrawn
+  finalPrice          Float?
+  directorAdjustment  Float    @default(0)
+  adjustmentRationale String?
+  submittedAt         DateTime?
+  outcome             String?  // won | lost | withdrawn | unknown
+  lossReason          String?  // price | programme | technical | prequalification | relationship | unknown
+  winningPrice        Float?
+  ourRank             Int?
+  clientFeedback      String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  organization        Organization @relation(fields: [organizationId], references: [id])
+  opportunity         Opportunity  @relation(fields: [opportunityId], references: [id])
+  estimate            Estimate    @relation(fields: [estimateId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit log — append-only
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  actorId        String?
+  action         String   // estimate.created | rate.changed | bid.submitted | etc.
+  entityType     String
+  entityId       String
+  beforeJson     String?
+  afterJson      String?
+  summary        String?
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  actor          User?        @relation(fields: [actorId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Knowledge Health — stale/unreliable knowledge surfacing
+// ─────────────────────────────────────────────────────────────────────────────
+
+model KnowledgeAlert {
+  id             String   @id @default(cuid())
+  organizationId String
+  type           String   // stale-price | productivity-variance | unapproved-rate | scope-gap | subcontract-exclusion
+  severity       String   @default("warning") // info | warning | blocker
+  title          String
+  detail         String?
+  entityId       String?
+  entityType     String?
+  acknowledged   Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+}
