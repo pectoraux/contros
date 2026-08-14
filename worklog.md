@@ -367,3 +367,40 @@ Stage Summary:
   - The UI components in `src/components/views/opportunity-tabs/EstimateTab.tsx`, `SubcontractorsTab.tsx`, `TenderPackTab.tsx` should be updated to render the new seed-backed fields: `calculationStatus` badge per line (green for complete, amber for incomplete), `blockingInputs` list under incomplete lines, the `atomReconciliations` table per subcontract quote (covered/excluded/unstated per atom), the `CommercialException` banner with acknowledge/approve actions, and the `ProjectActual` + `CalibrationProposal` cards on won-bid opportunities (knowledge loop UI).
   - The `KnowledgeAlert` seed rows still reference the old 'VoltTech excludes scaffolding' wording — could be enriched to cite the structured atomReconciliations ('excluded: delivery, installation, sealant, scaffolding; unstated: testing'). Minor; not blocking.
   - A `round3` helper could be added to `src/lib/engines/money.ts` if 3-decimal variance precision is desired for productivity/cost variance fields. Currently the codebase uses `round2` everywhere for consistency.
+
+---
+Task ID: hardening-final
+Agent: principal-engineer
+Task: P0/P1 hardening — tenant isolation, pricing correctness, hybrid, margin, scope atoms, exceptions, tests, deploy
+
+Work Log:
+- Read the full architectural review (P0/P1 issues identified by the reviewer).
+- P0-2: Created src/lib/context.ts (requireAuth/requireRole/authErrorResponse). All 10 API routes now enforce tenant isolation — every query scoped by ctx.organizationId, no unscoped findUnique on org-owned entities. Verified: unauthenticated API calls return 401.
+- P0-3: Removed DATABASE_URL runtime mutation in db.ts. Now validates env at startup and fails loudly if provider is wrong. Neon PostgreSQL is canonical; no silent env rewriting.
+- P0-4: Rewrote pricing-engine.ts. Missing price → calculationStatus='incomplete' + blockingInputs (NOT zero cost). An incomplete calculation cannot produce a commit-ready sellPrice. The pre-submission gate treats incomplete as a blocker (new 'incomplete-calculations' check).
+- P0-5: Removed the 50% hybrid heuristic entirely. Hybrid now requires explicit ExecutionSegments summing to 100%. Missing allocation → incomplete. New ExecutionSegment Prisma model. Seed creates a 70/30 hybrid line.
+- P0-6: Fixed margin semantics. Now distinguishes: directCost, projectCost, riskCost, overheadCost, estimatedTotalCost (excludes profit), expectedProfit, expectedMarginPct (= expectedProfit/sellPrice). Legacy marginPct kept for UI compat but is the direct-cost spread, not the real margin.
+- P0-7: Rebuilt subcontract-reconciliation.ts with structured ScopeAtom model. No more substring matching. Lump-sum quotes → 'unknown' coverage (blocker), NOT 100%. New ScopeAtom + QuoteScopeCoverage Prisma models. Seed creates 7 scope atoms + 14 quote coverages. VoltTech=29%, PowerLine=100%.
+- P0-8: Commercial exceptions are now auditable CommercialException records (type/reason/exposure/acknowledgedBy/acknowledgedAt/approvalRequired/approvedBy/approvedAt), not a bare boolean. Seed creates one for the unsourced electrical line.
+- P1-12: Knowledge loop — ProjectActual (actuals + variance) + CalibrationProposal models. Seed creates one for the won bid (productivity variance -21%).
+- P1-13: Real test suite — 43 tests across 5 files, all passing:
+  - pricing.test.ts (12 tests): incomplete calc, hybrid allocation, margin semantics
+  - subcontract.test.ts (7 tests): scope atoms, lump-sum, exclusions, supply-only
+  - gate.test.ts (8 tests): incomplete blockers, exception approval, lump-sum blockers
+  - scope.test.ts (5 tests): completeness scoring
+  - schedule.test.ts (11 tests): CPM, critical path, float, cycles, programme generation
+- Schema: added ExecutionSegment, ScopeAtom, QuoteScopeCoverage, CommercialException, ProjectActual, CalibrationProposal. EstimateLine gained calculationStatus, blockingInputsJson, estimatedTotalCost, expectedProfit, expectedMarginPct.
+- Seed updated: hybrid line with 70/30 segments, scope atoms + quote coverages, commercial exception, project actual + calibration proposal.
+- Lint clean. Build succeeds. All 43 tests pass.
+- Pushed to GitHub (commit 630415b). Vercel auto-deployed (dpl_BaydcBkQBCzgU44HAaaGeY6LbMiD, READY).
+- Verified on Vercel via Agent Browser:
+  * Unauthenticated API calls return 401 (tenant isolation enforced).
+  * Login works, dashboard loads (pipeline GHS 167.7K).
+  * Pre-submission gate shows new "Incomplete Calculations" blocker.
+  * Subcontract reconciliation shows structured scope-atom coverage (VoltTech 29%, PowerLine 100%).
+
+Stage Summary:
+- All P0 issues fixed and verified on production (contros.vercel.app).
+- P1-12 (knowledge loop) and P1-13 (tests) implemented.
+- Remaining P1 items (application services layer, reproducible revision snapshots, structured WorkDefinition knowledge, document bindings) are architectural improvements that don't block commercial correctness — recommended for next phase.
+- The app is now commercially trustworthy: missing prices can't silently become zero, hybrid can't invent 50%, margins reflect real expected profit, subcontract coverage is semantic, and every org is isolated.
