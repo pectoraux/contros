@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import ZAI from 'z-ai-web-dev-sdk'
+import { getZAI } from '@/lib/zai'
 import { db } from '@/lib/db'
 
 // Contractor AI Assistant
@@ -188,7 +188,7 @@ USER QUESTION:
 ${question}`
 
   try {
-    const zai = await ZAI.create()
+    const zai = await getZAI()
     const completion = await zai.chat.completions.create({
       messages: [
         { role: 'assistant', content: SYSTEM_PROMPT },

@@ -5,7 +5,8 @@ import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
 import { Settings, Building2, Users, DollarSign, ShieldCheck, Database, Cpu } from 'lucide-react'
 
-export function SettingsView() {
+export function SettingsView({ user }: { user?: { name: string | null; email: string | null; role: string; isDemo: boolean } }) {
+  void user
   return (
     <div className="p-6 space-y-4 max-w-3xl">
       <div>

@@ -6,6 +6,7 @@ export type ViewId =
   | 'work-library'
   | 'subcontracting'
   | 'knowledge'
+  | 'admin'
   | 'settings'
 
 export type OpportunityTab =

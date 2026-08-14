@@ -10,21 +10,32 @@ import {
   Brain,
   Settings,
   HardHat,
+  ShieldCheck,
 } from 'lucide-react'
 
-const NAV_ITEMS: { id: ViewId; label: string; icon: typeof LayoutDashboard }[] = [
+interface NavItem {
+  id: ViewId
+  label: string
+  icon: typeof LayoutDashboard
+  adminOnly?: boolean
+}
+
+const NAV_ITEMS: NavItem[] = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'opportunities', label: 'Opportunities', icon: FolderKanban },
   { id: 'work-library', label: 'Work Library', icon: Library },
   { id: 'subcontracting', label: 'Subcontracting', icon: GitCompareArrows },
   { id: 'knowledge', label: 'Knowledge', icon: Brain },
+  { id: 'admin', label: 'Admin', icon: ShieldCheck, adminOnly: true },
   { id: 'settings', label: 'Settings', icon: Settings },
 ]
 
-export function Sidebar() {
+export function Sidebar({ userRole = 'estimator' }: { userRole?: string }) {
   const view = useWorkspace((s) => s.view)
   const setView = useWorkspace((s) => s.setView)
   const closeOpportunity = useWorkspace((s) => s.closeOpportunity)
+
+  const items = NAV_ITEMS.filter((item) => !item.adminOnly || userRole === 'admin')
 
   return (
     <aside className="hidden md:flex w-60 flex-col border-r border-border bg-sidebar text-sidebar-foreground shrink-0">
@@ -39,7 +50,7 @@ export function Sidebar() {
       </div>
 
       <nav className="flex-1 px-3 py-4 space-y-1">
-        {NAV_ITEMS.map((item) => {
+        {items.map((item) => {
           const Icon = item.icon
           const active = view === item.id
           return (
