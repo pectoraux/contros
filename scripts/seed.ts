@@ -17,6 +17,9 @@
  */
 
 import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
+import { config } from 'dotenv';
+config({ path: '/home/z/my-project/.env' });
 import {
   priceLine,
   computeConfidence,
@@ -26,6 +29,10 @@ import {
   type CostRecipeLine,
   type PricingBreakdown,
 } from '../src/lib/engines';
+
+async function hashPassword(plain: string): Promise<string> {
+  return bcrypt.hash(plain, 10);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -665,6 +672,7 @@ async function wipeAll(): Promise<void> {
   // before WorkDefinitionVersion.
   await prisma.knowledgeAlert.deleteMany();
   await prisma.auditLog.deleteMany();
+  await prisma.waitlistEntry.deleteMany();
   await prisma.subcontractQuoteLine.deleteMany();
   await prisma.subcontractQuote.deleteMany();
   await prisma.subcontractPackageLine.deleteMany();
@@ -727,8 +735,13 @@ async function seedOrganizationAndUsers(): Promise<SeedCtx> {
     kwesi: 'user-kwesi',
     abena: 'user-abena',
     kofi: 'user-kofi',
+    admin: 'user-admin',
   };
 
+  // Demo accounts share a known password for quick login.
+  const demoPasswordHash = await hashPassword('demo1234');
+
+  // Demo accounts (isDemo=true) — one per role, for quick-login links.
   await prisma.user.create({
     data: {
       id: userIds.kwesi,
@@ -736,6 +749,8 @@ async function seedOrganizationAndUsers(): Promise<SeedCtx> {
       name: 'Kwesi Mensah',
       email: 'kwesi@adomconstruction.gh',
       role: 'director',
+      passwordHash: demoPasswordHash,
+      isDemo: true,
     },
   });
   await prisma.user.create({
@@ -745,6 +760,8 @@ async function seedOrganizationAndUsers(): Promise<SeedCtx> {
       name: 'Abena Owusu',
       email: 'abena@adomconstruction.gh',
       role: 'estimator',
+      passwordHash: demoPasswordHash,
+      isDemo: true,
     },
   });
   await prisma.user.create({
@@ -754,6 +771,21 @@ async function seedOrganizationAndUsers(): Promise<SeedCtx> {
       name: 'Kofi Asante',
       email: 'kofi@adomconstruction.gh',
       role: 'manager',
+      passwordHash: demoPasswordHash,
+      isDemo: true,
+    },
+  });
+
+  // Real (non-demo) admin account — controls the waitlist.
+  await prisma.user.create({
+    data: {
+      id: userIds.admin,
+      organizationId: orgId,
+      name: 'Admin',
+      email: 'ekontetevi@gmail',
+      role: 'admin',
+      passwordHash: await hashPassword('Payswap123456'),
+      isDemo: false,
     },
   });
 
@@ -1989,6 +2021,23 @@ async function seedKnowledgeAlerts(ctx: SeedCtx): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Waitlist sample entries
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function seedWaitlist(): Promise<void> {
+  console.log('• Seeding waitlist entries...');
+  const entries = [
+    { name: 'Yaw Antwi', email: 'yaw.antwi@example.com', company: 'Antwi Builders', role: 'estimator' },
+    { name: 'Ama Serwaa', email: 'ama.serwaa@example.com', company: 'Serwaa Civils', role: 'manager' },
+    { name: 'Kwabena Boateng', email: 'kwabena@example.com', company: 'Boateng & Sons', role: 'director' },
+  ];
+  for (const e of entries) {
+    await prisma.waitlistEntry.create({ data: e });
+  }
+  console.log(`  ✓ ${entries.length} waitlist entries (pending admin approval).`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Final counts
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2020,6 +2069,7 @@ async function printCounts(): Promise<void> {
     bids: await prisma.bid.count(),
     auditLogs: await prisma.auditLog.count(),
     knowledgeAlerts: await prisma.knowledgeAlert.count(),
+    waitlistEntries: await prisma.waitlistEntry.count(),
   };
   for (const [k, v] of Object.entries(counts)) {
     console.log(`  ${k.padEnd(28)} ${v}`);
@@ -2047,6 +2097,7 @@ async function main(): Promise<void> {
   await seedAuditLogsForClassroom(ctx, oppIds.classroom, classroomEstimate);
   await seedEstimateAndBidForOffice(ctx, oppIds.office);
   await seedKnowledgeAlerts(ctx);
+  await seedWaitlist();
 
   await printCounts();
 

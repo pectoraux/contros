@@ -7,8 +7,9 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,12 +41,30 @@ model User {
   name           String
   email          String   @unique
   role           String   @default("estimator") // estimator | manager | director | admin
+  passwordHash   String?
+  isDemo         Boolean  @default(false)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
   organization   Organization @relation(fields: [organizationId], references: [id])
   opportunities  Opportunity[] @relation("OpportunityOwner")
   auditLogs      AuditLog[]
+}
+
+// Users who signed up and are waiting for an admin to create their account.
+// Sign-up does NOT create a User — it creates a WaitlistEntry.
+model WaitlistEntry {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  company      String?
+  role         String   @default("estimator") // requested role
+  status       String   @default("pending") // pending | approved | rejected
+  notes        String?
+  createdAt    DateTime @default(now())
+  reviewedAt   DateTime?
+  reviewedById String?
+  createdUserId String? // the User created when approved
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
