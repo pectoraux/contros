@@ -98,7 +98,14 @@ export async function POST(
         | { totalAmount: number; coveragePct: number }
         | null = null
       const pkgLine = await db.subcontractPackageLine.findFirst({
-        where: { estimateLineId: l.id },
+        where: {
+          estimateLineId: l.id,
+          subcontractPackage: {
+            opportunity: {
+              organizationId: ctx.organizationId,
+            },
+          },
+        },
         include: {
           subcontractPackage: {
             include: {
@@ -131,8 +138,16 @@ export async function POST(
           | null
           | undefined = undefined
         if (seg.strategy === 'subcontract' && seg.subcontractQuoteId) {
-          const sq = await db.subcontractQuote.findUnique({
-            where: { id: seg.subcontractQuoteId },
+          // P0: tenant-safe — verify ownership via subcontractPackage → opportunity → org.
+          const sq = await db.subcontractQuote.findFirst({
+            where: {
+              id: seg.subcontractQuoteId,
+              subcontractPackage: {
+                opportunity: {
+                  organizationId: ctx.organizationId,
+                },
+              },
+            },
             select: { totalAmount: true, coveragePct: true },
           })
           segQuote = sq

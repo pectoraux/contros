@@ -61,9 +61,17 @@ export async function POST(
 
     // P0-5: fetch the subcontract quote (if any) for this line.
     // Look up via SubcontractPackageLine → SubcontractPackage → selectedQuote.
+    // P0: tenant-safe — the package must belong to the same organization.
     let subcontractQuote: { totalAmount: number; coveragePct: number } | null = null
     const pkgLine = await db.subcontractPackageLine.findFirst({
-      where: { estimateLineId: line.id },
+      where: {
+        estimateLineId: line.id,
+        subcontractPackage: {
+          opportunity: {
+            organizationId: ctx.organizationId,
+          },
+        },
+      },
       include: {
         subcontractPackage: {
           include: {
@@ -87,12 +95,22 @@ export async function POST(
 
     // P0-5: build ExecutionSegmentInput[] from the persisted relation.
     // For subcontract segments, fetch the segment's referenced quote (if any).
+    // P0: tenant-safe — verify the quote belongs to the same organization via
+    // its subcontractPackage → opportunity → organizationId chain. Never trust
+    // a foreign key reference alone.
     const executionSegments: ExecutionSegmentInput[] = []
     for (const seg of line.executionSegments) {
       let segQuote: { totalAmount: number; coveragePct: number } | null | undefined = undefined
       if (seg.strategy === 'subcontract' && seg.subcontractQuoteId) {
-        const sq = await db.subcontractQuote.findUnique({
-          where: { id: seg.subcontractQuoteId },
+        const sq = await db.subcontractQuote.findFirst({
+          where: {
+            id: seg.subcontractQuoteId,
+            subcontractPackage: {
+              opportunity: {
+                organizationId: ctx.organizationId,
+              },
+            },
+          },
           select: { totalAmount: true, coveragePct: true },
         })
         if (sq) {
