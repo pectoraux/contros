@@ -319,6 +319,8 @@ model EstimateRevision {
   finalizedById String?
 
   estimate      Estimate @relation(fields: [estimateId], references: [id])
+
+  @@unique([estimateId, revisionNo])
 }
 
 model EstimateLine {

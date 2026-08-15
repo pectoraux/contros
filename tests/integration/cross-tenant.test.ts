@@ -402,4 +402,121 @@ describe('Cross-tenant integration tests', () => {
       await db.auditLog.delete({ where: { id: audit!.id } })
     }
   }, 60000)
+
+  // ── Test 9: Cross-tenant WD finalization rejected ─────────────────────────
+  test('Org A line with Org B WorkDefinitionVersion → finalizeRevision rejected, no snapshot leakage', async () => {
+    // First ensure LINE_A is complete with its own WD.
+    await db.estimateLine.update({
+      where: { id: LINE_A },
+      data: { workDefinitionId: WD_A, workDefinitionVersionId: WDV_A, calculationStatus: 'complete' },
+    })
+    // Now switch LINE_A to reference Org B's WD.
+    await db.estimateLine.update({
+      where: { id: LINE_A },
+      data: { workDefinitionId: WD_B, workDefinitionVersionId: WDV_B },
+    })
+
+    const result = await estimateService.finalizeRevision({
+      ctx: ctxA,
+      estimateId: EST_A,
+      revisionNo: 777,
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(403)
+    }
+
+    // Verify NO revision was created.
+    const rev = await db.estimateRevision.findFirst({
+      where: { estimateId: EST_A, revisionNo: 777 },
+    })
+    expect(rev).toBeNull()
+
+    // Restore LINE_A.
+    await db.estimateLine.update({
+      where: { id: LINE_A },
+      data: { workDefinitionId: WD_A, workDefinitionVersionId: WDV_A },
+    })
+  }, 60000)
+
+  // ── Test 10: Resource/price observation isolation ─────────────────────────
+  test('Org B resource price observation does not appear in Org A pricing', async () => {
+    // Ensure LINE_A uses its own WD (which has Org A resources, not Org B).
+    await db.estimateLine.update({
+      where: { id: LINE_A },
+      data: { workDefinitionId: WD_A, workDefinitionVersionId: WDV_A, executionStrategy: 'self-perform' },
+    })
+
+    const result = await estimateService.recomputeLine({
+      ctx: ctxA,
+      estimateId: EST_A,
+      estimateLineId: LINE_A,
+    })
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      // The Org B resource price (777) and source reference (ORG-B-SECRET)
+      // must NOT appear anywhere in the result.
+      const provenance = result.line.provenance as Array<{ price: number; sourceReference?: string }>
+      expect(provenance.some((p) => p.price === 777)).toBe(false)
+      expect(provenance.some((p) => p.sourceReference === 'ORG-B-SECRET')).toBe(false)
+    }
+  }, 60000)
+
+  // ── Test 11: Real transaction rollback (failure after revision creation) ──
+  test('Transaction rollback: failure after revision creation leaves no extra revision', async () => {
+    // Ensure LINE_A is complete.
+    await estimateService.recomputeLine({
+      ctx: ctxA,
+      estimateId: EST_A,
+      estimateLineId: LINE_A,
+    })
+
+    // First, successfully create a revision at revisionNo=666.
+    const firstResult = await estimateService.finalizeRevision({
+      ctx: ctxA,
+      estimateId: EST_A,
+      revisionNo: 666,
+    })
+    expect(firstResult.ok).toBe(true)
+
+    // Count revisions before the second attempt.
+    const revisionsBefore = await db.estimateRevision.count({
+      where: { estimateId: EST_A, revisionNo: 666 },
+    })
+    expect(revisionsBefore).toBe(1)
+
+    // Now try to finalize again with the same revisionNo. The transaction
+    // will attempt to INSERT a duplicate revision. If there's a unique
+    // constraint, the INSERT fails inside the transaction → rollback.
+    // If there's no unique constraint, two revisions would be created —
+    // but the test verifies the count stays at 1.
+    try {
+      await estimateService.finalizeRevision({
+        ctx: ctxA,
+        estimateId: EST_A,
+        revisionNo: 666,
+      })
+    } catch {
+      // Expected — the transaction may throw on constraint violation.
+    }
+
+    // Verify only ONE revision with revisionNo=666 exists (the first one).
+    // If the transaction rolled back, the second insert didn't persist.
+    const revisionsAfter = await db.estimateRevision.count({
+      where: { estimateId: EST_A, revisionNo: 666 },
+    })
+    expect(revisionsAfter).toBe(1)
+
+    // Clean up.
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 666 } })
+    await db.auditLog.deleteMany({
+      where: {
+        organizationId: ORG_A,
+        action: 'estimate.revision-finalized',
+        summary: { contains: 'revision 666' },
+      },
+    })
+  }, 60000)
 })

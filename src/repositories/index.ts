@@ -30,8 +30,10 @@ export const estimateRepository = {
    * Get the full revision context for an estimate: the estimate, its lines,
    * work definitions, versions, execution segments, and existing revisions.
    *
-   * P0-3: WorkDefinition ownership is verified in the service after loading —
-   * if a WD/WDV doesn't belong to the same org, it's treated as null.
+   * P0-3: WorkDefinition/WDV/Resource ownership is enforced AT THE REPOSITORY
+   * LEVEL — the query only loads WDs/WDVs/priceObservations that belong to the
+   * requesting organization. If a line references a cross-tenant WD, the WD/WDV
+   * will be null in the result. The service checks for this and rejects.
    */
   async getRevisionContext(orgId: string, estimateId: string) {
     return db.estimate.findFirst({
@@ -39,8 +41,24 @@ export const estimateRepository = {
       include: {
         lines: {
           include: {
-            workDefinition: true,
-            workDefinitionVersion: { include: { priceObservations: true } },
+            // Only load WD if it belongs to the same org (1:1 relation with where filter)
+            workDefinition: {
+              where: { organizationId: orgId },
+            },
+            // Only load WDV if its parent WD belongs to the same org
+            workDefinitionVersion: {
+              where: {
+                workDefinition: { organizationId: orgId },
+              },
+              include: {
+                // Only load price observations for resources in the same org
+                priceObservations: {
+                  where: {
+                    resource: { organizationId: orgId },
+                  },
+                },
+              },
+            },
             executionSegments: true,
           },
         },
@@ -51,7 +69,7 @@ export const estimateRepository = {
 
   /**
    * Get an estimate line with full pricing graph, tenant-scoped.
-   * P0-3: WorkDefinition/WDV ownership is verified in the service after loading.
+   * P0-3: WD/WDV/Resource ownership enforced at the repository level.
    */
   async getLineForOrganization(
     orgId: string,
@@ -65,8 +83,21 @@ export const estimateRepository = {
         estimate: { organizationId: orgId },
       },
       include: {
-        workDefinition: true,
-        workDefinitionVersion: { include: { priceObservations: true } },
+        workDefinition: {
+          where: { organizationId: orgId },
+        },
+        workDefinitionVersion: {
+          where: {
+            workDefinition: { organizationId: orgId },
+          },
+          include: {
+            priceObservations: {
+              where: {
+                resource: { organizationId: orgId },
+              },
+            },
+          },
+        },
         estimate: true,
         scopeItem: true,
         executionSegments: true,

@@ -114,14 +114,14 @@ export const estimateService = {
 
     const wdv = line.workDefinitionVersion
 
-    // P0-3: Verify WorkDefinition ownership — if the WD belongs to another org,
-    // treat it as unavailable (null). This prevents cross-tenant pricing knowledge.
+    // P0-3: WorkDefinition ownership is enforced at the repository level.
+    // If the line references a cross-tenant WD, the repository returns null.
+    // If workDefinitionId is set but WD is null → cross-tenant reference → reject.
     const wd = line.workDefinition
-    if (wd && wd.organizationId !== ctx.organizationId) {
-      // Cross-tenant WD reference — treat as unavailable.
+    if (line.workDefinitionId && !wd) {
       return { ok: false, error: 'Work Definition not available for this organization', status: 403 }
     }
-    if (wdv && wd && wd.organizationId !== ctx.organizationId) {
+    if (line.workDefinitionVersionId && !wdv) {
       return { ok: false, error: 'Work Definition Version not available for this organization', status: 403 }
     }
 
@@ -398,9 +398,25 @@ export const estimateService = {
       }
 
       // P0-3: WD/WDV are only present if they belong to the same org (repository filters).
-      // If a cross-tenant WD was referenced, it's null here → treated as unavailable.
+      // If a line references a cross-tenant WD, the repository returns null for it.
+      // We must reject finalization — cross-tenant pricing knowledge must not enter
+      // the immutable snapshot.
       const wdv = l.workDefinitionVersion
       const wd = l.workDefinition
+      if (l.workDefinitionId && !wd) {
+        return {
+          ok: false,
+          error: `Line ${l.id} references a WorkDefinition that does not belong to this organization — cannot finalize.`,
+          status: 403,
+        }
+      }
+      if (l.workDefinitionVersionId && !wdv) {
+        return {
+          ok: false,
+          error: `Line ${l.id} references a WorkDefinitionVersion that does not belong to this organization — cannot finalize.`,
+          status: 403,
+        }
+      }
       lineSnapshots.push({
         lineId: l.id,
         description: l.description,
