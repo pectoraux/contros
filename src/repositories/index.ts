@@ -1187,13 +1187,28 @@ export const estimateRevisionRepositoryExtended = {
     })
   },
 
-  /** Get a finalized revision for adjudication — returns the snapshot JSON. */
-  async getFinalizedForOrganization(orgId: string, revisionId: string) {
+  /**
+   * P0-1: Get a finalized revision for adjudication — verifies the FULL chain:
+   *   revision → estimate → organization
+   *   AND estimate.id === the bid's estimateId
+   *   AND estimate.opportunityId === the bid's opportunityId
+   * Returns null if any link is broken.
+   */
+  async getFinalizedForBid(
+    orgId: string,
+    estimateId: string,
+    opportunityId: string,
+    revisionId: string,
+  ) {
     return db.estimateRevision.findFirst({
       where: {
         id: revisionId,
         status: 'finalized',
-        estimate: { organizationId: orgId },
+        estimate: {
+          id: estimateId,
+          organizationId: orgId,
+          opportunityId,
+        },
       },
       select: { id: true, snapshotJson: true, revisionNo: true, status: true },
     })
@@ -1201,19 +1216,29 @@ export const estimateRevisionRepositoryExtended = {
 }
 
 // ─── Programme Revision Repository ──────────────────────────────────────────
-// For MVP, programme revisions are stored as EstimateRevisions with a flag.
-// If a dedicated ProgrammeRevision model exists later, this can be extended.
+// For MVP, programme revisions are stored as EstimateRevisions.
+// The service must verify the revision belongs to the SAME opportunity.
 
 export const programmeRevisionRepository = {
-  /** Get a finalized programme revision, tenant-safe. */
-  async getFinalizedForOrganization(orgId: string, revisionId: string) {
-    // For now, programme revisions reuse the EstimateRevision model.
-    // A programme revision is simply a finalized revision on the same estimate.
+  /**
+   * P0-2: Get a finalized programme revision — verifies the FULL chain:
+   *   revision → estimate → organization
+   *   AND estimate.opportunityId === the bid's opportunityId
+   * Returns null if any link is broken.
+   */
+  async getFinalizedForOpportunity(
+    orgId: string,
+    opportunityId: string,
+    revisionId: string,
+  ) {
     return db.estimateRevision.findFirst({
       where: {
         id: revisionId,
         status: 'finalized',
-        estimate: { organizationId: orgId },
+        estimate: {
+          organizationId: orgId,
+          opportunityId,
+        },
       },
       select: { id: true, status: true, revisionNo: true },
     })

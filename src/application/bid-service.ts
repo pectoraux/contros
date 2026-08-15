@@ -129,11 +129,18 @@ export const bidService = {
 
     // P0-2: Deliverable readiness is NOT inferred from WD coverage.
     // BOQ is ready if estimate has lines. Programme/MS/JHA readiness is
-    // determined by whether a finalized revision exists, not by WD coverage.
+    // determined by whether the bid's adjudicated revision is finalized.
+    // P0-3: Use adjudicatedRevisionId (set during adjudication), not estimateRevisionId.
     const hasEstimateLines = (estimate?.lines.length ?? 0) > 0
-    const hasFinalizedRevision = !!(await estimateRevisionRepositoryExtended.getFinalizedForOrganization(
-      ctx.organizationId, opportunity.bid?.estimateRevisionId ?? '',
-    ))
+    const revisionToCheck = opportunity.bid?.adjudicatedRevisionId ?? opportunity.bid?.estimateRevisionId ?? ''
+    const hasFinalizedRevision = revisionToCheck
+      ? !!(await estimateRevisionRepositoryExtended.getFinalizedForBid(
+          ctx.organizationId,
+          opportunity.bid?.estimateId ?? '',
+          opportunity.id,
+          revisionToCheck,
+        ))
+      : false
     const deliverables = {
       boq: hasEstimateLines,
       programme: hasFinalizedRevision,
@@ -263,12 +270,20 @@ export const bidService = {
       return { ok: false, error: 'Cannot adjudicate a submitted bid — commercial fields are immutable', status: 400 }
     }
 
-    // P0-4: Load the FINALIZED revision via repository (tenant-safe).
-    const revision = await estimateRevisionRepositoryExtended.getFinalizedForOrganization(
-      ctx.organizationId, estimateRevisionId,
+    // P0-1: Load the FINALIZED revision via repository — verifies the FULL chain:
+    //   revision → estimate → organization
+    //   AND estimate.id === bid.estimateId
+    //   AND estimate.opportunityId === bid.opportunityId
+    // This prevents using a revision from a different estimate/opportunity
+    // even within the same organization.
+    const revision = await estimateRevisionRepositoryExtended.getFinalizedForBid(
+      ctx.organizationId,
+      bid.estimateId,
+      bid.opportunityId,
+      estimateRevisionId,
     )
     if (!revision) {
-      return { ok: false, error: 'Finalized estimate revision not found in this organization', status: 404 }
+      return { ok: false, error: 'Finalized estimate revision not found for this bid\'s estimate and opportunity', status: 404 }
     }
 
     // P0-4: Derive system price from the immutable snapshot, not the mutable estimate.
@@ -287,6 +302,9 @@ export const bidService = {
         finalPrice,
         systemSellPrice,
         adjudicatedRevisionId: estimateRevisionId,
+        // P0-4: Set estimateRevisionId = adjudicatedRevisionId so the gate
+        // and submission use the same revision.
+        estimateRevisionId: estimateRevisionId,
         tenderPackStatus: 'adjudication',
       })
       await auditLogRepository.createInTransaction(tx, ctx.organizationId, ctx.userId, {
@@ -326,20 +344,22 @@ export const bidService = {
       return { ok: false, error: 'Cannot submit without an adjudicated estimate revision — record adjudication first', status: 400 }
     }
 
-    // P0-3: Validate programme revision if provided (tenant-safe + finalized).
+    // P0-2: Validate programme revision if provided — must belong to the SAME opportunity.
     if (programmeRevisionId) {
-      const progRev = await programmeRevisionRepository.getFinalizedForOrganization(ctx.organizationId, programmeRevisionId)
+      const progRev = await programmeRevisionRepository.getFinalizedForOpportunity(
+        ctx.organizationId, bid.opportunityId, programmeRevisionId,
+      )
       if (!progRev) {
-        return { ok: false, error: 'Finalized programme revision not found in this organization', status: 404 }
+        return { ok: false, error: 'Finalized programme revision not found for this opportunity', status: 404 }
       }
     }
 
-    // Validate the adjudicated revision is still finalized.
-    const revision = await estimateRevisionRepositoryExtended.getFinalizedForOrganization(
-      ctx.organizationId, bid.adjudicatedRevisionId,
+    // P0-1: Validate the adjudicated revision is still finalized AND belongs to this bid's estimate+opportunity.
+    const revision = await estimateRevisionRepositoryExtended.getFinalizedForBid(
+      ctx.organizationId, bid.estimateId, bid.opportunityId, bid.adjudicatedRevisionId,
     )
     if (!revision) {
-      return { ok: false, error: 'Adjudicated estimate revision is no longer finalized', status: 400 }
+      return { ok: false, error: 'Adjudicated estimate revision is no longer finalized or does not belong to this bid', status: 400 }
     }
 
     // Validate bid submission.
