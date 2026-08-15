@@ -1046,3 +1046,24 @@ Stage Summary:
   * Post-adjudication mutation test proves frozen commercial state
   * 16 real integration tests
 - Three frozen application services: EstimateService, SubcontractService, BidService.
+
+---
+Task ID: bid-service-final-freeze
+Agent: principal-engineer
+Task: BidService final freeze — no fallback, frozen subcontract, tender-specific deliverables, BOQ from TenderDeliverable
+
+Work Log:
+- P0-1: NEVER fall back from adjudicated revision to current estimate.
+  If revision missing or replay fails → BLOCKER. No fallback path.
+- P0-2: Subcontract commercial basis frozen at adjudication.
+  Gate uses subcontractScopeSnapshots from revision replay.
+- P1-3: TenderDeliverable requirements are tender-specific.
+  createBid() accepts requiredDeliverables parameter.
+- P1-4: BOQ readiness uses TenderDeliverable status ONLY.
+  Removed estimate-lines fallback.
+- 18 integration tests all pass.
+- Deployed to Vercel at 415f3b9. All three SHAs match.
+
+Stage Summary:
+- BidService FROZEN. All final requirements satisfied.
+- Three frozen application services: EstimateService, SubcontractService, BidService.
