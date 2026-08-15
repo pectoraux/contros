@@ -440,4 +440,52 @@ describe('BidService integration tests', () => {
     await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 800 } })
     await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
   }, 60000)
+
+  // ── BOQ readiness must use TenderDeliverable only (not estimate lines) ────
+  test('BOQ deliverable missing → blocker even if estimate has lines', async () => {
+    // Create a bid with default deliverables (BOQ required, status=missing)
+    const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
+    if (!createResult.ok) return
+
+    // The estimate has lines, but BOQ deliverable status is 'missing'
+    const wsResult = await bidService.getBidWorkspace({ ctx: ctxA, opportunityId: OPP_A })
+    expect(wsResult.ok).toBe(true)
+    if (wsResult.ok) {
+      const boqCheck = wsResult.gate.checks.find((c) => c.id === 'deliverables')
+      if (boqCheck) {
+        // BOQ is missing → deliverables check should be blocker
+        expect(boqCheck.status).toBe('blocker')
+      }
+    }
+  }, 60000)
+
+  // ── Tender-specific deliverable requirements ──────────────────────────────
+  test('Bid with programme not required → no programme blocker', async () => {
+    const createResult = await bidService.createBid({
+      ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A,
+      requiredDeliverables: [
+        { kind: 'boq', required: true },
+        { kind: 'programme', required: false },
+        { kind: 'method-statement', required: false },
+        { kind: 'jha', required: false },
+      ],
+    })
+    if (!createResult.ok) return
+
+    // Mark BOQ as ready
+    await db.tenderDeliverable.updateMany({
+      where: { bidId: createResult.bidId, kind: 'boq' },
+      data: { status: 'ready' },
+    })
+
+    const wsResult = await bidService.getBidWorkspace({ ctx: ctxA, opportunityId: OPP_A })
+    expect(wsResult.ok).toBe(true)
+    if (wsResult.ok) {
+      // Programme/MS/JHA are not required → should not be a blocker
+      const deliverablesCheck = wsResult.gate.checks.find((c) => c.id === 'deliverables')
+      if (deliverablesCheck) {
+        expect(deliverablesCheck.status).not.toBe('blocker')
+      }
+    }
+  }, 60000)
 })

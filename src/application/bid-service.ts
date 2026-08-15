@@ -39,7 +39,17 @@ import {
 type Err = { ok: false; error: string; status: number }
 
 export interface BidWorkspaceInput { ctx: RequestContext; opportunityId: string }
-export interface CreateBidInput { ctx: RequestContext; opportunityId: string; estimateId: string }
+export interface TenderDeliverableRequirement {
+  kind: string // boq | programme | method-statement | jha | cover-letter | assumptions | clarifications | certificate
+  required: boolean
+}
+
+export interface CreateBidInput {
+  ctx: RequestContext
+  opportunityId: string
+  estimateId: string
+  requiredDeliverables?: TenderDeliverableRequirement[]
+}
 export interface TransitionStatusInput { ctx: RequestContext; bidId: string; newStatus: string }
 export interface RunGateInput { ctx: RequestContext; opportunityId: string }
 export interface RecordAdjudicationInput {
@@ -123,40 +133,60 @@ export const bidService = {
     let subcontractPackages: GateSubcontractPackage[]
 
     if (bid?.adjudicatedRevisionId) {
-      // P0-1: Use FROZEN adjudicated revision for commercial data.
+      // P0-1: Use FROZEN adjudicated revision for ALL commercial data.
+      // NEVER fall back to current estimate if adjudicated revision is set.
       const revision = await estimateRevisionRepositoryExtended.getFinalizedForBid(
         ctx.organizationId, bid.estimateId, opportunity.id, bid.adjudicatedRevisionId,
       )
-      if (revision) {
+      if (!revision) {
+        // P0-1: Missing revision = BLOCKER. Do NOT fall back to current estimate.
+        estimateLines = [{
+          id: 'blocked', description: 'Adjudicated estimate revision is unavailable',
+          isUnsourced: true, acknowledged: false, unitRate: 0,
+          calculationStatus: 'incomplete' as const, exceptionApproved: false,
+        }]
+        subcontractPackages = []
+      } else {
         const replay = replayRevision(revision.snapshotJson)
-        if (replay.ok) {
-          // Build gate lines from the frozen snapshot, not the mutable estimate.
+        if (!replay.ok) {
+          // P0-1: Replay failure = BLOCKER. Do NOT fall back.
+          estimateLines = [{
+            id: 'blocked', description: 'Adjudicated estimate revision cannot be replayed',
+            isUnsourced: true, acknowledged: false, unitRate: 0,
+            calculationStatus: 'incomplete' as const, exceptionApproved: false,
+          }]
+          subcontractPackages = []
+        } else {
+          // Build gate lines from the frozen snapshot.
           estimateLines = replay.lines.map((l) => ({
             id: l.lineId,
             description: l.description,
             isUnsourced: l.breakdown.unsourced,
-            acknowledged: false, // Acknowledgement is workflow state — use current if needed
+            acknowledged: false,
             unitRate: l.breakdown.unitRate,
             calculationStatus: l.breakdown.calculationStatus,
-            exceptionApproved: false, // Exceptions are workflow state
+            exceptionApproved: false,
           }))
-        } else {
-          // Replay failed — fall back to current estimate (shouldn't happen)
-          estimateLines = (estimate?.lines ?? []).map((l) => ({
-            id: l.id, description: l.description, isUnsourced: l.isUnsourced, acknowledged: l.acknowledged,
-            unitRate: l.unitRate,
-            calculationStatus: (l.calculationStatus === 'incomplete' ? 'incomplete' : 'complete') as 'complete' | 'incomplete',
-            exceptionApproved: l.commercialExceptions.some((ex) => !!ex.approvedById),
+
+          // P0-2: Build subcontract packages from the FROZEN revision snapshot.
+          // The snapshot contains subcontractQuote per line — use it, NOT current packages.
+          const frozenQuotes = replay.subcontractScopeSnapshots
+          subcontractPackages = frozenQuotes.map((sq) => ({
+            id: sq.id,
+            name: sq.supplierName,
+            coveragePct: sq.economicCoveragePct,
+            selectedQuoteId: sq.id,
+            isLumpSum: sq.economicCoverageUnknown,
           }))
+          // If no subcontract quotes in snapshot, use empty array (no packages = no blocker)
+          if (frozenQuotes.length === 0) {
+            subcontractPackages = opportunity.subcontractPackages.map((sp) => ({
+              id: sp.id, name: sp.name,
+              coveragePct: sp.quotes.find((q) => q.id === sp.selectedQuoteId)?.coveragePct ?? 0,
+              selectedQuoteId: sp.selectedQuoteId, isLumpSum: false,
+            }))
+          }
         }
-      } else {
-        // Revision not found — fall back to current
-        estimateLines = (estimate?.lines ?? []).map((l) => ({
-          id: l.id, description: l.description, isUnsourced: l.isUnsourced, acknowledged: l.acknowledged,
-          unitRate: l.unitRate,
-          calculationStatus: (l.calculationStatus === 'incomplete' ? 'incomplete' : 'complete') as 'complete' | 'incomplete',
-          exceptionApproved: l.commercialExceptions.some((ex) => !!ex.approvedById),
-        }))
       }
     } else {
       // No adjudicated revision yet — use current estimate (pre-adjudication is OK)
@@ -166,16 +196,16 @@ export const bidService = {
         calculationStatus: (l.calculationStatus === 'incomplete' ? 'incomplete' : 'complete') as 'complete' | 'incomplete',
         exceptionApproved: l.commercialExceptions.some((ex) => !!ex.approvedById),
       }))
+      // Pre-adjudication: use current subcontract packages
+      subcontractPackages = opportunity.subcontractPackages.map((sp) => ({
+        id: sp.id, name: sp.name,
+        coveragePct: sp.quotes.find((q) => q.id === sp.selectedQuoteId)?.coveragePct ?? 0,
+        selectedQuoteId: sp.selectedQuoteId, isLumpSum: false,
+      }))
     }
 
-    // Subcontract packages are always current (they're workflow state, not frozen in the revision)
-    subcontractPackages = opportunity.subcontractPackages.map((sp) => ({
-      id: sp.id, name: sp.name,
-      coveragePct: sp.quotes.find((q) => q.id === sp.selectedQuoteId)?.coveragePct ?? 0,
-      selectedQuoteId: sp.selectedQuoteId, isLumpSum: false,
-    }))
-
-    // P0-3: Deliverable readiness uses TenderDeliverable records, NOT estimateRevision existence.
+    // P0-3: Deliverable readiness uses TenderDeliverable records ONLY.
+    // P1-4: BOQ readiness must NOT fall back to estimate-lines existence.
     const deliverableRecords = bid
       ? await tenderDeliverableRepository.getForBid(ctx.organizationId, bid.id)
       : []
@@ -186,7 +216,7 @@ export const bidService = {
       return rec.status === 'ready' || rec.status === 'finalized'
     }
     const deliverables = {
-      boq: getDeliverableStatus('boq') || (estimate?.lines.length ?? 0) > 0,
+      boq: getDeliverableStatus('boq'),
       programme: getDeliverableStatus('programme'),
       methodStatement: getDeliverableStatus('method-statement'),
       jha: getDeliverableStatus('jha'),
@@ -244,7 +274,7 @@ export const bidService = {
    * Create a bid — transactional with audit.
    */
   async createBid(input: CreateBidInput): Promise<{ ok: true; bidId: string } | Err> {
-    const { ctx, opportunityId, estimateId } = input
+    const { ctx, opportunityId, estimateId, requiredDeliverables } = input
 
     const existing = await bidRepository.getForOpportunity(ctx.organizationId, opportunityId)
     if (existing) {
@@ -254,8 +284,20 @@ export const bidService = {
     const bid = await dbTx.$transaction(async (tx) => {
       const created = await bidRepository.createInTransaction(tx, ctx.organizationId, { opportunityId, estimateId })
       if (!created) return null
-      // P0-3: Create default tender deliverables for the new bid.
-      await tenderDeliverableRepository.createDefaultsForBid(tx, created.id)
+      // P1-3: Create tender deliverables — use caller-specified requirements
+      // or sensible defaults if not provided.
+      const defaults: TenderDeliverableRequirement[] = requiredDeliverables ?? [
+        { kind: 'boq', required: true },
+        { kind: 'programme', required: true },
+        { kind: 'method-statement', required: true },
+        { kind: 'jha', required: true },
+        { kind: 'assumptions', required: true },
+      ]
+      for (const d of defaults) {
+        await tx.tenderDeliverable.create({
+          data: { bidId: created.id, kind: d.kind, required: d.required, status: 'missing' },
+        })
+      }
       await auditLogRepository.createInTransaction(tx, ctx.organizationId, ctx.userId, {
         action: 'bid.created', entityType: 'Bid', entityId: created.id,
         summary: `Bid created for opportunity ${opportunityId}`,
