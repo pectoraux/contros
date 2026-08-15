@@ -626,3 +626,33 @@ Stage Summary:
 - The hybrid subcontract calculation is now commercially explicit — no guessing
   whether the quote is for the segment or for a larger package.
 - The commercial foundation is complete. Ready for the application-service layer.
+
+---
+Task ID: persist-hybrid-commercial-state
+Agent: principal-engineer
+Task: Persist pricingBasis + quoteCoversSegmentScope in canonical schema
+
+Work Log:
+- P0-1/P0-2: Added pricingBasis (String?) and quoteCoversSegmentScope (Boolean @default(false))
+  to the ExecutionSegment Prisma model. The commercial decision is now canonical, not ephemeral.
+- P0-3: Updated all read/write paths:
+  * price-line route: reads pricingBasis + quoteCoversSegmentScope from DB, passes to engine
+  * finalize-revision route: captures them in the immutable snapshot
+  * opportunity detail API: serializes them in the response
+  * seed: persists them when creating ExecutionSegment records
+- P0-4: Revision snapshot preserves pricingBasis + quoteCoversSegmentScope. Integration test
+  proves: finalize with direct-segment-quote → mutate to proportional-from-package →
+  replay original → still uses direct-segment-quote (cost = 500000, not 150000).
+- P0-9: Neon DB migrated. Seed completed — execution segments have pricingBasis and
+  quoteCoversSegmentScope persisted. Production API returns them.
+- 101 tests pass (2 new persistence + replay tests). Lint clean. Build succeeds.
+- All four SHAs verified EXACTLY matching:
+  LOCAL HEAD:    1579884a620d50218f3ad718f99e5a642903b11a
+  REMOTE MAIN:   1579884a620d50218f3ad718f99e5a642903b11a
+  VERCEL COMMIT: 1579884a620d50218f3ad718f99e5a642903b11a
+  /api/version:  1579884a620d50218f3ad718f99e5a642903b11a
+
+Stage Summary:
+- The database model and the commercial engine model are now aligned — no divergence.
+- pricingBasis and quoteCoversSegmentScope are persisted, serialized, snapshotted, and replayed.
+- The commercial foundation is frozen. Ready for the application-service layer.
