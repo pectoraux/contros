@@ -1,0 +1,629 @@
+     1→// Contractor OS — Canonical Domain Model
+     2→// Source of truth is the structured domain model, NOT Office files.
+     3→// Estimate is the canonical commercial object; BOQ is a projection.
+     4→
+     5→generator client {
+     6→  provider = "prisma-client-js"
+     7→}
+     8→
+     9→datasource db {
+    10→  provider  = "postgresql"
+    11→  url       = env("DATABASE_URL")
+    12→  directUrl = env("DIRECT_DATABASE_URL")
+    13→}
+    14→
+    15→// ─────────────────────────────────────────────────────────────────────────────
+    16→// Tenancy & Identity
+    17→// ─────────────────────────────────────────────────────────────────────────────
+    18→
+    19→model Organization {
+    20→  id            String   @id @default(cuid())
+    21→  name          String
+    22→  industryPackId String  @default("construction-ghana")
+    23→  currency      String   @default("GHS")
+    24→  createdAt     DateTime @default(now())
+    25→  updatedAt     DateTime @updatedAt
+    26→
+    27→  users         User[]
+    28→  clients       Client[]
+    29→  opportunities Opportunity[]
+    30→  workDefinitions WorkDefinition[]
+    31→  resources     Resource[]
+    32→  estimates     Estimate[]
+    33→  bids          Bid[]
+    34→  auditLogs     AuditLog[]
+    35→  knowledgeAlerts KnowledgeAlert[]
+    36→  commercialExceptions CommercialException[]
+    37→  projectActuals   ProjectActual[]
+    38→  calibrationProposals CalibrationProposal[]
+    39→}
+    40→
+    41→model User {
+    42→  id             String   @id @default(cuid())
+    43→  organizationId String
+    44→  name           String
+    45→  email          String   @unique
+    46→  role           String   @default("estimator") // estimator | manager | director | admin
+    47→  passwordHash   String?
+    48→  isDemo         Boolean  @default(false)
+    49→  createdAt      DateTime @default(now())
+    50→  updatedAt      DateTime @updatedAt
+    51→
+    52→  organization   Organization @relation(fields: [organizationId], references: [id])
+    53→  opportunities  Opportunity[] @relation("OpportunityOwner")
+    54→  auditLogs      AuditLog[]
+    55→}
+    56→
+    57→// Users who signed up and are waiting for an admin to create their account.
+    58→// Sign-up does NOT create a User — it creates a WaitlistEntry.
+    59→model WaitlistEntry {
+    60→  id           String   @id @default(cuid())
+    61→  name         String
+    62→  email        String   @unique
+    63→  company      String?
+    64→  role         String   @default("estimator") // requested role
+    65→  status       String   @default("pending") // pending | approved | rejected
+    66→  notes        String?
+    67→  createdAt    DateTime @default(now())
+    68→  reviewedAt   DateTime?
+    69→  reviewedById String?
+    70→  createdUserId String? // the User created when approved
+    71→}
+    72→
+    73→// ─────────────────────────────────────────────────────────────────────────────
+    74→// Clients
+    75→// ─────────────────────────────────────────────────────────────────────────────
+    76→
+    77→model Client {
+    78→  id             String   @id @default(cuid())
+    79→  organizationId String
+    80→  name           String
+    81→  contactName    String?
+    82→  contactEmail   String?
+    83→  contactPhone   String?
+    84→  sector         String?  // public | private | ngo
+    85→  createdAt      DateTime @default(now())
+    86→  updatedAt      DateTime @updatedAt
+    87→
+    88→  organization   Organization @relation(fields: [organizationId], references: [id])
+    89→  opportunities  Opportunity[]
+    90→}
+    91→
+    92→// ─────────────────────────────────────────────────────────────────────────────
+    93→// Opportunity / RFQ
+    94→// ─────────────────────────────────────────────────────────────────────────────
+    95→
+    96→model Opportunity {
+    97→  id                 String   @id @default(cuid())
+    98→  organizationId     String
+    99→  clientId           String
+   100→  ownerId            String?
+   101→  title              String
+   102→  reference          String?
+   103→  status             String   @default("received")
+   104→  // received | qualifying | no-bid | scope-development | estimating |
+   105→  // internal-review | adjudication | submitted | clarification | won | lost |
+   106→  // withdrawn | lapsed
+   107→  source             String?  // direct | tender-portal | referral
+   108→  description        String?
+   109→  receivedAt         DateTime @default(now())
+   110→  submissionDeadline DateTime?
+   111→  location           String?
+   112→  createdAt          DateTime @default(now())
+   113→  updatedAt          DateTime @updatedAt
+   114→
+   115→  organization       Organization @relation(fields: [organizationId], references: [id])
+   116→  client             Client       @relation(fields: [clientId], references: [id])
+   117→  owner              User?        @relation("OpportunityOwner", fields: [ownerId], references: [id])
+   118→  scopePackage       ScopePackage?
+   119→  estimates          Estimate[]
+   120→  subcontractPackages SubcontractPackage[]
+   121→  bid                Bid?
+   122→}
+   123→
+   124→// ─────────────────────────────────────────────────────────────────────────────
+   125→// Scope — first-class domain object
+   126→// ─────────────────────────────────────────────────────────────────────────────
+   127→
+   128→model ScopePackage {
+   129→  id             String   @id @default(cuid())
+   130→  opportunityId  String   @unique
+   131→  completeness   Float    @default(0) // 0..1 deterministic score
+   132→  origin         String   @default("rfq") // rfq | client-boq | estimator | site | ai
+   133→  createdAt      DateTime @default(now())
+   134→  updatedAt      DateTime @updatedAt
+   135→
+   136→  opportunity    Opportunity @relation(fields: [opportunityId], references: [id])
+   137→  items          ScopeItem[]
+   138→  questions      ScopeQuestion[]
+   139→  assumptions    ScopeAssumption[]
+   140→  evidence       ScopeEvidence[]
+   141→}
+   142→
+   143→model ScopeItem {
+   144→  id              String   @id @default(cuid())
+   145→  scopePackageId  String
+   146→  description     String
+   147→  category        String?  // structural | roofing | finishes | mep | external | etc.
+   148→  origin          String   @default("client") // client | inferred | ai | estimator
+   149→  status          String   @default("known") // known | missing | ambiguous
+   150→  confidence      Float    @default(1)
+   151→  createdAt       DateTime @default(now())
+   152→
+   153→  scopePackage    ScopePackage @relation(fields: [scopePackageId], references: [id])
+   154→  estimateLines   EstimateLine[]
+   155→}
+   156→
+   157→model ScopeQuestion {
+   158→  id                String   @id @default(cuid())
+   159→  scopePackageId    String
+   160→  question          String
+   161→  category          String?
+   162→  interpretationA   String?
+   163→  interpretationB   String?
+   164→  selectedInterpretation String?
+   165→  costImpact        Float    @default(0)
+   166→  programmeImpact   Float    @default(0) // days
+   167→  safetyImpact      String?
+   168→  contractualImpact String?
+   169→  status            String   @default("open") // open | clarified | assumed | resolved
+   170→  resolution        String?
+   171→  createdAt         DateTime @default(now())
+   172→  updatedAt         DateTime @updatedAt
+   173→
+   174→  scopePackage      ScopePackage @relation(fields: [scopePackageId], references: [id])
+   175→}
+   176→
+   177→model ScopeAssumption {
+   178→  id             String   @id @default(cuid())
+   179→  scopePackageId String
+   180→  text           String
+   181→  rationale      String?
+   182→  riskLevel      String   @default("medium") // low | medium | high
+   183→  acknowledged   Boolean  @default(false)
+   184→  createdAt      DateTime @default(now())
+   185→
+   186→  scopePackage   ScopePackage @relation(fields: [scopePackageId], references: [id])
+   187→}
+   188→
+   189→model ScopeEvidence {
+   190→  id             String   @id @default(cuid())
+   191→  scopePackageId String
+   192→  type           String   // rfq | drawing | specification | client-boq | photo | email | note | ai-extraction
+   193→  reference      String?
+   194→  summary        String
+   195→  createdAt      DateTime @default(now())
+   196→
+   197→  scopePackage   ScopePackage @relation(fields: [scopePackageId], references: [id])
+   198→}
+   199→
+   200→// ─────────────────────────────────────────────────────────────────────────────
+   201→// Work Library — institutional memory (versioned, immutable when approved)
+   202→// ─────────────────────────────────────────────────────────────────────────────
+   203→
+   204→model WorkDefinition {
+   205→  id             String   @id @default(cuid())
+   206→  organizationId String
+   207→  code           String   // e.g. "WD-STRUCT-014"
+   208→  name           String
+   209→  industry       String   @default("construction")
+   210→  category       String?  // structural | roofing | masonry | finishes | mep
+   211→  unit           String   // m2 | m3 | m | nr | ton
+   212→  approvalState  String   @default("draft") // draft | in-review | approved | deprecated
+   213→  currentVersionId String?
+   214→  createdAt      DateTime @default(now())
+   215→  updatedAt      DateTime @updatedAt
+   216→
+   217→  organization   Organization       @relation(fields: [organizationId], references: [id])
+   218→  versions       WorkDefinitionVersion[]
+   219→  estimateLines  EstimateLine[]
+   220→  calibrationProposals CalibrationProposal[]
+   221→}
+   222→
+   223→model WorkDefinitionVersion {
+   224→  id                  String   @id @default(cuid())
+   225→  workDefinitionId    String
+   226→  version             Int      @default(1)
+   227→  measurementRule     String?
+   228→  costRecipeJson      String   // deterministic recipe (resource quantities + wastage)
+   229→  productivityRule    Float?   // output per crew-day
+   230→  crewComposition     String?
+   231→  equipment           String?
+   232→  wastage             Float    @default(0.05)
+   233→  sequencing          String?
+   234→  methodStatementFragment String?
+   235→  hazardsJson         String   // array of hazard strings
+   236→  controlsJson        String   // array of control strings
+   237→  qualityChecklistJson String
+   238→  requiredPPE         String?
+   239→  requiredPermits     String?
+   240→  subcontractability  String   @default("yes") // yes | no | partial
+   241→  commonAssumptions   String?
+   242→  commonExclusions    String?
+   243→  approvalState       String   @default("draft") // draft | approved
+   244→  approvedAt          DateTime?
+   245→  approvedById        String?
+   246→  createdAt           DateTime @default(now())
+   247→
+   248→  workDefinition      WorkDefinition @relation(fields: [workDefinitionId], references: [id])
+   249→  estimateLines       EstimateLine[]
+   250→  priceObservations   ResourcePriceObservation[] @relation("PriceObservationWDV")
+   251→}
+   252→
+   253→// ─────────────────────────────────────────────────────────────────────────────
+   254→// Resources & Price Provenance (append-only observations)
+   255→// ─────────────────────────────────────────────────────────────────────────────
+   256→
+   257→model Resource {
+   258→  id             String   @id @default(cuid())
+   259→  organizationId String
+   260→  code           String   // e.g. "RES-MAT-CEM"
+   261→  name           String
+   262→  unit           String
+   263→  kind           String   // labour | material | plant | subcontract | fee
+   264→  currency       String   @default("GHS")
+   265→  region         String?  // e.g. "Greater Accra"
+   266→  createdAt      DateTime @default(now())
+   267→  updatedAt      DateTime @updatedAt
+   268→
+   269→  organization   Organization @relation(fields: [organizationId], references: [id])
+   270→  priceObservations ResourcePriceObservation[]
+   271→}
+   272→
+   273→model ResourcePriceObservation {
+   274→  id                       String   @id @default(cuid())
+   275→  resourceId               String
+   276→  workDefinitionVersionId  String?
+   277→  price                    Float
+   278→  currency                 String   @default("GHS")
+   279→  provenance               String   // supplier-quote | invoice | market-survey | manual | historical-bid | subcontract-quote
+   280→  sourceReference          String?  // quote #, invoice #, etc.
+   281→  observedAt               DateTime @default(now())
+   282→  recordedById             String?
+   283→  createdAt                DateTime @default(now())
+   284→
+   285→  resource                 Resource              @relation(fields: [resourceId], references: [id])
+   286→  workDefinitionVersion    WorkDefinitionVersion? @relation("PriceObservationWDV", fields: [workDefinitionVersionId], references: [id])
+   287→}
+   288→
+   289→// ─────────────────────────────────────────────────────────────────────────────
+   290→// Estimate — the canonical commercial object
+   291→// ─────────────────────────────────────────────────────────────────────────────
+   292→
+   293→model Estimate {
+   294→  id             String   @id @default(cuid())
+   295→  organizationId String
+   296→  opportunityId  String
+   297→  version        Int      @default(1)
+   298→  status         String   @default("draft") // draft | internal-review | adjudicated | submitted | superseded
+   299→  overheadPct    Float    @default(0.10)
+   300→  profitPct      Float    @default(0.12)
+   301→  contingencyPct Float    @default(0.05)
+   302→  createdAt      DateTime @default(now())
+   303→  updatedAt      DateTime @updatedAt
+   304→
+   305→  organization   Organization @relation(fields: [organizationId], references: [id])
+   306→  opportunity    Opportunity  @relation(fields: [opportunityId], references: [id])
+   307→  lines          EstimateLine[]
+   308→  revisions      EstimateRevision[]
+   309→  bid            Bid?
+   310→}
+   311→
+   312→model EstimateRevision {
+   313→  id            String   @id @default(cuid())
+   314→  estimateId    String
+   315→  revisionNo    Int
+   316→  snapshotJson  String   // immutable snapshot of lines + pricing inputs (P0-6 reproducibility)
+   317→  status        String   @default("finalized") // finalized (immutable) — only finalized revisions can be referenced by a Bid
+   318→  finalizedAt   DateTime @default(now())
+   319→  finalizedById String?
+   320→
+   321→  estimate      Estimate @relation(fields: [estimateId], references: [id])
+   322→
+   323→  @@unique([estimateId, revisionNo])
+   324→}
+   325→
+   326→model EstimateLine {
+   327→  id                    String   @id @default(cuid())
+   328→  estimateId            String
+   329→  scopeItemId           String?
+   330→  workDefinitionId      String?
+   331→  workDefinitionVersionId String?
+   332→  description           String
+   333→  quantity              Float
+   334→  unit                  String
+   335→  executionStrategy     String   @default("self-perform") // self-perform | subcontract | hybrid | undecided
+   336→  // Calculation status — 'incomplete' means the price is provisional and
+   337→  // cannot be committed to a finalized estimate (P0-4 fix).
+   338→  calculationStatus     String   @default("complete") // complete | incomplete
+   339→  blockingInputsJson    String   @default("[]") // [{kind:'missing-price',resourceName}]
+   340→  // Cost build-up (deterministic, computed by pricing-engine on write)
+   341→  materialCost          Float    @default(0)
+   342→  labourCost            Float    @default(0)
+   343→  plantCost             Float    @default(0)
+   344→  subcontractCost       Float    @default(0)
+   345→  directCost            Float    @default(0)
+   346→  projectCost           Float    @default(0) // direct + project-specific
+   347→  riskCost              Float    @default(0)
+   348→  overheadCost          Float    @default(0)
+   349→  profitCost            Float    @default(0)
+   350→  estimatedTotalCost    Float    @default(0) // direct + risk + overhead (excludes profit)
+   351→  expectedProfit        Float    @default(0) // sellPrice - estimatedTotalCost
+   352→  sellPrice             Float    @default(0)
+   353→  unitRate              Float    @default(0)
+   354→  expectedMarginPct     Float    @default(0) // expectedProfit / sellPrice (P0-6 fix)
+   355→  marginPct             Float    @default(0) // legacy alias kept for backward-compat reads
+   356→  confidence            Float    @default(0.5) // 0..1 derived from evidence
+   357→  provenanceSummary     String?  // human-readable lineage
+   358→  isUnsourced           Boolean  @default(false)
+   359→  unsourcedRationale    String?
+   360→  unsourcedConfidence   Float?
+   361→  acknowledged          Boolean  @default(false)
+   362→  createdAt             DateTime @default(now())
+   363→  updatedAt             DateTime @updatedAt
+   364→
+   365→  estimate              Estimate              @relation(fields: [estimateId], references: [id])
+   366→  scopeItem             ScopeItem?            @relation(fields: [scopeItemId], references: [id])
+   367→  workDefinition        WorkDefinition?       @relation(fields: [workDefinitionId], references: [id])
+   368→  workDefinitionVersion WorkDefinitionVersion? @relation(fields: [workDefinitionVersionId], references: [id])
+   369→  subcontractPackageLine SubcontractPackageLine[]
+   370→  executionSegments     ExecutionSegment[]
+   371→  commercialExceptions  CommercialException[]
+   372→  actuals               ProjectActual[]
+   373→}
+   374→
+   375→// P0-5 fix: hybrid execution needs explicit allocation, never a 50% heuristic.
+   376→// An EstimateLine with strategy 'hybrid' must have ≥2 segments summing to 100%.
+   377→// Missing allocation → calculationStatus = 'incomplete'.
+   378→model ExecutionSegment {
+   379→  id            String   @id @default(cuid())
+   380→  estimateLineId String
+   381→  strategy      String   // self-perform | subcontract
+   382→  scopeDefinition String
+   383→  quantityPct   Float    @default(1.0) // 0..1 share of the line's quantity
+   384→  subcontractQuoteId String?
+   385→  // P0-1/P0-2: Persisted commercial state — the pricing engine consumes these.
+   386→  // Without them, the commercial decision is ephemeral and not reproducible.
+   387→  pricingBasis  String?  // direct-segment-quote | proportional-from-package
+   388→  quoteCoversSegmentScope Boolean @default(false) // approved reconciliation result
+   389→  createdAt     DateTime @default(now())
+   390→
+   391→  estimateLine  EstimateLine @relation(fields: [estimateLineId], references: [id])
+   392→}
+   393→
+   394→// ─────────────────────────────────────────────────────────────────────────────
+   395→// Subcontracting — execution strategy + scope reconciliation
+   396→// ─────────────────────────────────────────────────────────────────────────────
+   397→
+   398→model SubcontractPackage {
+   399→  id             String   @id @default(cuid())
+   400→  organizationId String
+   401→  opportunityId  String
+   402→  name           String
+   403→  scope          String?
+   404→  executionStrategy String @default("subcontract")
+   405→  status         String   @default("draft") // draft | enquiry-sent | quotes-received | awarded | abandoned
+   406→  selectedQuoteId String?
+   407→  createdAt      DateTime @default(now())
+   408→  updatedAt      DateTime @updatedAt
+   409→
+   410→  opportunity    Opportunity @relation(fields: [opportunityId], references: [id])
+   411→  lines          SubcontractPackageLine[]
+   412→  quotes         SubcontractQuote[]
+   413→  scopeAtoms     ScopeAtom[]
+   414→}
+   415→
+   416→model SubcontractPackageLine {
+   417→  id                   String @id @default(cuid())
+   418→  subcontractPackageId String
+   419→  estimateLineId       String
+   420→  requiredScope        String
+   421→  createdAt            DateTime @default(now())
+   422→
+   423→  subcontractPackage   SubcontractPackage @relation(fields: [subcontractPackageId], references: [id])
+   424→  estimateLine         EstimateLine       @relation(fields: [estimateLineId], references: [id])
+   425→}
+   426→
+   427→model SubcontractQuote {
+   428→  id                   String   @id @default(cuid())
+   429→  subcontractPackageId String
+   430→  supplierName         String
+   431→  totalAmount          Float
+   432→  currency             String   @default("GHS")
+   433→  receivedAt           DateTime @default(now())
+   434→  exclusionsJson       String   @default("[]")
+   435→  assumptionsJson      String   @default("[]")
+   436→  coveragePct          Float    @default(0) // 0..1 reconciled coverage
+   437→  status               String   @default("received") // received | selected | rejected
+   438→  createdAt            DateTime @default(now())
+   439→
+   440→  subcontractPackage   SubcontractPackage @relation(fields: [subcontractPackageId], references: [id])
+   441→  lines                SubcontractQuoteLine[]
+   442→  scopeCoverages       QuoteScopeCoverage[]
+   443→}
+   444→
+   445→model SubcontractQuoteLine {
+   446→  id              String   @id @default(cuid())
+   447→  quoteId         String
+   448→  description     String
+   449→  amount          Float
+   450→  currency        String   @default("GHS")
+   451→
+   452→  quote           SubcontractQuote @relation(fields: [quoteId], references: [id])
+   453→}
+   454→
+   455→// P0-7 fix: scope reconciliation based on structured scope atoms, not substring.
+   456→// A SubcontractPackage defines required ScopeAtoms (e.g. manufacture, delivery,
+   457→// installation). Each quote explicitly covers/excludes each atom.
+   458→model ScopeAtom {
+   459→  id                   String   @id @default(cuid())
+   460→  subcontractPackageId String
+   461→  name                 String   // e.g. "installation"
+   462→  description          String?
+   463→  // P0-1 fix: economic weight for this atom (0..1). Enables economic coverage
+   464→  // = sum(covered atom weights) / sum(all atom weights), distinct from semantic
+   465→  // coverage = covered atoms / total atoms. If all weights are equal (or 0),
+   466→  // economic coverage falls back to semantic coverage.
+   467→  valueWeight          Float    @default(0)
+   468→  createdAt            DateTime @default(now())
+   469→
+   470→  subcontractPackage   SubcontractPackage @relation(fields: [subcontractPackageId], references: [id])
+   471→  coverages            QuoteScopeCoverage[]
+   472→}
+   473→
+   474→model QuoteScopeCoverage {
+   475→  id            String   @id @default(cuid())
+   476→  quoteId       String
+   477→  scopeAtomId   String
+   478→  // covered | excluded | unstated. 'unstated' = quote didn't address this atom.
+   479→  status        String   @default("unstated")
+   480→  note          String?
+   481→  createdAt     DateTime @default(now())
+   482→
+   483→  quote         SubcontractQuote @relation(fields: [quoteId], references: [id])
+   484→  scopeAtom     ScopeAtom        @relation(fields: [scopeAtomId], references: [id])
+   485→}
+   486→
+   487→// ─────────────────────────────────────────────────────────────────────────────
+   488→// Bid — submission + outcome (reproducible from immutable revisions)
+   489→// ─────────────────────────────────────────────────────────────────────────────
+   490→
+   491→model Bid {
+   492→  id                  String   @id @default(cuid())
+   493→  organizationId      String
+   494→  opportunityId       String   @unique
+   495→  estimateId          String   @unique
+   496→  estimateRevisionId  String?
+   497→  programmeRevisionId String?
+   498→  tenderPackStatus    String   @default("draft") // draft | ready | submitted | won | lost | withdrawn
+   499→  finalPrice          Float?
+   500→  directorAdjustment  Float    @default(0)
+   501→  adjustmentRationale String?
+   502→  submittedAt         DateTime?
+   503→  outcome             String?  // won | lost | withdrawn | unknown
+   504→  lossReason          String?  // price | programme | technical | prequalification | relationship | unknown
+   505→  winningPrice        Float?
+   506→  ourRank             Int?
+   507→  clientFeedback      String?
+   508→  createdAt           DateTime @default(now())
+   509→  updatedAt           DateTime @updatedAt
+   510→
+   511→  organization        Organization @relation(fields: [organizationId], references: [id])
+   512→  opportunity         Opportunity  @relation(fields: [opportunityId], references: [id])
+   513→  estimate            Estimate    @relation(fields: [estimateId], references: [id])
+   514→}
+   515→
+   516→// ─────────────────────────────────────────────────────────────────────────────
+   517→// Audit log — append-only
+   518→// ─────────────────────────────────────────────────────────────────────────────
+   519→
+   520→model AuditLog {
+   521→  id             String   @id @default(cuid())
+   522→  organizationId String
+   523→  actorId        String?
+   524→  action         String   // estimate.created | rate.changed | bid.submitted | etc.
+   525→  entityType     String
+   526→  entityId       String
+   527→  beforeJson     String?
+   528→  afterJson      String?
+   529→  summary        String?
+   530→  createdAt      DateTime @default(now())
+   531→
+   532→  organization   Organization @relation(fields: [organizationId], references: [id])
+   533→  actor          User?        @relation(fields: [actorId], references: [id])
+   534→}
+   535→
+   536→// ─────────────────────────────────────────────────────────────────────────────
+   537→// Knowledge Health — stale/unreliable knowledge surfacing
+   538→// ─────────────────────────────────────────────────────────────────────────────
+   539→
+   540→model KnowledgeAlert {
+   541→  id             String   @id @default(cuid())
+   542→  organizationId String
+   543→  type           String   // stale-price | productivity-variance | unapproved-rate | scope-gap | subcontract-exclusion
+   544→  severity       String   @default("warning") // info | warning | blocker
+   545→  title          String
+   546→  detail         String?
+   547→  entityId       String?
+   548→  entityType     String?
+   549→  acknowledged   Boolean  @default(false)
+   550→  createdAt      DateTime @default(now())
+   551→
+   552→  organization   Organization @relation(fields: [organizationId], references: [id])
+   553→}
+   554→
+   555→// ─────────────────────────────────────────────────────────────────────────────
+   556→// Commercial Exceptions (P0-8 fix) — auditable, not a bare boolean.
+   557→// An unsourced rate, an incomplete calculation, or any commercial override
+   558→// must be recorded with who/when/why and (for high-value) director approval.
+   559→// ─────────────────────────────────────────────────────────────────────────────
+   560→
+   561→model CommercialException {
+   562→  id              String   @id @default(cuid())
+   563→  organizationId  String
+   564→  estimateLineId  String?
+   565→  entityType      String   // estimate-line | subcontract-quote | assumption
+   566→  entityId        String?
+   567→  type            String   // unsourced-rate | incomplete-calculation | hybrid-without-allocation | missing-quote | other
+   568→  reason          String
+   569→  exposure        Float    @default(0) // GHS value at risk
+   570→  acknowledgedById String?
+   571→  acknowledgedAt  DateTime?
+   572→  approvalRequired Boolean @default(false)
+   573→  approvedById    String?
+   574→  approvedAt      DateTime?
+   575→  createdAt       DateTime @default(now())
+   576→
+   577→  organization    Organization @relation(fields: [organizationId], references: [id])
+   578→  estimateLine    EstimateLine? @relation(fields: [estimateLineId], references: [id])
+   579→}
+   580→
+   581→// ─────────────────────────────────────────────────────────────────────────────
+   582→// Knowledge Loop (P1-12) — actuals → variance → calibration proposal
+   583→// ─────────────────────────────────────────────────────────────────────────────
+   584→
+   585→model ProjectActual {
+   586→  id              String   @id @default(cuid())
+   587→  organizationId  String
+   588→  estimateLineId  String
+   589→  // Actuals captured after execution
+   590→  quantityCompleted Float   @default(0)
+   591→  daysTaken        Float    @default(0)
+   592→  crewSize         Float    @default(0)
+   593→  materialConsumed Float    @default(0)
+   594→  materialCost     Float    @default(0)
+   595→  subcontractFinalCost Float @default(0)
+   596→  // Computed variance (planned vs actual)
+   597→  plannedProductivity Float  @default(0) // qty / crew-day
+   598→  actualProductivity  Float  @default(0)
+   599→  productivityVariance Float @default(0) // (actual - planned) / planned
+   600→  plannedCost      Float    @default(0)
+   601→  actualCost       Float    @default(0)
+   602→  costVariance     Float    @default(0) // (actual - planned) / planned
+   603→  recordedAt       DateTime @default(now())
+   604→  createdAt        DateTime @default(now())
+   605→
+   606→  organization    Organization @relation(fields: [organizationId], references: [id])
+   607→  estimateLine    EstimateLine @relation(fields: [estimateLineId], references: [id])
+   608→  calibrationProposals CalibrationProposal[]
+   609→}
+   610→
+   611→model CalibrationProposal {
+   612→  id                     String   @id @default(cuid())
+   613→  organizationId         String
+   614→  workDefinitionId       String
+   615→  projectActualId        String?
+   616→  type                   String   // productivity-update | price-update | method-update
+   617→  currentValue           String
+   618→  proposedValue          String
+   619→  rationale              String
+   620→  status                 String   @default("pending") // pending | approved | rejected | applied
+   621→  reviewedById           String?
+   622→  reviewedAt             DateTime?
+   623→  createdAt              DateTime @default(now())
+   624→
+   625→  organization           Organization @relation(fields: [organizationId], references: [id])
+   626→  workDefinition         WorkDefinition @relation(fields: [workDefinitionId], references: [id])
+   627→  projectActual          ProjectActual? @relation(fields: [projectActualId], references: [id])
+   628→}
+   629→

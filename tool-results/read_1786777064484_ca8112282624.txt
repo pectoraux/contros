@@ -1,0 +1,847 @@
+     1→/**
+     2→ * SubcontractService integration tests — REAL adversarial tests with actual
+     3→ * Neon DB data.
+     4→ *
+     5→ * Two test groups:
+     6→ *   1. Cross-tenant isolation: Org A cannot operate on Org B's subcontract data
+     7→ *      (and vice versa).
+     8→ *   2. Commercial adversarial: lump-sum, exclusions, low coverage, invalid
+     9→ *      inputs, illegal state transitions, approved-exception override.
+    10→ *
+    11→ * Run: bun test tests/integration/subcontract-service.test.ts
+    12→ *
+    13→ * Requires: DATABASE_URL pointing to Neon PostgreSQL.
+    14→ */
+    15→
+    16→import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
+    17→import { PrismaClient } from '@prisma/client'
+    18→import { subcontractService } from '../../src/application/subcontract-service'
+    19→import type { RequestContext } from '../../src/lib/context'
+    20→
+    21→const db = new PrismaClient()
+    22→
+    23→// ─── Test fixture IDs (fixed for reproducibility) ───────────────────────────
+    24→
+    25→const ORG_A = 'test-sc-org-a'
+    26→const ORG_B = 'test-sc-org-b'
+    27→const USER_A = 'test-sc-user-a'
+    28→const USER_B = 'test-sc-user-b'
+    29→const CLIENT_A = 'test-sc-client-a'
+    30→const CLIENT_B = 'test-sc-client-b'
+    31→const OPP_A = 'test-sc-opp-a'
+    32→const OPP_B = 'test-sc-opp-b'
+    33→const EST_A = 'test-sc-est-a'
+    34→const EST_B = 'test-sc-est-b'
+    35→const LINE_A = 'test-sc-line-a'
+    36→const LINE_B = 'test-sc-line-b'
+    37→
+    38→// Cross-tenant test packages
+    39→const PKG_A = 'test-sc-pkg-a'
+    40→const PKG_B = 'test-sc-pkg-b'
+    41→const ATOM_A1 = 'test-sc-atom-a1'
+    42→const ATOM_B1 = 'test-sc-atom-b1'
+    43→const QUOTE_B = 'test-sc-quote-b' // Org B's quote (target of cross-tenant attack)
+    44→const QUOTE_A_SHARED = 'test-sc-quote-a-shared' // Org A's quote
+    45→
+    46→// Per-test commercial packages (all in Org A, created fresh per test).
+    47→// Use distinct prefixes so afterAll cleanup-by-org catches everything.
+    48→const PKG_LUMPSUM = 'test-sc-pkg-lumpsum'
+    49→const PKG_EXCLUDED = 'test-sc-pkg-excluded'
+    50→const PKG_FULL = 'test-sc-pkg-full'
+    51→const PKG_LOWCOV = 'test-sc-pkg-lowcov'
+    52→const PKG_EXCEPTION = 'test-sc-pkg-exception'
+    53→const PKG_STATE = 'test-sc-pkg-state'
+    54→
+    55→const ctxA: RequestContext = {
+    56→  userId: USER_A,
+    57→  organizationId: ORG_A,
+    58→  role: 'estimator',
+    59→  isDemo: false,
+    60→  name: 'Test User A',
+    61→  email: 'a-sc@test.com',
+    62→}
+    63→
+    64→const ctxB: RequestContext = {
+    65→  userId: USER_B,
+    66→  organizationId: ORG_B,
+    67→  role: 'estimator',
+    68→  isDemo: false,
+    69→  name: 'Test User B',
+    70→  email: 'b-sc@test.com',
+    71→}
+    72→
+    73→// ─── Helpers ────────────────────────────────────────────────────────────────
+    74→
+    75→/** Wipe all subcontract test data for the two test orgs (robust to partial failures). */
+    76→async function cleanupOrgData() {
+    77→  // 1. Fetch all package IDs for the two orgs (and any test-sc prefixed packages,
+    78→  //    in case a previous run left data with a different org assignment).
+    79→  const packages = await db.subcontractPackage.findMany({
+    80→    where: {
+    81→      OR: [
+    82→        { organizationId: { in: [ORG_A, ORG_B] } },
+    83→        { id: { startsWith: 'test-sc-' } },
+    84→      ],
+    85→    },
+    86→    select: { id: true },
+    87→  })
+    88→  const packageIds = packages.map((p) => p.id)
+    89→
+    90→  if (packageIds.length > 0) {
+    91→    // 2. Delete children by packageId (direct scalar filter — more reliable
+    92→    //    than relation filters, which can miss orphaned records).
+    93→    await db.quoteScopeCoverage.deleteMany({
+    94→      where: { quote: { subcontractPackageId: { in: packageIds } } },
+    95→    })
+    96→    await db.subcontractQuoteLine.deleteMany({
+    97→      where: { quote: { subcontractPackageId: { in: packageIds } } },
+    98→    })
+    99→    await db.subcontractQuote.deleteMany({
+   100→      where: { subcontractPackageId: { in: packageIds } },
+   101→    })
+   102→    await db.scopeAtom.deleteMany({
+   103→      where: { subcontractPackageId: { in: packageIds } },
+   104→    })
+   105→    await db.subcontractPackageLine.deleteMany({
+   106→      where: { subcontractPackageId: { in: packageIds } },
+   107→    })
+   108→    await db.subcontractPackage.deleteMany({
+   109→      where: { id: { in: packageIds } },
+   110→    })
+   111→  }
+   112→
+   113→  // 3. Clean up any orphaned subcontract records with test-sc prefix (defensive).
+   114→  await db.subcontractQuote.deleteMany({ where: { id: { startsWith: 'test-sc-' } } })
+   115→  await db.scopeAtom.deleteMany({ where: { id: { startsWith: 'test-sc-' } } })
+   116→
+   117→  // 4. Delete the rest by orgId.
+   118→  await db.auditLog.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+   119→  await db.commercialException.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+   120→  await db.estimateLine.deleteMany({ where: { id: { in: [LINE_A, LINE_B] } } })
+   121→  await db.estimate.deleteMany({ where: { id: { in: [EST_A, EST_B] } } })
+   122→  await db.opportunity.deleteMany({ where: { id: { in: [OPP_A, OPP_B] } } })
+   123→  await db.client.deleteMany({ where: { id: { in: [CLIENT_A, CLIENT_B] } } })
+   124→  await db.user.deleteMany({ where: { id: { in: [USER_A, USER_B] } } })
+   125→  await db.organization.deleteMany({ where: { id: { in: [ORG_A, ORG_B] } } })
+   126→}
+   127→
+   128→/** Create a package + atoms directly in the DB (for test setup). */
+   129→async function createPackageWithAtoms(
+   130→  orgId: string,
+   131→  packageId: string,
+   132→  opportunityId: string,
+   133→  atoms: Array<{ id: string; name: string; valueWeight: number }>,
+   134→) {
+   135→  await db.subcontractPackage.create({
+   136→    data: {
+   137→      id: packageId,
+   138→      organizationId: orgId,
+   139→      opportunityId,
+   140→      name: `Test Package ${packageId}`,
+   141→      executionStrategy: 'subcontract',
+   142→    },
+   143→  })
+   144→  for (const a of atoms) {
+   145→    await db.scopeAtom.create({
+   146→      data: {
+   147→        id: a.id,
+   148→        subcontractPackageId: packageId,
+   149→        name: a.name,
+   150→        valueWeight: a.valueWeight,
+   151→      },
+   152→    })
+   153→  }
+   154→}
+   155→
+   156→/** Create a quote + coverages directly in the DB (for test setup). */
+   157→async function createQuoteWithCoverages(
+   158→  orgId: string,
+   159→  packageId: string,
+   160→  quoteId: string,
+   161→  supplierName: string,
+   162→  totalAmount: number,
+   163→  coverages: Array<{ atomId: string; status: 'covered' | 'excluded' | 'unstated' }>,
+   164→) {
+   165→  await db.subcontractQuote.create({
+   166→    data: {
+   167→      id: quoteId,
+   168→      subcontractPackageId: packageId,
+   169→      supplierName,
+   170→      totalAmount,
+   171→      currency: 'GHS',
+   172→    },
+   173→  })
+   174→  for (const c of coverages) {
+   175→    await db.quoteScopeCoverage.create({
+   176→      data: {
+   177→        quoteId,
+   178→        scopeAtomId: c.atomId,
+   179→        status: c.status,
+   180→      },
+   181→    })
+   182→  }
+   183→}
+   184→
+   185→// ─── Test suite ─────────────────────────────────────────────────────────────
+   186→
+   187→describe('SubcontractService integration tests', () => {
+   188→  beforeAll(async () => {
+   189→    // Clean up any stale test data first.
+   190→    await cleanupOrgData()
+   191→
+   192→    // Create Org A.
+   193→    await db.organization.create({ data: { id: ORG_A, name: 'SC Org A', currency: 'GHS' } })
+   194→    await db.user.create({
+   195→      data: { id: USER_A, organizationId: ORG_A, name: 'User A', email: 'a-sc@test.com', role: 'estimator' },
+   196→    })
+   197→    await db.client.create({ data: { id: CLIENT_A, organizationId: ORG_A, name: 'Client A' } })
+   198→    await db.opportunity.create({
+   199→      data: { id: OPP_A, organizationId: ORG_A, clientId: CLIENT_A, title: 'Opp A', status: 'estimating' },
+   200→    })
+   201→    await db.estimate.create({
+   202→      data: { id: EST_A, organizationId: ORG_A, opportunityId: OPP_A, status: 'draft' },
+   203→    })
+   204→    await db.estimateLine.create({
+   205→      data: {
+   206→        id: LINE_A,
+   207→        estimateId: EST_A,
+   208→        description: 'Line A',
+   209→        quantity: 100,
+   210→        unit: 'm2',
+   211→        executionStrategy: 'self-perform',
+   212→        sellPrice: 50000,
+   213→      },
+   214→    })
+   215→
+   216→    // Create Org B.
+   217→    await db.organization.create({ data: { id: ORG_B, name: 'SC Org B', currency: 'GHS' } })
+   218→    await db.user.create({
+   219→      data: { id: USER_B, organizationId: ORG_B, name: 'User B', email: 'b-sc@test.com', role: 'estimator' },
+   220→    })
+   221→    await db.client.create({ data: { id: CLIENT_B, organizationId: ORG_B, name: 'Client B' } })
+   222→    await db.opportunity.create({
+   223→      data: { id: OPP_B, organizationId: ORG_B, clientId: CLIENT_B, title: 'Opp B', status: 'estimating' },
+   224→    })
+   225→    await db.estimate.create({
+   226→      data: { id: EST_B, organizationId: ORG_B, opportunityId: OPP_B, status: 'draft' },
+   227→    })
+   228→    await db.estimateLine.create({
+   229→      data: {
+   230→        id: LINE_B,
+   231→        estimateId: EST_B,
+   232→        description: 'Line B',
+   233→        quantity: 50,
+   234→        unit: 'm2',
+   235→        executionStrategy: 'self-perform',
+   236→        sellPrice: 30000,
+   237→      },
+   238→    })
+   239→
+   240→    // Cross-tenant test data.
+   241→    // Org A: package with 1 scope atom + 1 quote.
+   242→    await createPackageWithAtoms(ORG_A, PKG_A, OPP_A, [
+   243→      { id: ATOM_A1, name: 'installation', valueWeight: 1.0 },
+   244→    ])
+   245→    await createQuoteWithCoverages(ORG_A, PKG_A, QUOTE_A_SHARED, 'Supplier A Shared', 40000, [
+   246→      { atomId: ATOM_A1, status: 'covered' },
+   247→    ])
+   248→
+   249→    // Org B: package with 1 scope atom + 1 quote (target of cross-tenant attack).
+   250→    await createPackageWithAtoms(ORG_B, PKG_B, OPP_B, [
+   251→      { id: ATOM_B1, name: 'manufacture', valueWeight: 1.0 },
+   252→    ])
+   253→    await createQuoteWithCoverages(ORG_B, PKG_B, QUOTE_B, 'Supplier B Secret', 99999, [
+   254→      { atomId: ATOM_B1, status: 'covered' },
+   255→    ])
+   256→  }, 120000)
+   257→
+   258→  afterAll(async () => {
+   259→    await cleanupOrgData()
+   260→    await db.$disconnect()
+   261→  }, 120000)
+   262→
+   263→  // ─── Cross-tenant tests ─────────────────────────────────────────────────
+   264→
+   265→  test('Org A cannot read Org B package workspace', async () => {
+   266→    const result = await subcontractService.getPackageWorkspace({
+   267→      ctx: ctxA,
+   268→      opportunityId: OPP_B, // Org B's opportunity
+   269→    })
+   270→    // The service returns an empty package list (Org A has no packages in OPP_B).
+   271→    expect(result.ok).toBe(true)
+   272→    if (result.ok) {
+   273→      // Org A sees zero packages in Org B's opportunity — the packages belong
+   274→      // to Org B and the repository scopes them out.
+   275→      expect(result.packages.length).toBe(0)
+   276→      // Org B's quote amount (99999) must NOT appear.
+   277→      const allQuotes = result.packages.flatMap((p) => p.quotes)
+   278→      expect(allQuotes.some((q) => q.totalAmount === 99999)).toBe(false)
+   279→    }
+   280→  }, 60000)
+   281→
+   282→  test('Org A cannot create a quote on Org B package', async () => {
+   283→    const result = await subcontractService.recordQuote({
+   284→      ctx: ctxA,
+   285→      packageId: PKG_B, // Org B's package
+   286→      supplierName: 'Attacker Supplier',
+   287→      totalAmount: 1,
+   288→      currency: 'GHS',
+   289→    })
+   290→    expect(result.ok).toBe(false)
+   291→    if (!result.ok) {
+   292→      // 404 — the package doesn't exist in Org A.
+   293→      expect(result.status).toBe(404)
+   294→    }
+   295→    // Verify no quote was actually created on Org B's package.
+   296→    const quotesOnB = await db.subcontractQuote.findMany({
+   297→      where: { subcontractPackageId: PKG_B, supplierName: 'Attacker Supplier' },
+   298→    })
+   299→    expect(quotesOnB.length).toBe(0)
+   300→  }, 60000)
+   301→
+   302→  test('Org A cannot select Org B quote', async () => {
+   303→    const result = await subcontractService.selectQuote({
+   304→      ctx: ctxA,
+   305→      packageId: PKG_B, // Org B's package
+   306→      quoteId: QUOTE_B,  // Org B's quote
+   307→    })
+   308→    expect(result.ok).toBe(false)
+   309→    if (!result.ok) {
+   310→      expect(result.status).toBe(404)
+   311→    }
+   312→    // Verify Org B's package was NOT awarded to Org A's selection.
+   313→    const pkgB = await db.subcontractPackage.findUnique({ where: { id: PKG_B } })
+   314→    expect(pkgB?.status).not.toBe('awarded')
+   315→    expect(pkgB?.selectedQuoteId).not.toBe(QUOTE_B)
+   316→  }, 60000)
+   317→
+   318→  test('Org A cannot create a scope atom on Org B package', async () => {
+   319→    const result = await subcontractService.createScopeAtom({
+   320→      ctx: ctxA,
+   321→      packageId: PKG_B, // Org B's package
+   322→      name: 'Attacker Atom',
+   323→      valueWeight: 0.5,
+   324→    })
+   325→    expect(result.ok).toBe(false)
+   326→    if (!result.ok) {
+   327→      expect(result.status).toBe(404)
+   328→    }
+   329→    // Verify no atom was created on Org B's package.
+   330→    const atomsOnB = await db.scopeAtom.findMany({
+   331→      where: { subcontractPackageId: PKG_B, name: 'Attacker Atom' },
+   332→    })
+   333→    expect(atomsOnB.length).toBe(0)
+   334→  }, 60000)
+   335→
+   336→  test('Inverse: Org B cannot read Org A package workspace', async () => {
+   337→    const result = await subcontractService.getPackageWorkspace({
+   338→      ctx: ctxB,
+   339→      opportunityId: OPP_A, // Org A's opportunity
+   340→    })
+   341→    expect(result.ok).toBe(true)
+   342→    if (result.ok) {
+   343→      expect(result.packages.length).toBe(0)
+   344→      const allQuotes = result.packages.flatMap((p) => p.quotes)
+   345→      // Org A's quote amount (40000) must NOT appear to Org B.
+   346→      expect(allQuotes.some((q) => q.totalAmount === 40000)).toBe(false)
+   347→    }
+   348→  }, 60000)
+   349→
+   350→  // ─── Commercial adversarial tests ───────────────────────────────────────
+   351→
+   352→  test('Lump-sum quote (no scope coverages) → reconciliation blocker, selection rejected', async () => {
+   353→    // Package with 3 scope atoms but the quote has NO scope coverages (lump-sum).
+   354→    await createPackageWithAtoms(ORG_A, PKG_LUMPSUM, OPP_A, [
+   355→      { id: 'test-sc-atom-lumpsum-1', name: 'manufacture', valueWeight: 0.34 },
+   356→      { id: 'test-sc-atom-lumpsum-2', name: 'delivery', valueWeight: 0.33 },
+   357→      { id: 'test-sc-atom-lumpsum-3', name: 'installation', valueWeight: 0.33 },
+   358→    ])
+   359→    // Lump-sum quote: no coverages.
+   360→    await db.subcontractQuote.create({
+   361→      data: {
+   362→        id: 'test-sc-quote-lumpsum',
+   363→        subcontractPackageId: PKG_LUMPSUM,
+   364→        supplierName: 'Lump Sum Supplier',
+   365→        totalAmount: 45000,
+   366→        currency: 'GHS',
+   367→      },
+   368→    })
+   369→
+   370→    // Reconcile — should return blocker.
+   371→    const reconResult = await subcontractService.reconcileQuote({
+   372→      ctx: ctxA,
+   373→      packageId: PKG_LUMPSUM,
+   374→      quoteId: 'test-sc-quote-lumpsum',
+   375→    })
+   376→    expect(reconResult.ok).toBe(true)
+   377→    if (reconResult.ok) {
+   378→      expect(reconResult.reconciliation.isLumpSum).toBe(true)
+   379→      expect(reconResult.reconciliation.status).toBe('blocker')
+   380→      expect(reconResult.reconciliation.coverageBasis).toBe('lump-sum')
+   381→    }
+   382→
+   383→    // Attempt selection — should be rejected.
+   384→    const selectResult = await subcontractService.selectQuote({
+   385→      ctx: ctxA,
+   386→      packageId: PKG_LUMPSUM,
+   387→      quoteId: 'test-sc-quote-lumpsum',
+   388→    })
+   389→    expect(selectResult.ok).toBe(false)
+   390→    if (!selectResult.ok) {
+   391→      expect(selectResult.status).toBe(400)
+   392→      expect(selectResult.error).toContain('lump-sum')
+   393→    }
+   394→    // Verify package was NOT awarded.
+   395→    const pkg = await db.subcontractPackage.findUnique({ where: { id: PKG_LUMPSUM } })
+   396→    expect(pkg?.status).not.toBe('awarded')
+   397→    expect(pkg?.selectedQuoteId).toBeNull()
+   398→  }, 60000)
+   399→
+   400→  test('Quote with excluded critical atom → reconciliation blocker, selection rejected', async () => {
+   401→    // Package with 3 atoms. Quote covers 2, excludes 1 (critical).
+   402→    await createPackageWithAtoms(ORG_A, PKG_EXCLUDED, OPP_A, [
+   403→      { id: 'test-sc-atom-excl-1', name: 'manufacture', valueWeight: 0.34 },
+   404→      { id: 'test-sc-atom-excl-2', name: 'delivery', valueWeight: 0.33 },
+   405→      { id: 'test-sc-atom-excl-3', name: 'installation', valueWeight: 0.33 },
+   406→    ])
+   407→    await createQuoteWithCoverages(
+   408→      ORG_A,
+   409→      PKG_EXCLUDED,
+   410→      'test-sc-quote-excl',
+   411→      'Excluding Supplier',
+   412→      42000,
+   413→      [
+   414→        { atomId: 'test-sc-atom-excl-1', status: 'covered' },
+   415→        { atomId: 'test-sc-atom-excl-2', status: 'covered' },
+   416→        { atomId: 'test-sc-atom-excl-3', status: 'excluded' }, // critical atom excluded
+   417→      ],
+   418→    )
+   419→
+   420→    const reconResult = await subcontractService.reconcileQuote({
+   421→      ctx: ctxA,
+   422→      packageId: PKG_EXCLUDED,
+   423→      quoteId: 'test-sc-quote-excl',
+   424→    })
+   425→    expect(reconResult.ok).toBe(true)
+   426→    if (reconResult.ok) {
+   427→      expect(reconResult.reconciliation.excludedAtoms.length).toBe(1)
+   428→      expect(reconResult.reconciliation.excludedAtoms).toContain('installation')
+   429→      expect(reconResult.reconciliation.status).toBe('blocker')
+   430→      // Economic coverage = (0.34 + 0.33) / (0.34 + 0.33 + 0.33) = 0.67 / 1.0 = 0.67
+   431→      expect(reconResult.reconciliation.coveragePct).toBeLessThan(0.8)
+   432→    }
+   433→
+   434→    // Attempt selection — should be rejected (both exclusion AND low coverage).
+   435→    const selectResult = await subcontractService.selectQuote({
+   436→      ctx: ctxA,
+   437→      packageId: PKG_EXCLUDED,
+   438→      quoteId: 'test-sc-quote-excl',
+   439→    })
+   440→    expect(selectResult.ok).toBe(false)
+   441→    if (!selectResult.ok) {
+   442→      expect(selectResult.status).toBe(400)
+   443→      expect(selectResult.error).toContain('excludes')
+   444→    }
+   445→    const pkg = await db.subcontractPackage.findUnique({ where: { id: PKG_EXCLUDED } })
+   446→    expect(pkg?.status).not.toBe('awarded')
+   447→  }, 60000)
+   448→
+   449→  test('Quote with full coverage → selection succeeds', async () => {
+   450→    // Package with 3 atoms. Quote covers all 3.
+   451→    await createPackageWithAtoms(ORG_A, PKG_FULL, OPP_A, [
+   452→      { id: 'test-sc-atom-full-1', name: 'manufacture', valueWeight: 0.34 },
+   453→      { id: 'test-sc-atom-full-2', name: 'delivery', valueWeight: 0.33 },
+   454→      { id: 'test-sc-atom-full-3', name: 'installation', valueWeight: 0.33 },
+   455→    ])
+   456→    await createQuoteWithCoverages(
+   457→      ORG_A,
+   458→      PKG_FULL,
+   459→      'test-sc-quote-full',
+   460→      'Full Coverage Supplier',
+   461→      48000,
+   462→      [
+   463→        { atomId: 'test-sc-atom-full-1', status: 'covered' },
+   464→        { atomId: 'test-sc-atom-full-2', status: 'covered' },
+   465→        { atomId: 'test-sc-atom-full-3', status: 'covered' },
+   466→      ],
+   467→    )
+   468→
+   469→    const reconResult = await subcontractService.reconcileQuote({
+   470→      ctx: ctxA,
+   471→      packageId: PKG_FULL,
+   472→      quoteId: 'test-sc-quote-full',
+   473→    })
+   474→    expect(reconResult.ok).toBe(true)
+   475→    if (reconResult.ok) {
+   476→      expect(reconResult.reconciliation.coveragePct).toBe(1)
+   477→      expect(reconResult.reconciliation.status).toBe('ok')
+   478→      expect(reconResult.reconciliation.excludedAtoms.length).toBe(0)
+   479→      expect(reconResult.reconciliation.isLumpSum).toBe(false)
+   480→    }
+   481→
+   482→    // Attempt selection — should succeed.
+   483→    const selectResult = await subcontractService.selectQuote({
+   484→      ctx: ctxA,
+   485→      packageId: PKG_FULL,
+   486→      quoteId: 'test-sc-quote-full',
+   487→    })
+   488→    expect(selectResult.ok).toBe(true)
+   489→    if (selectResult.ok) {
+   490→      expect(selectResult.packageStatus).toBe('awarded')
+   491→      expect(selectResult.selectedQuoteId).toBe('test-sc-quote-full')
+   492→    }
+   493→
+   494→    // Verify the package + quote were updated atomically.
+   495→    const pkg = await db.subcontractPackage.findUnique({ where: { id: PKG_FULL } })
+   496→    expect(pkg?.status).toBe('awarded')
+   497→    expect(pkg?.selectedQuoteId).toBe('test-sc-quote-full')
+   498→    const quote = await db.subcontractQuote.findUnique({ where: { id: 'test-sc-quote-full' } })
+   499→    expect(quote?.status).toBe('selected')
+   500→    // The coveragePct should be persisted on the quote (for downstream use).
+   501→    expect(quote?.coveragePct).toBe(1)
+   502→
+   503→    // Verify an audit log entry was created.
+   504→    const audit = await db.auditLog.findFirst({
+   505→      where: {
+   506→        organizationId: ORG_A,
+   507→        action: 'subcontract.quote-selected',
+   508→        entityId: PKG_FULL,
+   509→      },
+   510→    })
+   511→    expect(audit).not.toBeNull()
+   512→  }, 60000)
+   513→
+   514→  test('Invalid valueWeight > 1 → rejected', async () => {
+   515→    const result = await subcontractService.createScopeAtom({
+   516→      ctx: ctxA,
+   517→      packageId: PKG_A, // valid package in Org A
+   518→      name: 'Bad Weight High',
+   519→      valueWeight: 1.5, // > 1 — invalid
+   520→    })
+   521→    expect(result.ok).toBe(false)
+   522→    if (!result.ok) {
+   523→      expect(result.status).toBe(400)
+   524→      expect(result.error).toContain('valueWeight')
+   525→    }
+   526→    // Verify no atom was created.
+   527→    const atom = await db.scopeAtom.findFirst({
+   528→      where: { subcontractPackageId: PKG_A, name: 'Bad Weight High' },
+   529→    })
+   530→    expect(atom).toBeNull()
+   531→  }, 60000)
+   532→
+   533→  test('Invalid valueWeight < 0 → rejected', async () => {
+   534→    const result = await subcontractService.createScopeAtom({
+   535→      ctx: ctxA,
+   536→      packageId: PKG_A,
+   537→      name: 'Bad Weight Low',
+   538→      valueWeight: -0.1, // < 0 — invalid
+   539→    })
+   540→    expect(result.ok).toBe(false)
+   541→    if (!result.ok) {
+   542→      expect(result.status).toBe(400)
+   543→      expect(result.error).toContain('valueWeight')
+   544→    }
+   545→    const atom = await db.scopeAtom.findFirst({
+   546→      where: { subcontractPackageId: PKG_A, name: 'Bad Weight Low' },
+   547→    })
+   548→    expect(atom).toBeNull()
+   549→  }, 60000)
+   550→
+   551→  test('Negative quote amount → rejected', async () => {
+   552→    const result = await subcontractService.recordQuote({
+   553→      ctx: ctxA,
+   554→      packageId: PKG_A,
+   555→      supplierName: 'Negative Amount Supplier',
+   556→      totalAmount: -100, // negative — invalid
+   557→      currency: 'GHS',
+   558→    })
+   559→    expect(result.ok).toBe(false)
+   560→    if (!result.ok) {
+   561→      expect(result.status).toBe(400)
+   562→      expect(result.error).toContain('totalAmount')
+   563→    }
+   564→    // Verify no quote was created.
+   565→    const quote = await db.subcontractQuote.findFirst({
+   566→      where: { subcontractPackageId: PKG_A, supplierName: 'Negative Amount Supplier' },
+   567→    })
+   568→    expect(quote).toBeNull()
+   569→  }, 60000)
+   570→
+   571→  test('Select quote with coverage < 80% → rejected', async () => {
+   572→    // Package with 3 atoms. Quote covers only 1 (weight 0.34 → coverage 0.34 < 0.8).
+   573→    await createPackageWithAtoms(ORG_A, PKG_LOWCOV, OPP_A, [
+   574→      { id: 'test-sc-atom-low-1', name: 'manufacture', valueWeight: 0.34 },
+   575→      { id: 'test-sc-atom-low-2', name: 'delivery', valueWeight: 0.33 },
+   576→      { id: 'test-sc-atom-low-3', name: 'installation', valueWeight: 0.33 },
+   577→    ])
+   578→    await createQuoteWithCoverages(
+   579→      ORG_A,
+   580→      PKG_LOWCOV,
+   581→      'test-sc-quote-low',
+   582→      'Low Coverage Supplier',
+   583→      30000,
+   584→      [
+   585→        { atomId: 'test-sc-atom-low-1', status: 'covered' },
+   586→        { atomId: 'test-sc-atom-low-2', status: 'unstated' },
+   587→        { atomId: 'test-sc-atom-low-3', status: 'unstated' },
+   588→      ],
+   589→    )
+   590→
+   591→    const reconResult = await subcontractService.reconcileQuote({
+   592→      ctx: ctxA,
+   593→      packageId: PKG_LOWCOV,
+   594→      quoteId: 'test-sc-quote-low',
+   595→    })
+   596→    expect(reconResult.ok).toBe(true)
+   597→    if (reconResult.ok) {
+   598→      // Economic coverage = 0.34 / 1.0 = 0.34
+   599→      expect(reconResult.reconciliation.coveragePct).toBeLessThan(0.8)
+   600→      expect(reconResult.reconciliation.status).toBe('blocker')
+   601→      expect(reconResult.reconciliation.excludedAtoms.length).toBe(0) // not excluded, just unstated
+   602→    }
+   603→
+   604→    // Attempt selection — should be rejected (low coverage).
+   605→    const selectResult = await subcontractService.selectQuote({
+   606→      ctx: ctxA,
+   607→      packageId: PKG_LOWCOV,
+   608→      quoteId: 'test-sc-quote-low',
+   609→    })
+   610→    expect(selectResult.ok).toBe(false)
+   611→    if (!selectResult.ok) {
+   612→      expect(selectResult.status).toBe(400)
+   613→      expect(selectResult.error).toContain('80%')
+   614→    }
+   615→    const pkg = await db.subcontractPackage.findUnique({ where: { id: PKG_LOWCOV } })
+   616→    expect(pkg?.status).not.toBe('awarded')
+   617→  }, 60000)
+   618→
+   619→  test('Select quote with approved CommercialException → allowed', async () => {
+   620→    // Same setup as the low-coverage test, but with an approved exception.
+   621→    await createPackageWithAtoms(ORG_A, PKG_EXCEPTION, OPP_A, [
+   622→      { id: 'test-sc-atom-exc-1', name: 'manufacture', valueWeight: 0.34 },
+   623→      { id: 'test-sc-atom-exc-2', name: 'delivery', valueWeight: 0.33 },
+   624→      { id: 'test-sc-atom-exc-3', name: 'installation', valueWeight: 0.33 },
+   625→    ])
+   626→    await createQuoteWithCoverages(
+   627→      ORG_A,
+   628→      PKG_EXCEPTION,
+   629→      'test-sc-quote-exc',
+   630→      'Exception Supplier',
+   631→      32000,
+   632→      [
+   633→        { atomId: 'test-sc-atom-exc-1', status: 'covered' },
+   634→        { atomId: 'test-sc-atom-exc-2', status: 'unstated' },
+   635→        { atomId: 'test-sc-atom-exc-3', status: 'unstated' },
+   636→      ],
+   637→    )
+   638→
+   639→    // Create an APPROVED CommercialException for this quote.
+   640→    await db.commercialException.create({
+   641→      data: {
+   642→        organizationId: ORG_A,
+   643→        entityType: 'subcontract-quote',
+   644→        entityId: 'test-sc-quote-exc',
+   645→        type: 'low-coverage-override',
+   646→        reason: 'Director approved low coverage due to single-source supplier constraint',
+   647→        exposure: 30000,
+   648→        approvalRequired: true,
+   649→        approvedById: USER_A,
+   650→        approvedAt: new Date(),
+   651→      },
+   652→    })
+   653→
+   654→    // Reconcile first — should still be a blocker (low coverage).
+   655→    const reconResult = await subcontractService.reconcileQuote({
+   656→      ctx: ctxA,
+   657→      packageId: PKG_EXCEPTION,
+   658→      quoteId: 'test-sc-quote-exc',
+   659→    })
+   660→    expect(reconResult.ok).toBe(true)
+   661→    if (reconResult.ok) {
+   662→      expect(reconResult.reconciliation.coveragePct).toBeLessThan(0.8)
+   663→      expect(reconResult.reconciliation.status).toBe('blocker')
+   664→    }
+   665→
+   666→    // Attempt selection — should SUCCEED because of the approved exception.
+   667→    const selectResult = await subcontractService.selectQuote({
+   668→      ctx: ctxA,
+   669→      packageId: PKG_EXCEPTION,
+   670→      quoteId: 'test-sc-quote-exc',
+   671→    })
+   672→    expect(selectResult.ok).toBe(true)
+   673→    if (selectResult.ok) {
+   674→      expect(selectResult.packageStatus).toBe('awarded')
+   675→    }
+   676→
+   677→    // Verify the package + quote were awarded.
+   678→    const pkg = await db.subcontractPackage.findUnique({ where: { id: PKG_EXCEPTION } })
+   679→    expect(pkg?.status).toBe('awarded')
+   680→    expect(pkg?.selectedQuoteId).toBe('test-sc-quote-exc')
+   681→    const quote = await db.subcontractQuote.findUnique({ where: { id: 'test-sc-quote-exc' } })
+   682→    expect(quote?.status).toBe('selected')
+   683→
+   684→    // Verify the audit log notes the exception override.
+   685→    const audit = await db.auditLog.findFirst({
+   686→      where: {
+   687→        organizationId: ORG_A,
+   688→        action: 'subcontract.quote-selected',
+   689→        entityId: PKG_EXCEPTION,
+   690→      },
+   691→    })
+   692→    expect(audit).not.toBeNull()
+   693→    expect(audit?.summary).toContain('approved exception')
+   694→  }, 60000)
+   695→
+   696→  test('Illegal state transition (awarded → draft) → rejected', async () => {
+   697→    // Setup: create a package, select a quote (moves to awarded), then attempt
+   698→    // to transition back to draft (illegal).
+   699→    await createPackageWithAtoms(ORG_A, PKG_STATE, OPP_A, [
+   700→      { id: 'test-sc-atom-st-1', name: 'manufacture', valueWeight: 0.5 },
+   701→      { id: 'test-sc-atom-st-2', name: 'installation', valueWeight: 0.5 },
+   702→    ])
+   703→    await createQuoteWithCoverages(
+   704→      ORG_A,
+   705→      PKG_STATE,
+   706→      'test-sc-quote-st',
+   707→      'State Test Supplier',
+   708→      46000,
+   709→      [
+   710→        { atomId: 'test-sc-atom-st-1', status: 'covered' },
+   711→        { atomId: 'test-sc-atom-st-2', status: 'covered' },
+   712→      ],
+   713→    )
+   714→
+   715→    // First: select the quote — package goes to awarded.
+   716→    const selectResult = await subcontractService.selectQuote({
+   717→      ctx: ctxA,
+   718→      packageId: PKG_STATE,
+   719→      quoteId: 'test-sc-quote-st',
+   720→    })
+   721→    expect(selectResult.ok).toBe(true)
+   722→    if (selectResult.ok) {
+   723→      expect(selectResult.packageStatus).toBe('awarded')
+   724→    }
+   725→
+   726→    // Verify the package is in awarded state.
+   727→    const pkgAwarded = await db.subcontractPackage.findUnique({ where: { id: PKG_STATE } })
+   728→    expect(pkgAwarded?.status).toBe('awarded')
+   729→
+   730→    // Attempt illegal transition: awarded → draft.
+   731→    const transitionResult = await subcontractService.transitionPackageStatus({
+   732→      ctx: ctxA,
+   733→      packageId: PKG_STATE,
+   734→      status: 'draft',
+   735→    })
+   736→    expect(transitionResult.ok).toBe(false)
+   737→    if (!transitionResult.ok) {
+   738→      expect(transitionResult.status).toBe(400)
+   739→      expect(transitionResult.error).toContain('Illegal state transition')
+   740→    }
+   741→
+   742→    // Verify the package is STILL in awarded state (not changed).
+   743→    const pkgAfter = await db.subcontractPackage.findUnique({ where: { id: PKG_STATE } })
+   744→    expect(pkgAfter?.status).toBe('awarded')
+   745→
+   746→    // Control: awarded → abandoned IS allowed.
+   747→    const abandonResult = await subcontractService.transitionPackageStatus({
+   748→      ctx: ctxA,
+   749→      packageId: PKG_STATE,
+   750→      status: 'abandoned',
+   751→    })
+   752→    expect(abandonResult.ok).toBe(true)
+   753→    if (abandonResult.ok) {
+   754→      expect(abandonResult.status).toBe('abandoned')
+   755→    }
+   756→  }, 60000)
+   757→
+   758→  // ─── Additional control tests ───────────────────────────────────────────
+   759→
+   760→  test('Same-org getPackageWorkspace returns packages with reconciliation', async () => {
+   761→    // Org A reading its own OPP_A workspace — should include PKG_A.
+   762→    const result = await subcontractService.getPackageWorkspace({
+   763→      ctx: ctxA,
+   764→      opportunityId: OPP_A,
+   765→    })
+   766→    expect(result.ok).toBe(true)
+   767→    if (result.ok) {
+   768→      // The commercial test packages were created in OPP_A too — they should
+   769→      // all be visible. We just verify PKG_A is present and reconciled.
+   770→      const pkgA = result.packages.find((p) => p.id === PKG_A)
+   771→      expect(pkgA).toBeDefined()
+   772→      if (pkgA) {
+   773→        expect(pkgA.scopeAtoms.length).toBe(1)
+   774→        expect(pkgA.quotes.length).toBe(1)
+   775→        const q = pkgA.quotes[0]
+   776→        expect(q.coveragePct).toBe(1) // full coverage
+   777→        expect(q.reconciliationStatus).toBe('ok')
+   778→        expect(q.supplierName).toBe('Supplier A Shared')
+   779→      }
+   780→    }
+   781→  }, 60000)
+   782→
+   783→  test('Same-org createPackage + createScopeAtom + recordQuote works end-to-end', async () => {
+   784→    // Use the service to create a fresh package, atom, and quote, then
+   785→    // verify the workspace reflects them.
+   786→    const pkgResult = await subcontractService.createPackage({
+   787→      ctx: ctxA,
+   788→      opportunityId: OPP_A,
+   789→      name: 'End-to-End Test Package',
+   790→      executionStrategy: 'subcontract',
+   791→    })
+   792→    expect(pkgResult.ok).toBe(true)
+   793→    if (!pkgResult.ok) return
+   794→    const newPkgId = pkgResult.package.id
+   795→
+   796→    const atomResult = await subcontractService.createScopeAtom({
+   797→      ctx: ctxA,
+   798→      packageId: newPkgId,
+   799→      name: 'e2e-atom',
+   800→      valueWeight: 1.0,
+   801→    })
+   802→    expect(atomResult.ok).toBe(true)
+   803→    if (!atomResult.ok) return
+   804→    const newAtomId = atomResult.scopeAtom.id
+   805→
+   806→    const quoteResult = await subcontractService.recordQuote({
+   807→      ctx: ctxA,
+   808→      packageId: newPkgId,
+   809→      supplierName: 'E2E Supplier',
+   810→      totalAmount: 25000,
+   811→      currency: 'GHS',
+   812→    })
+   813→    expect(quoteResult.ok).toBe(true)
+   814→    if (!quoteResult.ok) return
+   815→    const newQuoteId = quoteResult.quote.id
+   816→
+   817→    // Record full coverage.
+   818→    const covResult = await subcontractService.recordQuoteScopeCoverage({
+   819→      ctx: ctxA,
+   820→      quoteId: newQuoteId,
+   821→      scopeAtomId: newAtomId,
+   822→      status: 'covered',
+   823→    })
+   824→    expect(covResult.ok).toBe(true)
+   825→
+   826→    // Reconcile via the service.
+   827→    const reconResult = await subcontractService.reconcileQuote({
+   828→      ctx: ctxA,
+   829→      packageId: newPkgId,
+   830→      quoteId: newQuoteId,
+   831→    })
+   832→    expect(reconResult.ok).toBe(true)
+   833→    if (reconResult.ok) {
+   834→      expect(reconResult.reconciliation.coveragePct).toBe(1)
+   835→      expect(reconResult.reconciliation.status).toBe('ok')
+   836→    }
+   837→
+   838→    // Select the quote — should succeed (full coverage).
+   839→    const selectResult = await subcontractService.selectQuote({
+   840→      ctx: ctxA,
+   841→      packageId: newPkgId,
+   842→      quoteId: newQuoteId,
+   843→    })
+   844→    expect(selectResult.ok).toBe(true)
+   845→  }, 60000)
+   846→})
+   847→
