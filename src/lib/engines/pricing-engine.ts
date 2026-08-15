@@ -61,6 +61,21 @@ export interface ExecutionSegmentInput {
    * required scope. If false or undefined, the segment is incomplete.
    */
   quoteCoversSegmentScope?: boolean;
+  /**
+   * The commercial basis for how the quote amount maps to this segment's cost.
+   *
+   * - 'direct-segment-quote': the quote totalAmount IS the cost for this segment.
+   *   Do NOT multiply by quantityPct. Use this when the subcontractor quoted
+   *   specifically for the work in this segment (e.g. "west wing installation").
+   *
+   * - 'proportional-from-package': the quote covers a larger package and this
+   *   segment takes a proportional share. cost = totalAmount × quantityPct.
+   *   Use this when the quote covers the full scope and quantityPct represents
+   *   the portion being subcontracted.
+   *
+   * If undefined → blocker ('missing-pricing-basis'). The engine never guesses.
+   */
+  pricingBasis?: 'direct-segment-quote' | 'proportional-from-package';
 }
 
 /**
@@ -101,7 +116,7 @@ export interface PricingProvenanceEntry {
 }
 
 export interface BlockingInput {
-  kind: 'missing-price' | 'missing-hybrid-allocation' | 'missing-work-definition' | 'invalid-recipe' | 'missing-subcontract-quote' | 'invalid-price-observation' | 'invalid-quantity' | 'invalid-wastage' | 'invalid-percentage' | 'invalid-hybrid-segment' | 'partial-subcontract-coverage' | 'hybrid-missing-strategy' | 'uncovered-exposure-unknown' | 'segment-scope-not-covered';
+  kind: 'missing-price' | 'missing-hybrid-allocation' | 'missing-work-definition' | 'invalid-recipe' | 'missing-subcontract-quote' | 'invalid-price-observation' | 'invalid-quantity' | 'invalid-wastage' | 'invalid-percentage' | 'invalid-hybrid-segment' | 'partial-subcontract-coverage' | 'hybrid-missing-strategy' | 'uncovered-exposure-unknown' | 'segment-scope-not-covered' | 'missing-pricing-basis';
   resourceName?: string;
   resourceCode?: string;
   detail: string;
@@ -444,6 +459,14 @@ export function priceLine(input: PricingInput): PricingBreakdown {
               detail: `Hybrid subcontract segment ${i + 1} quote has not been verified to cover the segment's required scope${seg.scopeDefinition ? ` ("${seg.scopeDefinition}")` : ''}. Explicitly confirm quoteCoversSegmentScope=true after reconciling the quote against the segment's scope atoms.`,
             });
           }
+          // Pricing basis: the engine must know whether the quote amount is
+          // for this segment directly or for a larger package.
+          if (seg.subcontractQuote && !seg.pricingBasis) {
+            segmentErrors.push({
+              kind: 'missing-pricing-basis',
+              detail: `Hybrid subcontract segment ${i + 1} has no pricingBasis. Specify 'direct-segment-quote' (quote IS the segment cost) or 'proportional-from-package' (cost = quote × quantityPct).`,
+            });
+          }
         } else {
           segmentErrors.push({
             kind: 'invalid-hybrid-segment',
@@ -486,7 +509,16 @@ export function priceLine(input: PricingInput): PricingBreakdown {
             selfPerformLabour += labour * pct;
             selfPerformPlant += plant * pct;
           } else if (seg.strategy === 'subcontract' && seg.subcontractQuote) {
-            hybridSubcontract += seg.subcontractQuote.totalAmount * pct;
+            // Apply the explicit pricing basis — the engine never guesses.
+            if (seg.pricingBasis === 'direct-segment-quote') {
+              // The quote totalAmount IS the cost for this segment.
+              hybridSubcontract += seg.subcontractQuote.totalAmount;
+            } else if (seg.pricingBasis === 'proportional-from-package') {
+              // The quote covers a larger package; take a proportional share.
+              hybridSubcontract += seg.subcontractQuote.totalAmount * pct;
+            }
+            // If no pricingBasis, segmentErrors already has a blocker —
+            // we won't reach here because segmentErrors.length > 0 above.
           }
         }
         material = round2(selfPerformMaterial);

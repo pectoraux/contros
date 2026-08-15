@@ -74,7 +74,7 @@ describe('Fix #1: subcontract exposure from actual uncovered scope, not extrapol
         {
           strategy: 'subcontract', quantityPct: 0.3, scopeDefinition: 'Specialist level 3',
           subcontractQuote: { totalAmount: 10000, coveragePct: 0.5, uncoveredScopeValue: 8000 },
-          quoteCoversSegmentScope: true,
+          quoteCoversSegmentScope: true, pricingBasis: 'direct-segment-quote' as const,
         },
       ],
     }))
@@ -92,7 +92,7 @@ describe('Fix #1: subcontract exposure from actual uncovered scope, not extrapol
         {
           strategy: 'subcontract', quantityPct: 0.3,
           subcontractQuote: { totalAmount: 10000, coveragePct: 0.5 },
-          quoteCoversSegmentScope: true,
+          quoteCoversSegmentScope: true, pricingBasis: 'direct-segment-quote' as const,
         },
       ],
     }))
@@ -134,7 +134,7 @@ describe('Fix #2: subcontract segment scope verification', () => {
         {
           strategy: 'subcontract', quantityPct: 0.3, scopeDefinition: 'Specialist blockwork',
           subcontractQuote: { totalAmount: 5000, coveragePct: 1.0 },
-          quoteCoversSegmentScope: true,
+          quoteCoversSegmentScope: true, pricingBasis: 'direct-segment-quote' as const,
         },
       ],
     }))

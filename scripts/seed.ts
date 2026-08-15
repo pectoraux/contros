@@ -1495,11 +1495,16 @@ async function createEstimateLine(
   if (!wdv) throw new Error(`WDV ${versionId} not found`);
 
   // Build the PricingInput. P0-5: pass executionSegments for hybrid strategy.
+  // Include pricingBasis for subcontract segments so the engine knows how to
+  // map the quote amount to the segment cost.
   const executionSegmentInputs: ExecutionSegmentInput[] | undefined =
     lineSeed.executionSegments?.map((s) => ({
       strategy: s.strategy,
       quantityPct: s.quantityPct,
       subcontractQuote: s.subcontractQuote ?? null,
+      scopeDefinition: s.scopeDefinition,
+      quoteCoversSegmentScope: s.strategy === 'subcontract' ? true : undefined,
+      pricingBasis: s.strategy === 'subcontract' ? 'proportional-from-package' : undefined,
     }));
 
   const breakdown = priceLine({

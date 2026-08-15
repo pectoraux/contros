@@ -20,8 +20,8 @@ export interface RequestContext {
 
 /**
  * Require an authenticated session. Returns the server-derived context.
- * P0-8: Role is validated at runtime — unknown roles are normalized to 'estimator'.
- * Throws a 401-shaped error if unauthenticated.
+ * Role is validated at runtime — invalid roles are rejected with 403 (fail closed).
+ * Throws a 401-shaped error if unauthenticated, 403 if the role is invalid.
  */
 export async function requireAuth(): Promise<RequestContext> {
   const session = await getServerSession(authOptions)

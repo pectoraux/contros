@@ -121,7 +121,7 @@ describe('P0-3: hybrid execution validation', () => {
       executionStrategy: 'hybrid',
       executionSegments: [
         { strategy: 'self-perform', quantityPct: 0.7 },
-        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 5000, coveragePct: 1.0 }, quoteCoversSegmentScope: true },
+        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 5000, coveragePct: 1.0 }, quoteCoversSegmentScope: true, pricingBasis: 'direct-segment-quote' as const },
       ],
     }))
     expect(result.calculationStatus).toBe('complete')
@@ -170,7 +170,7 @@ describe('P0-4: subcontract pricing vs coverage', () => {
       executionStrategy: 'hybrid',
       executionSegments: [
         { strategy: 'self-perform', quantityPct: 0.7 },
-        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 10000, coveragePct: 0.5 }, quoteCoversSegmentScope: true },
+        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 10000, coveragePct: 0.5 }, quoteCoversSegmentScope: true, pricingBasis: 'direct-segment-quote' as const },
       ],
     }))
     expect(result.calculationStatus).toBe('incomplete')
