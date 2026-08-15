@@ -8,6 +8,7 @@
  *   - WorkDefinitionVersion (id, version, cost recipe, wastage, productivity)
  *   - ResourcePriceObservation (price, provenance, source, observedAt)
  *   - ExecutionSegments (strategy, quantityPct, subcontract quote snapshot)
+ *   - Subcontract scope interpretation (atoms, coverages, exclusions, economic coverage)
  *   - Estimate policy (overhead, profit, contingency)
  *   - Line descriptions, quantities, units
  *
@@ -18,6 +19,29 @@
  */
 
 import { priceLine, type PricingInput, type PricingBreakdown, type ExecutionSegmentInput } from './pricing-engine'
+
+/** Immutable snapshot of a subcontract quote's full scope interpretation. */
+export interface SubcontractQuoteSnapshot {
+  id: string
+  supplierName: string
+  totalAmount: number
+  currency: string
+  exclusions: string[]
+  assumptions: string[]
+  /** Full scope-atom coverage mapping at finalization time. */
+  scopeCoverages: {
+    scopeAtomId: string
+    atomName: string
+    atomValueWeight: number
+    status: 'covered' | 'excluded' | 'unstated'
+    note?: string
+  }[]
+  /** Coverage metrics frozen at finalization. */
+  semanticCoveragePct: number
+  economicCoveragePct: number
+  economicCoverageUnknown: boolean
+  uncoveredExposure: number
+}
 
 /** Immutable snapshot of a single estimate line's pricing inputs. */
 export interface LineSnapshot {
@@ -36,8 +60,13 @@ export interface LineSnapshot {
     costRecipeJson: string
   } | null
   executionSegments: ExecutionSegmentInput[]
-  /** Snapshot of the subcontract quote used (if any). */
-  subcontractQuote?: { totalAmount: number; coveragePct: number } | null
+  /** Snapshot of the subcontract quote used (if any), including full scope state. */
+  subcontractQuote?: {
+    totalAmount: number
+    coveragePct: number
+    /** Full scope interpretation snapshot for reproducibility. */
+    scopeSnapshot?: SubcontractQuoteSnapshot
+  } | null
 }
 
 /** Immutable snapshot of the estimate's commercial policy. */
@@ -54,6 +83,8 @@ export interface RevisionSnapshot {
   policy: PolicySnapshot
   lines: LineSnapshot[]
   finalizedAt: string
+  /** Schema version of the snapshot format — for forward compatibility. */
+  snapshotVersion: number
 }
 
 /**
@@ -75,6 +106,7 @@ export function finalizeRevision(
     policy,
     lines,
     finalizedAt: new Date().toISOString(),
+    snapshotVersion: 2, // v2 = includes subcontract scope snapshots
   }
   return JSON.stringify(snapshot)
 }
@@ -85,6 +117,8 @@ export function finalizeRevision(
  *
  * P0-6: This is the reproducibility proof. Changing current WorkDefinitions,
  * resource prices, or subcontract quotes must NOT change the replayed result.
+ *
+ * The replay uses ONLY the snapshot data — it never reads current mutable state.
  */
 export function replayRevision(snapshotJson: string): {
   ok: true
@@ -94,6 +128,8 @@ export function replayRevision(snapshotJson: string): {
   totalSellPrice: number
   totalEstimatedTotalCost: number
   totalExpectedProfit: number
+  /** Subcontract scope interpretations frozen at finalization. */
+  subcontractScopeSnapshots: SubcontractQuoteSnapshot[]
 } | { ok: false; error: string } {
   let snapshot: RevisionSnapshot
   try {
@@ -106,6 +142,8 @@ export function replayRevision(snapshotJson: string): {
     return { ok: false, error: 'Invalid snapshot structure — missing lines array.' }
   }
 
+  const subcontractScopeSnapshots: SubcontractQuoteSnapshot[] = []
+
   const replayedLines = snapshot.lines.map((line) => {
     const pricingInput: PricingInput = {
       workDefinitionVersion: line.workDefinitionVersion,
@@ -115,9 +153,17 @@ export function replayRevision(snapshotJson: string): {
       overheadPct: snapshot.policy.overheadPct,
       profitPct: snapshot.policy.profitPct,
       contingencyPct: snapshot.policy.contingencyPct,
-      subcontractQuote: line.subcontractQuote ?? null,
+      subcontractQuote: line.subcontractQuote
+        ? { totalAmount: line.subcontractQuote.totalAmount, coveragePct: line.subcontractQuote.coveragePct }
+        : null,
     }
     const breakdown = priceLine(pricingInput)
+
+    // Collect subcontract scope snapshots for the result
+    if (line.subcontractQuote?.scopeSnapshot) {
+      subcontractScopeSnapshots.push(line.subcontractQuote.scopeSnapshot)
+    }
+
     return { ...line, breakdown }
   })
 
@@ -134,6 +180,7 @@ export function replayRevision(snapshotJson: string): {
     totalSellPrice: Math.round(totalSellPrice * 100) / 100,
     totalEstimatedTotalCost: Math.round(totalEstimatedTotalCost * 100) / 100,
     totalExpectedProfit: Math.round(totalExpectedProfit * 100) / 100,
+    subcontractScopeSnapshots,
   }
 }
 
@@ -144,6 +191,7 @@ export function replayRevision(snapshotJson: string): {
  *   - estimateRevisionId is set (points to a finalized revision)
  *   - the referenced estimate is not in 'draft' status
  *   - finalPrice is set
+ *   - all estimate lines are 'complete' (not 'incomplete')
  *
  * Returns { ok: true } or { ok: false, errors: string[] }.
  */
@@ -152,6 +200,7 @@ export function validateBidSubmission(input: {
   estimateStatus: string
   finalPrice: number | null
   hasFinalizedRevision: boolean
+  incompleteLineCount?: number
 }): { ok: true } | { ok: false; errors: string[] } {
   const errors: string[] = []
 
@@ -166,6 +215,9 @@ export function validateBidSubmission(input: {
   }
   if (input.finalPrice === null || input.finalPrice === undefined) {
     errors.push('Final price is not set — cannot submit.')
+  }
+  if (input.incompleteLineCount && input.incompleteLineCount > 0) {
+    errors.push(`${input.incompleteLineCount} estimate line(s) have incomplete calculations — cannot submit.`)
   }
 
   return errors.length > 0 ? { ok: false, errors } : { ok: true }

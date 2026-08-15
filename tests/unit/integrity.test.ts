@@ -303,6 +303,73 @@ describe('P0-6: estimate revision reproducibility', () => {
     const result = replayRevision(JSON.stringify({ estimateId: 'e1', revisionNo: 1, policy: {}, finalizedAt: '2025-01-01' }))
     expect(result.ok).toBe(false)
   })
+
+  test('enriched snapshot captures full subcontract scope state', () => {
+    const scopeSnapshot = {
+      id: 'q1',
+      supplierName: 'VoltTech',
+      totalAmount: 18500,
+      currency: 'GHS',
+      exclusions: ['scaffolding', 'delivery'],
+      assumptions: ['valid 30 days'],
+      scopeCoverages: [
+        { scopeAtomId: 'a1', atomName: 'manufacture', atomValueWeight: 0.4, status: 'covered' as const },
+        { scopeAtomId: 'a2', atomName: 'delivery', atomValueWeight: 0.05, status: 'excluded' as const },
+        { scopeAtomId: 'a3', atomName: 'installation', atomValueWeight: 0.35, status: 'excluded' as const },
+      ],
+      semanticCoveragePct: 0.33,
+      economicCoveragePct: 0.40,
+      economicCoverageUnknown: false,
+      uncoveredExposure: 11000,
+    }
+    const lines = [{
+      lineId: 'l1', description: 'Electrical', quantity: 500, unit: 'm',
+      executionStrategy: 'subcontract' as const,
+      workDefinitionVersion: null,
+      executionSegments: [],
+      subcontractQuote: { totalAmount: 18500, coveragePct: 0.40, scopeSnapshot },
+    }]
+    const snapshotJson = finalizeRevision('est-1', 1, { overheadPct: 0.1, profitPct: 0.12, contingencyPct: 0.05 }, lines)
+
+    const replay = replayRevision(snapshotJson)
+    expect(replay.ok).toBe(true)
+    if (replay.ok) {
+      // The subcontract scope snapshot is preserved in the replay
+      expect(replay.subcontractScopeSnapshots.length).toBe(1)
+      expect(replay.subcontractScopeSnapshots[0].supplierName).toBe('VoltTech')
+      expect(replay.subcontractScopeSnapshots[0].economicCoveragePct).toBe(0.40)
+      expect(replay.subcontractScopeSnapshots[0].exclusions).toContain('scaffolding')
+      expect(replay.subcontractScopeSnapshots[0].scopeCoverages.length).toBe(3)
+      expect(replay.subcontractScopeSnapshots[0].uncoveredExposure).toBe(11000)
+    }
+  })
+
+  test('replay is independent of current subcontract quote state', () => {
+    const recipe = [pricedLine({ resourceKind: 'subcontract', resourceName: 'Subcontractor', quantityPerUnit: 1, priceObservation: { price: 0, provenance: 'quote', observedAt: '2025-01-01' } })]
+    const scopeSnapshot = {
+      id: 'q1', supplierName: 'Original', totalAmount: 50000, currency: 'GHS',
+      exclusions: [], assumptions: [],
+      scopeCoverages: [{ scopeAtomId: 'a1', atomName: 'all', atomValueWeight: 1, status: 'covered' as const }],
+      semanticCoveragePct: 1, economicCoveragePct: 1, economicCoverageUnknown: false, uncoveredExposure: 0,
+    }
+    const lines = [{
+      lineId: 'l1', description: 'Package', quantity: 1, unit: 'nr',
+      executionStrategy: 'subcontract' as const,
+      workDefinitionVersion: { id: 'wdv-1', name: 'Package', version: 1, unit: 'nr', wastage: 0, costRecipeJson: JSON.stringify(recipe) },
+      executionSegments: [],
+      subcontractQuote: { totalAmount: 50000, coveragePct: 1, scopeSnapshot },
+    }]
+    const snapshotJson = finalizeRevision('est-1', 1, { overheadPct: 0.1, profitPct: 0.12, contingencyPct: 0.05 }, lines)
+
+    // Replay — the snapshot's quote (50000) is used, NOT any current mutable quote
+    const replay = replayRevision(snapshotJson)
+    expect(replay.ok).toBe(true)
+    if (replay.ok) {
+      expect(replay.totalSellPrice).toBeGreaterThan(0)
+      // The scope snapshot preserves the original supplier name
+      expect(replay.subcontractScopeSnapshots[0].supplierName).toBe('Original')
+    }
+  })
 })
 
 // ── P0-7: Bid submission invariant ───────────────────────────────────────────
@@ -366,6 +433,20 @@ describe('P0-7: bid submission invariant', () => {
     expect(result.ok).toBe(false)
     if (!result.ok) {
       expect(result.errors.some((e) => e.includes('not finalized'))).toBe(true)
+    }
+  })
+
+  test('cannot submit with incomplete estimate lines', () => {
+    const result = validateBidSubmission({
+      estimateRevisionId: 'rev-1',
+      estimateStatus: 'adjudicated',
+      finalPrice: 100000,
+      hasFinalizedRevision: true,
+      incompleteLineCount: 2,
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.includes('incomplete calculations'))).toBe(true)
     }
   })
 })

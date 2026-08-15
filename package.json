@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000 2>&1 | tee dev.log",
-    "build": "prisma generate && next build",
+    "build": "bun run scripts/generate-version.ts && prisma generate && next build",
+    "predev": "bun run scripts/generate-version.ts",
     "postinstall": "prisma generate || true",
     "start": "next start",
     "lint": "eslint .",
