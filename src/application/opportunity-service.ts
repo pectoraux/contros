@@ -24,7 +24,7 @@
  * - No raw Prisma in the service — all access through tenant-scoped repositories.
  */
 
-import { db, dbTx } from '@/lib/db'
+import { dbTx } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
 import { computeScopeCompleteness } from '@/lib/engines/scope-completeness'
 import {
@@ -35,6 +35,9 @@ import {
   scopeQuestionRepository,
   scopeAssumptionRepository,
   scopeEvidenceRepository,
+  userRepository,
+  auditLogWorkspaceRepository,
+  opportunityDetailGraphRepository,
   auditLogRepository,
 } from '@/repositories'
 
@@ -285,36 +288,37 @@ export const opportunityService = {
    * Get the full opportunity detail — returns the serialized shape the
    * frontend expects (OpportunityDetail). Includes scope package (with
    * all children), estimates, subcontract packages, bid, and audit logs.
+   *
+   * P0 hardening:
+   * - Uses the hardened graph loader which verifies nested ownership
+   *   (WorkDefinition.organizationId, WDV→WD, SubcontractPackageLine→EstimateLine).
+   * - If any nested entity is cross-tenant inconsistent, surfaces
+   *   `graphInconsistent=true` with diagnostics and STRIPS the foreign
+   *   commercial data from the response (does not silently serialize it).
+   * - Audit logs are fetched via the tenant-aware auditLogWorkspaceRepository
+   *   (ZERO direct db.auditLog.find* in the service).
    */
   async getOpportunityDetail(input: GetOpportunityDetailInput): Promise<{ ok: true; opportunity: unknown } | Err> {
     const { ctx, opportunityId } = input
 
-    const opportunity = await opportunityRepository.getDetailForOrganization(
+    const hardened = await opportunityDetailGraphRepository.loadHardenedForOrganization(
       ctx.organizationId, opportunityId,
     )
-    if (!opportunity) {
+    if (!hardened) {
       return { ok: false, error: 'Opportunity not found', status: 404 }
     }
 
-    // Fetch audit logs referencing this opportunity or its child entities.
+    const { opportunity, graphInconsistent, inconsistencies } = hardened
+
+    // Fetch audit logs via the tenant-aware repository (no raw Prisma).
     const estimateIds = opportunity.estimates.map((e) => e.id)
     const lineIds = opportunity.estimates.flatMap((e) => e.lines.map((l) => l.id))
     const scopeItemIds = opportunity.scopePackage?.items.map((i) => i.id) ?? []
     const quoteIds = opportunity.subcontractPackages.flatMap((sp) => sp.quotes.map((q) => q.id))
     const relevantEntityIds = [opportunity.id, ...estimateIds, ...lineIds, ...scopeItemIds, ...quoteIds]
-
-    const auditLogs = await db.auditLog.findMany({
-      where: {
-        organizationId: ctx.organizationId,
-        OR: [
-          { entityId: { in: relevantEntityIds } },
-          { action: { contains: 'ai.assistant' } },
-        ],
-      },
-      include: { actor: true },
-      orderBy: { createdAt: 'desc' },
-      take: 30,
-    })
+    const auditLogs = await auditLogWorkspaceRepository.getForOpportunityWorkspace(
+      ctx.organizationId, relevantEntityIds,
+    )
 
     // Helper: safely parse blockingInputsJson.
     const parseBlockingInputs = (json: string | null | undefined): unknown[] => {
@@ -326,6 +330,12 @@ export const opportunityService = {
         return []
       }
     }
+
+    // Build a set of inconsistent entity IDs for fast lookup during serialization.
+    // When graphInconsistent=true, we strip the foreign commercial data from
+    // the affected nested entities (workDefinition, workDefinitionVersion,
+    // estimateLine on subcontract package lines) rather than exposing it.
+    const inconsistentEntityIds = new Set(inconsistencies.map((i) => i.entityId))
 
     // Serialize estimates.
     const estimates = opportunity.estimates.map((e) => {
@@ -349,67 +359,76 @@ export const opportunityService = {
         averageMarginPct: totalSell > 0 ? ((totalSell - totalDirect) / totalSell) * 100 : 0,
         averageConfidence: avgConfidence,
         unsourcedLineCount: unsourcedCount,
-        lines: e.lines.map((l) => ({
-          id: l.id,
-          description: l.description,
-          quantity: l.quantity,
-          unit: l.unit,
-          executionStrategy: l.executionStrategy,
-          calculationStatus: l.calculationStatus,
-          blockingInputs: parseBlockingInputs(l.blockingInputsJson),
-          estimatedTotalCost: l.estimatedTotalCost,
-          expectedProfit: l.expectedProfit,
-          expectedMarginPct: l.expectedMarginPct,
-          materialCost: l.materialCost,
-          labourCost: l.labourCost,
-          plantCost: l.plantCost,
-          subcontractCost: l.subcontractCost,
-          directCost: l.directCost,
-          projectCost: l.projectCost,
-          riskCost: l.riskCost,
-          overheadCost: l.overheadCost,
-          profitCost: l.profitCost,
-          sellPrice: l.sellPrice,
-          unitRate: l.unitRate,
-          marginPct: l.marginPct,
-          confidence: l.confidence,
-          provenanceSummary: l.provenanceSummary,
-          isUnsourced: l.isUnsourced,
-          unsourcedRationale: l.unsourcedRationale,
-          unsourcedConfidence: l.unsourcedConfidence,
-          acknowledged: l.acknowledged,
-          executionSegments: l.executionSegments.map((seg) => ({
-            id: seg.id,
-            strategy: seg.strategy,
-            scopeDefinition: seg.scopeDefinition,
-            quantityPct: seg.quantityPct,
-            subcontractQuoteId: seg.subcontractQuoteId,
-            pricingBasis: seg.pricingBasis,
-            quoteCoversSegmentScope: seg.quoteCoversSegmentScope,
-          })),
-          scopeItem: l.scopeItem
-            ? { id: l.scopeItem.id, description: l.scopeItem.description, status: l.scopeItem.status }
-            : null,
-          workDefinition: l.workDefinition
-            ? { id: l.workDefinition.id, code: l.workDefinition.code, name: l.workDefinition.name, unit: l.workDefinition.unit }
-            : null,
-          workDefinitionVersion: l.workDefinitionVersion
-            ? {
-                id: l.workDefinitionVersion.id,
-                version: l.workDefinitionVersion.version,
-                approvalState: l.workDefinitionVersion.approvalState,
-                productivityRule: l.workDefinitionVersion.productivityRule,
-                wastage: l.workDefinitionVersion.wastage,
-                hazardsJson: l.workDefinitionVersion.hazardsJson,
-                controlsJson: l.workDefinitionVersion.controlsJson,
-                methodStatementFragment: l.workDefinitionVersion.methodStatementFragment,
-                requiredPPE: l.workDefinitionVersion.requiredPPE,
-                requiredPermits: l.workDefinitionVersion.requiredPermits,
-                costRecipeJson: l.workDefinitionVersion.costRecipeJson,
-                subcontractability: l.workDefinitionVersion.subcontractability,
-              }
-            : null,
-        })),
+        lines: e.lines.map((l) => {
+          // P0: strip foreign WorkDefinition/WDV if this line is flagged inconsistent.
+          const wdInconsistent = l.workDefinition ? inconsistentEntityIds.has(l.workDefinition.id) : false
+          const wdvInconsistent = l.workDefinitionVersion ? inconsistentEntityIds.has(l.workDefinitionVersion.id) : false
+          const scopeItemInconsistent = l.scopeItem ? inconsistentEntityIds.has(l.scopeItem.id) : false
+          return {
+            id: l.id,
+            description: l.description,
+            quantity: l.quantity,
+            unit: l.unit,
+            executionStrategy: l.executionStrategy,
+            calculationStatus: l.calculationStatus,
+            blockingInputs: parseBlockingInputs(l.blockingInputsJson),
+            estimatedTotalCost: l.estimatedTotalCost,
+            expectedProfit: l.expectedProfit,
+            expectedMarginPct: l.expectedMarginPct,
+            materialCost: l.materialCost,
+            labourCost: l.labourCost,
+            plantCost: l.plantCost,
+            subcontractCost: l.subcontractCost,
+            directCost: l.directCost,
+            projectCost: l.projectCost,
+            riskCost: l.riskCost,
+            overheadCost: l.overheadCost,
+            profitCost: l.profitCost,
+            sellPrice: l.sellPrice,
+            unitRate: l.unitRate,
+            marginPct: l.marginPct,
+            confidence: l.confidence,
+            provenanceSummary: l.provenanceSummary,
+            isUnsourced: l.isUnsourced,
+            unsourcedRationale: l.unsourcedRationale,
+            unsourcedConfidence: l.unsourcedConfidence,
+            acknowledged: l.acknowledged,
+            executionSegments: l.executionSegments.map((seg) => ({
+              id: seg.id,
+              strategy: seg.strategy,
+              scopeDefinition: seg.scopeDefinition,
+              quantityPct: seg.quantityPct,
+              subcontractQuoteId: seg.subcontractQuoteId,
+              pricingBasis: seg.pricingBasis,
+              quoteCoversSegmentScope: seg.quoteCoversSegmentScope,
+            })),
+            // P0: strip foreign scope items — never expose cross-tenant scope data.
+            scopeItem: l.scopeItem && !scopeItemInconsistent
+              ? { id: l.scopeItem.id, description: l.scopeItem.description, status: l.scopeItem.status }
+              : null,
+            // P0: strip foreign WorkDefinitions — never expose cross-tenant WD code/name.
+            workDefinition: l.workDefinition && !wdInconsistent
+              ? { id: l.workDefinition.id, code: l.workDefinition.code, name: l.workDefinition.name, unit: l.workDefinition.unit }
+              : null,
+            // P0: strip foreign WorkDefinitionVersions — never expose cross-tenant recipes.
+            workDefinitionVersion: l.workDefinitionVersion && !wdvInconsistent
+              ? {
+                  id: l.workDefinitionVersion.id,
+                  version: l.workDefinitionVersion.version,
+                  approvalState: l.workDefinitionVersion.approvalState,
+                  productivityRule: l.workDefinitionVersion.productivityRule,
+                  wastage: l.workDefinitionVersion.wastage,
+                  hazardsJson: l.workDefinitionVersion.hazardsJson,
+                  controlsJson: l.workDefinitionVersion.controlsJson,
+                  methodStatementFragment: l.workDefinitionVersion.methodStatementFragment,
+                  requiredPPE: l.workDefinitionVersion.requiredPPE,
+                  requiredPermits: l.workDefinitionVersion.requiredPermits,
+                  costRecipeJson: l.workDefinitionVersion.costRecipeJson,
+                  subcontractability: l.workDefinitionVersion.subcontractability,
+                }
+              : null,
+          }
+        }),
         revisions: e.revisions.map((r) => ({
           id: r.id,
           revisionNo: r.revisionNo,
@@ -464,20 +483,24 @@ export const opportunityService = {
             description: a.description,
             valueWeight: a.valueWeight,
           })),
-          lines: sp.lines.map((l) => ({
-            id: l.id,
-            requiredScope: l.requiredScope,
-            estimateLineId: l.estimateLineId,
-            estimateLine: l.estimateLine
-              ? {
-                  id: l.estimateLine.id,
-                  description: l.estimateLine.description,
-                  sellPrice: l.estimateLine.sellPrice,
-                  unit: l.estimateLine.unit,
-                  quantity: l.estimateLine.quantity,
-                }
-              : null,
-          })),
+          lines: sp.lines.map((l) => {
+            // P0: strip foreign EstimateLine references from subcontract package lines.
+            const estimateLineInconsistent = l.estimateLine ? inconsistentEntityIds.has(l.estimateLine.id) : false
+            return {
+              id: l.id,
+              requiredScope: l.requiredScope,
+              estimateLineId: l.estimateLineId,
+              estimateLine: l.estimateLine && !estimateLineInconsistent
+                ? {
+                    id: l.estimateLine.id,
+                    description: l.estimateLine.description,
+                    sellPrice: l.estimateLine.sellPrice,
+                    unit: l.estimateLine.unit,
+                    quantity: l.estimateLine.quantity,
+                  }
+                : null,
+            }
+          }),
           quotes: sp.quotes.map((q) => ({
             id: q.id,
             supplierName: q.supplierName,
@@ -498,6 +521,15 @@ export const opportunityService = {
           })),
         })),
         bid: opportunity.bid,
+        // P0: surface graph inconsistency diagnostics so the caller knows the
+        // commercial graph is not fully trustworthy. The foreign commercial
+        // data has already been stripped from the nested entities above.
+        graphInconsistent,
+        inconsistencies: inconsistencies.map((i) => ({
+          path: i.path,
+          reason: i.reason,
+          entityId: i.entityId,
+        })),
         auditLogs: auditLogs.map((a) => ({
           id: a.id,
           action: a.action,
@@ -514,6 +546,10 @@ export const opportunityService = {
   /**
    * Create an opportunity from an RFQ. Auto-creates the 1:1 ScopePackage.
    * Transactional with audit.
+   *
+   * P0: If ownerId is provided, verifies the user belongs to ctx.organizationId
+   * before assigning. A foreign-org user is never assigned — returns 404
+   * (does not reveal cross-tenant user existence).
    */
   async createOpportunity(input: CreateOpportunityInput): Promise<{ ok: true; opportunityId: string } | Err> {
     const { ctx, clientId, title, reference, source, description, submissionDeadline, location, ownerId } = input
@@ -523,6 +559,15 @@ export const opportunityService = {
     }
     if (!clientId) {
       return { ok: false, error: 'Client is required', status: 400 }
+    }
+
+    // P0: Validate ownerId belongs to this organization before creating.
+    if (ownerId) {
+      const owner = await userRepository.getForOrganization(ctx.organizationId, ownerId)
+      if (!owner) {
+        // Do not reveal whether the user exists in another org — 404 is 404.
+        return { ok: false, error: 'Owner not found in this organization', status: 404 }
+      }
     }
 
     const opportunity = await dbTx.$transaction(async (tx) => {
@@ -559,6 +604,9 @@ export const opportunityService = {
 
   /**
    * Update opportunity metadata. Transactional with audit.
+   *
+   * P0: If ownerId is being changed, verifies the new owner belongs to
+   * ctx.organizationId. A foreign-org user is never assigned.
    */
   async updateOpportunity(input: UpdateOpportunityInput): Promise<{ ok: true } | Err> {
     const { ctx, opportunityId, title, reference, description, submissionDeadline, location, ownerId } = input
@@ -566,6 +614,15 @@ export const opportunityService = {
     const existing = await opportunityRepository.getForOrganization(ctx.organizationId, opportunityId)
     if (!existing) {
       return { ok: false, error: 'Opportunity not found', status: 404 }
+    }
+
+    // P0: Validate ownerId belongs to this organization before updating.
+    // Allow null (clearing the owner), but never assign a foreign-org user.
+    if (ownerId !== undefined && ownerId !== null) {
+      const owner = await userRepository.getForOrganization(ctx.organizationId, ownerId)
+      if (!owner) {
+        return { ok: false, error: 'Owner not found in this organization', status: 404 }
+      }
     }
 
     const data: Record<string, unknown> = {}
@@ -598,8 +655,22 @@ export const opportunityService = {
   /**
    * Transition the opportunity status — enforces the state machine.
    *
-   * Business rule: transitioning to 'estimating' requires at least one
-   * scope item. Don't start estimating an empty scope.
+   * P1 hardening: transitioning to 'estimating' now requires a MEANINGFUL
+   * scope readiness state, not just one arbitrary scope item. The rule is:
+   *
+   *   1. At least one scope item exists (don't estimate an empty scope).
+   *   2. No UNRESOLVED high-risk assumptions (riskLevel='high' AND
+   *      acknowledged=false). High-risk unacknowledged assumptions represent
+   *      material commercial exposure that must be consciously accepted
+   *      before estimating begins, not silently carried forward.
+   *   3. No OPEN scope questions (status='open'). Open questions mean the
+   *      scope itself is ambiguous — estimating against ambiguity produces
+   *      false precision.
+   *
+   * This rule deliberately does NOT impose a universal completeness threshold
+   * (e.g. 85%) because the right threshold depends on the tender type and
+   * project context. Instead it blocks on concrete unresolved risk signals.
+   * A future config-driven threshold can be layered on top of this baseline.
    */
   async transitionStatus(input: TransitionStatusInput): Promise<{ ok: true; newStatus: string; completeness: number } | Err> {
     const { ctx, opportunityId, newStatus } = input
@@ -624,13 +695,39 @@ export const opportunityService = {
       return { ok: false, error: `Illegal status transition: ${currentStatus} → ${newStatus}`, status: 400 }
     }
 
-    // Business rule: estimating requires at least one scope item.
+    // P1: Estimating-readiness rule — meaningful, not just "≥1 item".
     if (newStatus === 'estimating') {
-      const itemCount = opportunity.scopePackage?.items.length ?? 0
-      if (itemCount === 0) {
+      const items = opportunity.scopePackage?.items ?? []
+      const questions = opportunity.scopePackage?.questions ?? []
+      const assumptions = opportunity.scopePackage?.assumptions ?? []
+
+      // Rule 1: must have at least one scope item.
+      if (items.length === 0) {
         return {
           ok: false,
           error: 'Cannot transition to estimating — scope package has no items. Add at least one scope item first.',
+          status: 400,
+        }
+      }
+
+      // Rule 2: no unresolved high-risk assumptions.
+      const unresolvedHighRisk = assumptions.filter(
+        (a) => a.riskLevel === 'high' && !a.acknowledged,
+      )
+      if (unresolvedHighRisk.length > 0) {
+        return {
+          ok: false,
+          error: `Cannot transition to estimating — ${unresolvedHighRisk.length} unacknowledged high-risk assumption(s) must be acknowledged first. High-risk assumptions represent material commercial exposure that must be consciously accepted before estimating.`,
+          status: 400,
+        }
+      }
+
+      // Rule 3: no open scope questions.
+      const openQuestions = questions.filter((q) => q.status === 'open')
+      if (openQuestions.length > 0) {
+        return {
+          ok: false,
+          error: `Cannot transition to estimating — ${openQuestions.length} open scope question(s) must be clarified or resolved first. Open questions mean the scope is ambiguous; estimating against ambiguity produces false precision.`,
           status: 400,
         }
       }

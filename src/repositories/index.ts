@@ -1310,4 +1310,8 @@ export {
   scopeQuestionRepository,
   scopeAssumptionRepository,
   scopeEvidenceRepository,
+  userRepository,
+  auditLogWorkspaceRepository,
+  opportunityDetailGraphRepository,
 } from './opportunity-repositories'
+export type { GraphInconsistency, HardenedOpportunityDetail } from './opportunity-repositories'

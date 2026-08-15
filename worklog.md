@@ -1231,3 +1231,63 @@ Stage Summary:
     OpportunityService → Scope → EstimateService → SubcontractService → BidService
 - Four application services: EstimateService (FROZEN), SubcontractService (FROZEN),
   BidService (FROZEN), OpportunityService (code-complete).
+
+---
+Task ID: opportunity-service-hardening
+Agent: principal-engineer
+Task: OpportunityService final hardening — P0 tenant-boundary + graph-inconsistency + owner validation + estimating-readiness
+
+Work Log:
+- P0-1: Removed raw db.auditLog.findMany from getOpportunityDetail.
+  Created auditLogWorkspaceRepository.getForOpportunityWorkspace (tenant-scoped).
+  Service now has ZERO direct db.* calls (only dbTx.$transaction orchestration).
+- P0-2: Created opportunityDetailGraphRepository.loadHardenedForOrganization.
+  Verifies nested ownership chains:
+  * EstimateLine → WorkDefinition.organizationId
+  * EstimateLine → WorkDefinitionVersion → WorkDefinition (FK chain + foreign-org)
+  * EstimateLine → ScopeItem (must belong to this opportunity's scope package)
+  * SubcontractPackageLine → EstimateLine (must belong to this opportunity)
+- P0-3: graphInconsistent=true surfaced with diagnostics. Foreign commercial
+  data is STRIPPED from the response (WD code/name, WDV recipe, EstimateLine
+  sellPrice) — never silently serialized as valid.
+- P0-4: Created userRepository.getForOrganization. createOpportunity and
+  updateOpportunity now validate ownerId belongs to ctx.organizationId
+  before assigning. Foreign-org user → 404 (no cross-tenant existence leak).
+- P1-6: Hardened estimating transition. Now requires:
+  1. ≥1 scope item (don't estimate empty scope)
+  2. No unacknowledged high-risk assumptions (riskLevel='high' AND !acknowledged)
+  3. No open scope questions (status='open')
+  Deliberately NOT a universal completeness threshold — blocks on concrete
+  unresolved risk signals.
+- P0-5: Added 11 new integration tests:
+  * Owner cross-tenant (create rejects, update rejects, same-org accepts)
+  * Nested WorkDefinition cross-tenant (graphInconsistent, WD+WDV stripped)
+  * Nested subcontract EstimateLine cross-tenant (graphInconsistent, sellPrice stripped)
+  * Inverse direction (Org B cannot see Org A data)
+  * Estimating blocked by high-risk assumption
+  * Estimating allowed after acknowledging
+  * Estimating blocked by open question
+  * Estimating allowed after clarifying
+  * Transaction rollback (item insert succeeds, audit fails → rollback)
+- Updated getForOrganization to include assumptions (needed for estimating rule).
+- Updated test cleanup to handle all nested entities (WD, WDV, estimates, lines,
+  subcontract packages, quotes, etc.).
+
+Verification:
+- 106 unit tests pass (0 fail) — including tenant-safety source-code audit.
+- 31 integration tests pass (0 fail) — 20 existing + 11 new P0/P1 tests.
+- Lint clean.
+- Zero db.* calls in opportunity-service.ts (verified via grep).
+
+Stage Summary:
+- OpportunityService now satisfies ALL P0/P1 hardening requirements:
+  * Zero raw Prisma CRUD in service
+  * Tenant-aware audit repository
+  * Nested WorkDefinition/WDV/ScopeItem/SubcontractPackageLine ownership verified
+  * ownerId belongs to same organization
+  * Invalid nested commercial graph surfaced (graphInconsistent), not silently dropped
+  * Real cross-tenant tests pass (both directions)
+  * Estimating-readiness rule is meaningful (not just ≥1 item)
+  * Scope mutation transaction rollback test passes
+- Four application services: EstimateService (FROZEN), SubcontractService (FROZEN),
+  BidService (FROZEN), OpportunityService (FROZEN).

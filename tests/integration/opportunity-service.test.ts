@@ -53,25 +53,49 @@ describe('OpportunityService integration tests', () => {
   }, 120000)
 
   afterAll(async () => {
+    // Clean up ALL test entities in reverse dependency order.
     await db.auditLog.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.scopeEvidence.deleteMany({ where: { scopePackage: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } })
     await db.scopeAssumption.deleteMany({ where: { scopePackage: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } })
     await db.scopeQuestion.deleteMany({ where: { scopePackage: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } })
     await db.scopeItem.deleteMany({ where: { scopePackage: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } })
+    await db.quoteScopeCoverage.deleteMany({ where: { quote: { subcontractPackage: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } } }).catch(() => {})
+    await db.subcontractQuoteLine.deleteMany({ where: { quote: { subcontractPackage: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } } }).catch(() => {})
+    await db.subcontractQuote.deleteMany({ where: { subcontractPackage: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
+    await db.subcontractPackageLine.deleteMany({ where: { subcontractPackage: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
+    await db.scopeAtom.deleteMany({ where: { subcontractPackage: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
+    await db.subcontractPackage.deleteMany({ where: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
+    await db.executionSegment.deleteMany({ where: { estimateLine: { estimate: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } } }).catch(() => {})
+    await db.estimateLine.deleteMany({ where: { estimate: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
+    await db.estimateRevision.deleteMany({ where: { estimate: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
+    await db.estimate.deleteMany({ where: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
     await db.scopePackage.deleteMany({ where: { opportunity: { organizationId: { in: [ORG_A, ORG_B] } } } })
     await db.opportunity.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.client.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+    await db.workDefinitionVersion.deleteMany({ where: { workDefinition: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
+    await db.workDefinition.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } }).catch(() => {})
     await db.user.deleteMany({ where: { id: { in: [USER_A, USER_B] } } })
     await db.organization.deleteMany({ where: { id: { in: [ORG_A, ORG_B] } } })
     await db.$disconnect()
   }, 120000)
 
   beforeEach(async () => {
-    // Clean up test-specific records between tests
+    // Clean up test-specific records between tests (Org A only — Org B's
+    // WorkDefinitions/WDVs persist for cross-tenant tests).
     await db.scopeEvidence.deleteMany({ where: { scopePackage: { opportunity: { organizationId: ORG_A } } } }).catch(() => {})
     await db.scopeAssumption.deleteMany({ where: { scopePackage: { opportunity: { organizationId: ORG_A } } } }).catch(() => {})
     await db.scopeQuestion.deleteMany({ where: { scopePackage: { opportunity: { organizationId: ORG_A } } } }).catch(() => {})
     await db.scopeItem.deleteMany({ where: { scopePackage: { opportunity: { organizationId: ORG_A } } } }).catch(() => {})
+    await db.quoteScopeCoverage.deleteMany({ where: { quote: { subcontractPackage: { opportunity: { organizationId: ORG_A } } } } }).catch(() => {})
+    await db.subcontractQuoteLine.deleteMany({ where: { quote: { subcontractPackage: { opportunity: { organizationId: ORG_A } } } } }).catch(() => {})
+    await db.subcontractQuote.deleteMany({ where: { subcontractPackage: { opportunity: { organizationId: ORG_A } } } }).catch(() => {})
+    await db.subcontractPackageLine.deleteMany({ where: { subcontractPackage: { opportunity: { organizationId: ORG_A } } } }).catch(() => {})
+    await db.scopeAtom.deleteMany({ where: { subcontractPackage: { opportunity: { organizationId: ORG_A } } } }).catch(() => {})
+    await db.subcontractPackage.deleteMany({ where: { opportunity: { organizationId: ORG_A } } }).catch(() => {})
+    await db.executionSegment.deleteMany({ where: { estimateLine: { estimate: { opportunity: { organizationId: ORG_A } } } } }).catch(() => {})
+    await db.estimateLine.deleteMany({ where: { estimate: { opportunity: { organizationId: ORG_A } } } }).catch(() => {})
+    await db.estimateRevision.deleteMany({ where: { estimate: { opportunity: { organizationId: ORG_A } } } }).catch(() => {})
+    await db.estimate.deleteMany({ where: { opportunity: { organizationId: ORG_A } } }).catch(() => {})
     await db.scopePackage.deleteMany({ where: { opportunity: { organizationId: ORG_A } } }).catch(() => {})
     await db.opportunity.deleteMany({ where: { organizationId: ORG_A } }).catch(() => {})
     await db.auditLog.deleteMany({ where: { organizationId: ORG_A } }).catch(() => {})
@@ -515,4 +539,407 @@ describe('OpportunityService integration tests', () => {
     expect(opp?.title).toBe('Updated Title')
     expect(opp?.location).toBe('Accra, Ghana')
   }, 30000)
+
+  // ── P0: Owner cross-tenant validation ─────────────────────────────────────
+
+  test('P0: createOpportunity rejects foreign-org ownerId', async () => {
+    const result = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Cross-tenant owner test',
+      ownerId: USER_B, // User B belongs to Org B
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(404)
+      expect(result.error).toContain('Owner not found')
+    }
+
+    // Verify no opportunity was created
+    const opps = await db.opportunity.findMany({
+      where: { organizationId: ORG_A, title: 'Cross-tenant owner test' },
+    })
+    expect(opps.length).toBe(0)
+  }, 30000)
+
+  test('P0: updateOpportunity rejects foreign-org ownerId', async () => {
+    const createResult = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Update Owner Test',
+    })
+    if (!createResult.ok) return
+
+    const result = await opportunityService.updateOpportunity({
+      ctx: ctxA, opportunityId: createResult.opportunityId,
+      ownerId: USER_B, // User B belongs to Org B
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(404)
+      expect(result.error).toContain('Owner not found')
+    }
+
+    // Verify the owner was NOT changed
+    const opp = await db.opportunity.findUnique({ where: { id: createResult.opportunityId } })
+    expect(opp?.ownerId).toBeNull()
+  }, 30000)
+
+  test('P0: createOpportunity accepts same-org ownerId', async () => {
+    const result = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Same-org owner test',
+      ownerId: USER_A,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const opp = await db.opportunity.findUnique({ where: { id: result.opportunityId } })
+    expect(opp?.ownerId).toBe(USER_A)
+  }, 30000)
+
+  // ── P0: Graph inconsistency — nested WorkDefinition cross-tenant ──────────
+
+  test('P0: Cross-tenant WorkDefinition on EstimateLine → graphInconsistent=true, foreign WD stripped', async () => {
+    // 1. Create Org B WorkDefinition + WDV
+    const wdB = await db.workDefinition.create({
+      data: { id: 'test-opp-wd-b', organizationId: ORG_B, code: 'WD-B-X', name: 'Foreign WD', unit: 'm2' },
+    })
+    const wdvB = await db.workDefinitionVersion.create({
+      data: { id: 'test-opp-wdv-b', workDefinitionId: wdB.id, version: 1, costRecipeJson: '[]', approvalState: 'approved', wastage: 0.05, hazardsJson: '[]', controlsJson: '[]', qualityChecklistJson: '[]' },
+    })
+
+    // 2. Create Org A opportunity + estimate + estimate line that references Org B's WD/WDV
+    const createResult = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Graph Inconsistency WD Test',
+    })
+    if (!createResult.ok) return
+    const oppId = createResult.opportunityId
+
+    // Get the estimate (auto-created? No — OpportunityService doesn't auto-create estimates).
+    // Create one directly.
+    const estimate = await db.estimate.create({
+      data: { id: 'test-opp-est-wd', organizationId: ORG_A, opportunityId: oppId, status: 'draft' },
+    })
+    // Create an estimate line referencing Org B's WD/WDV
+    await db.estimateLine.create({
+      data: {
+        id: 'test-opp-line-wd', estimateId: estimate.id,
+        workDefinitionId: wdB.id, workDefinitionVersionId: wdvB.id,
+        description: 'Line with foreign WD', quantity: 100, unit: 'm2',
+        executionStrategy: 'self-perform', calculationStatus: 'complete',
+        sellPrice: 99999, directCost: 50000, // foreign pricing we must NOT expose via WD
+      },
+    })
+
+    // 3. Get the opportunity detail — should detect graphInconsistent
+    const result = await opportunityService.getOpportunityDetail({ ctx: ctxA, opportunityId: oppId })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const opp = result.opportunity as {
+      graphInconsistent: boolean
+      inconsistencies: { path: string; reason: string; entityId: string }[]
+      estimates: { lines: { workDefinition: { id: string; code: string } | null; workDefinitionVersion: { id: string } | null }[] }[]
+    }
+
+    expect(opp.graphInconsistent).toBe(true)
+    expect(opp.inconsistencies.length).toBeGreaterThan(0)
+    const wdInconsistency = opp.inconsistencies.find((i) => i.entityId === wdB.id)
+    expect(wdInconsistency).toBeDefined()
+    expect(wdInconsistency?.reason).toContain('belongs to organization')
+
+    // The foreign WD must be STRIPPED from the serialized line
+    const line = opp.estimates[0]?.lines[0]
+    expect(line?.workDefinition).toBeNull()
+    expect(line?.workDefinitionVersion).toBeNull()
+
+    // Cleanup
+    await db.estimateLine.deleteMany({ where: { id: 'test-opp-line-wd' } })
+    await db.estimate.deleteMany({ where: { id: estimate.id } })
+    await db.workDefinitionVersion.deleteMany({ where: { id: wdvB.id } })
+    await db.workDefinition.deleteMany({ where: { id: wdB.id } })
+  }, 45000)
+
+  // ── P0: Graph inconsistency — nested subcontract EstimateLine cross-tenant ─
+
+  test('P0: Cross-tenant EstimateLine on SubcontractPackageLine → graphInconsistent=true, foreign sellPrice stripped', async () => {
+    // 1. Create Org B opportunity + estimate + estimate line (foreign pricing)
+    const oppB = await db.opportunity.create({
+      data: { id: 'test-opp-opp-b-sc', organizationId: ORG_B, clientId: CLIENT_B, title: 'Org B Opp', status: 'received' },
+    })
+    await db.scopePackage.create({ data: { opportunityId: oppB.id, completeness: 0, origin: 'rfq' } })
+    const estB = await db.estimate.create({
+      data: { id: 'test-opp-est-b-sc', organizationId: ORG_B, opportunityId: oppB.id, status: 'draft' },
+    })
+    const lineB = await db.estimateLine.create({
+      data: {
+        id: 'test-opp-line-b-sc', estimateId: estB.id,
+        description: 'Org B line', quantity: 50, unit: 'm2',
+        executionStrategy: 'self-perform', calculationStatus: 'complete',
+        sellPrice: 77777, // foreign pricing we must NOT expose
+      },
+    })
+
+    // 2. Create Org A opportunity + estimate + estimate line (own)
+    const createResult = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Graph Inconsistency SC Test',
+    })
+    if (!createResult.ok) return
+    const oppA = createResult.opportunityId
+
+    const estA = await db.estimate.create({
+      data: { id: 'test-opp-est-a-sc', organizationId: ORG_A, opportunityId: oppA, status: 'draft' },
+    })
+    await db.estimateLine.create({
+      data: {
+        id: 'test-opp-line-a-sc', estimateId: estA.id,
+        description: 'Org A line', quantity: 100, unit: 'm2',
+        executionStrategy: 'self-perform', calculationStatus: 'complete',
+        sellPrice: 50000,
+      },
+    })
+
+    // 3. Create Org A subcontract package with a line referencing Org B's estimate line
+    const sp = await db.subcontractPackage.create({
+      data: { id: 'test-opp-sp-a-sc', organizationId: ORG_A, opportunityId: oppA, name: 'SC Pkg', executionStrategy: 'subcontract' },
+    })
+    await db.subcontractPackageLine.create({
+      data: {
+        id: 'test-opp-spl-a-sc', subcontractPackageId: sp.id,
+        estimateLineId: lineB.id, // foreign Org B estimate line!
+        requiredScope: 'foreign scope ref',
+      },
+    })
+
+    // 4. Get the opportunity detail — should detect graphInconsistent
+    const result = await opportunityService.getOpportunityDetail({ ctx: ctxA, opportunityId: oppA })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const opp = result.opportunity as {
+      graphInconsistent: boolean
+      inconsistencies: { path: string; reason: string; entityId: string }[]
+      subcontractPackages: { lines: { estimateLine: { id: string; sellPrice: number } | null; estimateLineId: string }[] }[]
+    }
+
+    expect(opp.graphInconsistent).toBe(true)
+    const scInconsistency = opp.inconsistencies.find((i) => i.entityId === lineB.id)
+    expect(scInconsistency).toBeDefined()
+    expect(scInconsistency?.reason).toContain('does not belong to this opportunity')
+
+    // The foreign estimateLine must be STRIPPED — sellPrice not exposed
+    const spl = opp.subcontractPackages[0]?.lines[0]
+    expect(spl?.estimateLine).toBeNull()
+
+    // Cleanup
+    await db.subcontractPackageLine.deleteMany({ where: { id: 'test-opp-spl-a-sc' } })
+    await db.subcontractPackage.deleteMany({ where: { id: sp.id } })
+    await db.estimateLine.deleteMany({ where: { id: 'test-opp-line-a-sc' } })
+    await db.estimate.deleteMany({ where: { id: estA.id } })
+    await db.estimateLine.deleteMany({ where: { id: lineB.id } })
+    await db.estimate.deleteMany({ where: { id: estB.id } })
+    await db.scopePackage.deleteMany({ where: { opportunityId: oppB.id } })
+    await db.opportunity.deleteMany({ where: { id: oppB.id } })
+  }, 45000)
+
+  // ── P0: Inverse direction — Org B cannot see Org A's nested data ───────────
+
+  test('P0: Inverse — Org B cannot see Org A nested commercial data', async () => {
+    // 1. Create Org A opportunity with estimate + line
+    const createResult = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Inverse Direction Test',
+    })
+    if (!createResult.ok) return
+    const oppA = createResult.opportunityId
+
+    const estA = await db.estimate.create({
+      data: { id: 'test-opp-est-inv', organizationId: ORG_A, opportunityId: oppA, status: 'draft' },
+    })
+    await db.estimateLine.create({
+      data: {
+        id: 'test-opp-line-inv', estimateId: estA.id,
+        description: 'Org A inverse line', quantity: 100, unit: 'm2',
+        executionStrategy: 'self-perform', calculationStatus: 'complete',
+        sellPrice: 88888,
+      },
+    })
+
+    // 2. Org B tries to load Org A's opportunity detail → 404
+    const result = await opportunityService.getOpportunityDetail({ ctx: ctxB, opportunityId: oppA })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(404)
+    }
+
+    // Cleanup
+    await db.estimateLine.deleteMany({ where: { id: 'test-opp-line-inv' } })
+    await db.estimate.deleteMany({ where: { id: estA.id } })
+  }, 30000)
+
+  // ── P1: Estimating-readiness — high-risk assumption blocks ─────────────────
+
+  test('P1: Estimating blocked by unacknowledged high-risk assumption', async () => {
+    const createResult = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'High-Risk Assumption Test',
+    })
+    if (!createResult.ok) return
+    const oppId = createResult.opportunityId
+
+    await opportunityService.transitionStatus({ ctx: ctxA, opportunityId: oppId, newStatus: 'scope-development' })
+    await opportunityService.addScopeItem({
+      ctx: ctxA, opportunityId: oppId, description: 'Known item', status: 'known',
+    })
+    // Add an unacknowledged high-risk assumption
+    await opportunityService.addAssumption({
+      ctx: ctxA, opportunityId: oppId, text: 'Assume no rock', riskLevel: 'high',
+    })
+
+    const result = await opportunityService.transitionStatus({
+      ctx: ctxA, opportunityId: oppId, newStatus: 'estimating',
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.error).toContain('high-risk assumption')
+    }
+  }, 30000)
+
+  test('P1: Estimating allowed after acknowledging high-risk assumption', async () => {
+    const createResult = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Ack High-Risk Test',
+    })
+    if (!createResult.ok) return
+    const oppId = createResult.opportunityId
+
+    await opportunityService.transitionStatus({ ctx: ctxA, opportunityId: oppId, newStatus: 'scope-development' })
+    await opportunityService.addScopeItem({
+      ctx: ctxA, opportunityId: oppId, description: 'Known item', status: 'known',
+    })
+    const aResult = await opportunityService.addAssumption({
+      ctx: ctxA, opportunityId: oppId, text: 'Assume no rock', riskLevel: 'high',
+    })
+    if (!aResult.ok) return
+
+    // Acknowledge the assumption
+    await opportunityService.acknowledgeAssumption({
+      ctx: ctxA, opportunityId: oppId, assumptionId: aResult.assumptionId,
+    })
+
+    // Now estimating should be allowed
+    const result = await opportunityService.transitionStatus({
+      ctx: ctxA, opportunityId: oppId, newStatus: 'estimating',
+    })
+    expect(result.ok).toBe(true)
+  }, 30000)
+
+  test('P1: Estimating blocked by open scope question', async () => {
+    const createResult = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Open Question Test',
+    })
+    if (!createResult.ok) return
+    const oppId = createResult.opportunityId
+
+    await opportunityService.transitionStatus({ ctx: ctxA, opportunityId: oppId, newStatus: 'scope-development' })
+    await opportunityService.addScopeItem({
+      ctx: ctxA, opportunityId: oppId, description: 'Known item', status: 'known',
+    })
+    // Add an open question (no high-risk assumptions)
+    await opportunityService.addScopeQuestion({
+      ctx: ctxA, opportunityId: oppId, question: 'What is the exact area?',
+    })
+
+    const result = await opportunityService.transitionStatus({
+      ctx: ctxA, opportunityId: oppId, newStatus: 'estimating',
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.error).toContain('open scope question')
+    }
+  }, 30000)
+
+  test('P1: Estimating allowed after clarifying open question', async () => {
+    const createResult = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Clarify Question Test',
+    })
+    if (!createResult.ok) return
+    const oppId = createResult.opportunityId
+
+    await opportunityService.transitionStatus({ ctx: ctxA, opportunityId: oppId, newStatus: 'scope-development' })
+    await opportunityService.addScopeItem({
+      ctx: ctxA, opportunityId: oppId, description: 'Known item', status: 'known',
+    })
+    const qResult = await opportunityService.addScopeQuestion({
+      ctx: ctxA, opportunityId: oppId, question: 'What is the exact area?',
+    })
+    if (!qResult.ok) return
+
+    // Clarify the question
+    await opportunityService.clarifyScopeQuestion({
+      ctx: ctxA, opportunityId: oppId, questionId: qResult.questionId,
+      status: 'clarified', resolution: '500 m2',
+    })
+
+    // Now estimating should be allowed
+    const result = await opportunityService.transitionStatus({
+      ctx: ctxA, opportunityId: oppId, newStatus: 'estimating',
+    })
+    expect(result.ok).toBe(true)
+  }, 30000)
+
+  // ── P0: Transaction rollback test ──────────────────────────────────────────
+
+  test('P0: Scope item insert rolls back when audit log fails', async () => {
+    const createResult = await opportunityService.createOpportunity({
+      ctx: ctxA, clientId: CLIENT_A, title: 'Rollback Test',
+    })
+    if (!createResult.ok) return
+    const oppId = createResult.opportunityId
+
+    const opportunity = await opportunityRepository_getForOrg(ORG_A, oppId)
+    if (!opportunity?.scopePackage) return
+    const scopePackageId = opportunity.scopePackage.id
+
+    // Get the initial completeness (should be 0)
+    const spBefore = await db.scopePackage.findUnique({ where: { id: scopePackageId } })
+    const completenessBefore = spBefore?.completeness ?? 0
+    const itemCountBefore = await db.scopeItem.count({ where: { scopePackageId } })
+
+    // Manually perform the transaction and force the audit log to fail by
+    // passing an invalid actorId (violates FK constraint).
+    // The scope item INSERT should succeed, but the audit INSERT should fail,
+    // and the whole transaction should roll back.
+    const { dbTx } = await import('../../src/lib/db')
+    const { scopeItemRepository } = await import('../../src/repositories')
+    const { auditLogRepository } = await import('../../src/repositories')
+
+    let threw = false
+    try {
+      await dbTx.$transaction(async (tx) => {
+        const item = await scopeItemRepository.createInTransaction(tx, ORG_A, scopePackageId, {
+          description: 'Rollback item', status: 'known',
+        })
+        if (!item) throw new Error('item creation failed')
+        // This will fail: non-existent actorId violates AuditLog_actorId_fkey
+        await auditLogRepository.createInTransaction(tx, ORG_A, 'nonexistent-user-id', {
+          action: 'scope.item-added',
+          entityType: 'ScopeItem',
+          entityId: item.id,
+          summary: 'This should roll back',
+        })
+      })
+    } catch {
+      threw = true
+    }
+
+    expect(threw).toBe(true)
+
+    // Verify the scope item was NOT persisted (rolled back)
+    const itemCountAfter = await db.scopeItem.count({ where: { scopePackageId } })
+    expect(itemCountAfter).toBe(itemCountBefore)
+
+    // Verify the completeness was NOT updated (rolled back)
+    const spAfter = await db.scopePackage.findUnique({ where: { id: scopePackageId } })
+    expect(spAfter?.completeness).toBe(completenessBefore)
+  }, 30000)
 })
+
+// Helper: load opportunity via the repository directly (for test setup)
+async function opportunityRepository_getForOrg(orgId: string, oppId: string) {
+  const { opportunityRepository } = await import('../../src/repositories')
+  return opportunityRepository.getForOrganization(orgId, oppId)
+}
