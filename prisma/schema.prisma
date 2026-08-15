@@ -494,11 +494,13 @@ model Bid {
   opportunityId       String   @unique
   estimateId          String   @unique
   estimateRevisionId  String?
+  adjudicatedRevisionId String? // P0-4: the revision used for adjudication (must match submitted revision)
   programmeRevisionId String?
   tenderPackStatus    String   @default("draft") // draft | ready | submitted | won | lost | withdrawn
   finalPrice          Float?
   directorAdjustment  Float    @default(0)
   adjustmentRationale String?
+  systemSellPrice     Float?   // P0-4: frozen system price at adjudication time (from revision snapshot)
   submittedAt         DateTime?
   outcome             String?  // won | lost | withdrawn | unknown
   lossReason          String?  // price | programme | technical | prequalification | relationship | unknown

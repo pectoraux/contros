@@ -1181,6 +1181,41 @@ export const bidRepository = {
 
 export const estimateRevisionRepositoryExtended = {
   async getForOrganization(orgId: string, revisionId: string) {
-    return db.estimateRevision.findFirst({ where: { id: revisionId, estimate: { organizationId: orgId } }, include: { estimate: true } })
+    return db.estimateRevision.findFirst({
+      where: { id: revisionId, estimate: { organizationId: orgId } },
+      include: { estimate: true },
+    })
+  },
+
+  /** Get a finalized revision for adjudication — returns the snapshot JSON. */
+  async getFinalizedForOrganization(orgId: string, revisionId: string) {
+    return db.estimateRevision.findFirst({
+      where: {
+        id: revisionId,
+        status: 'finalized',
+        estimate: { organizationId: orgId },
+      },
+      select: { id: true, snapshotJson: true, revisionNo: true, status: true },
+    })
+  },
+}
+
+// ─── Programme Revision Repository ──────────────────────────────────────────
+// For MVP, programme revisions are stored as EstimateRevisions with a flag.
+// If a dedicated ProgrammeRevision model exists later, this can be extended.
+
+export const programmeRevisionRepository = {
+  /** Get a finalized programme revision, tenant-safe. */
+  async getFinalizedForOrganization(orgId: string, revisionId: string) {
+    // For now, programme revisions reuse the EstimateRevision model.
+    // A programme revision is simply a finalized revision on the same estimate.
+    return db.estimateRevision.findFirst({
+      where: {
+        id: revisionId,
+        status: 'finalized',
+        estimate: { organizationId: orgId },
+      },
+      select: { id: true, status: true, revisionNo: true },
+    })
   },
 }

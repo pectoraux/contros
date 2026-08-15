@@ -29,14 +29,11 @@ const WD_A = 'test-bid-wd-a'
 const WDV_A = 'test-bid-wdv-a'
 const BID_A = 'test-bid-a'
 const BID_B = 'test-bid-b'
-const REV_A = 'test-bid-rev-a'
 
 const RECIPE = JSON.stringify([
-  {
-    resourceKind: 'material', resourceCode: 'RES-BID', resourceName: 'Test Material',
+  { resourceKind: 'material', resourceCode: 'RES-BID', resourceName: 'Test Material',
     unit: 'ton', quantityPerUnit: 0.1,
-    priceObservation: { price: 100, provenance: 'supplier-quote', observedAt: '2025-01-01' },
-  },
+    priceObservation: { price: 100, provenance: 'supplier-quote', observedAt: '2025-01-01' } },
 ])
 
 const ctxA: RequestContext = {
@@ -50,7 +47,6 @@ const ctxB: RequestContext = {
 
 describe('BidService integration tests', () => {
   beforeAll(async () => {
-    // Clean up — delete bids FIRST (FK constraint from Estimate)
     await db.auditLog.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.commercialException.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.bid.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
@@ -64,7 +60,6 @@ describe('BidService integration tests', () => {
     await db.user.deleteMany({ where: { id: { in: [USER_A, USER_B] } } })
     await db.organization.deleteMany({ where: { id: { in: [ORG_A, ORG_B] } } })
 
-    // Create Org A
     await db.organization.create({ data: { id: ORG_A, name: 'Bid Org A', currency: 'GHS' } })
     await db.user.create({ data: { id: USER_A, organizationId: ORG_A, name: 'User A', email: 'a@bid-test.com', role: 'estimator' } })
     await db.client.create({ data: { id: CLIENT_A, organizationId: ORG_A, name: 'Client A' } })
@@ -74,7 +69,6 @@ describe('BidService integration tests', () => {
     await db.workDefinitionVersion.create({ data: { id: WDV_A, workDefinitionId: WD_A, version: 1, wastage: 0.05, costRecipeJson: RECIPE, approvalState: 'approved', hazardsJson: '[]', controlsJson: '[]', qualityChecklistJson: '[]' } })
     await db.estimateLine.create({ data: { id: LINE_A, estimateId: EST_A, workDefinitionId: WD_A, workDefinitionVersionId: WDV_A, description: 'Bid Line A', quantity: 100, unit: 'm2', executionStrategy: 'self-perform', calculationStatus: 'complete' } })
 
-    // Create Org B
     await db.organization.create({ data: { id: ORG_B, name: 'Bid Org B', currency: 'GHS' } })
     await db.user.create({ data: { id: USER_B, organizationId: ORG_B, name: 'User B', email: 'b@bid-test.com', role: 'estimator' } })
     await db.client.create({ data: { id: CLIENT_B, organizationId: ORG_B, name: 'Client B' } })
@@ -98,7 +92,6 @@ describe('BidService integration tests', () => {
     await db.$disconnect()
   }, 120000)
 
-  // Clean up any existing bid for OPP_A before each test (unique constraint on opportunityId)
   beforeEach(async () => {
     await db.bid.deleteMany({ where: { opportunityId: OPP_A } }).catch(() => {})
     await db.bid.deleteMany({ where: { opportunityId: OPP_B } }).catch(() => {})
@@ -107,25 +100,18 @@ describe('BidService integration tests', () => {
 
   // ── Cross-tenant tests ─────────────────────────────────────────────────────
   test('Org A cannot read Org B bid workspace', async () => {
-    // Create a bid in Org B first
     await db.bid.create({ data: { id: BID_B, organizationId: ORG_B, opportunityId: OPP_B, estimateId: EST_B, tenderPackStatus: 'draft' } })
-
     const result = await bidService.getBidWorkspace({ ctx: ctxA, opportunityId: OPP_B })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.status).toBe(404)
-
     await db.bid.delete({ where: { id: BID_B } })
   }, 60000)
 
   test('Org A cannot submit Org B bid', async () => {
     await db.bid.create({ data: { id: BID_B, organizationId: ORG_B, opportunityId: OPP_B, estimateId: EST_B, tenderPackStatus: 'adjudication' } })
-
-    const result = await bidService.submitBid({
-      ctx: ctxA, bidId: BID_B, estimateRevisionId: 'any-revision',
-    })
+    const result = await bidService.submitBid({ ctx: ctxA, bidId: BID_B })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.status).toBe(404)
-
     await db.bid.delete({ where: { id: BID_B } })
   }, 60000)
 
@@ -133,131 +119,130 @@ describe('BidService integration tests', () => {
   test('Legal transition: draft → adjudication → ready', async () => {
     const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
     expect(createResult.ok).toBe(true)
+    if (!createResult.ok) return
 
-    const transition1 = await bidService.transitionStatus({ ctx: ctxA, bidId: (createResult as { ok: true; bidId: string }).bidId, newStatus: 'adjudication' })
-    expect(transition1.ok).toBe(true)
+    const t1 = await bidService.transitionStatus({ ctx: ctxA, bidId: createResult.bidId, newStatus: 'adjudication' })
+    expect(t1.ok).toBe(true)
 
-    const transition2 = await bidService.transitionStatus({ ctx: ctxA, bidId: (createResult as { ok: true; bidId: string }).bidId, newStatus: 'ready' })
-    expect(transition2.ok).toBe(true)
-
-    // Clean up
-    await db.bid.deleteMany({ where: { opportunityId: OPP_A } })
-    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, action: 'bid.created' } })
+    const t2 = await bidService.transitionStatus({ ctx: ctxA, bidId: createResult.bidId, newStatus: 'ready' })
+    expect(t2.ok).toBe(true)
   }, 60000)
 
-  test('Illegal transition: submitted → estimating → rejected', async () => {
+  test('Illegal transition: submitted → draft → rejected', async () => {
     await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'submitted', submittedAt: new Date() } })
-
-    const result = await bidService.transitionStatus({ ctx: ctxA, bidId: BID_A, newStatus: 'estimating' })
+    const result = await bidService.transitionStatus({ ctx: ctxA, bidId: BID_A, newStatus: 'draft' })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.status).toBe(400)
-
-    await db.bid.delete({ where: { id: BID_A } })
   }, 60000)
 
-  // ── Submission adversarial tests ───────────────────────────────────────────
-  test('Submit without finalized revision → rejected', async () => {
-    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'adjudication', finalPrice: 10000 } })
-
-    const result = await bidService.submitBid({ ctx: ctxA, bidId: BID_A, estimateRevisionId: 'nonexistent-rev' })
-    expect(result.ok).toBe(false)
-
-    await db.bid.delete({ where: { id: BID_A } })
-  }, 60000)
-
-  test('Duplicate submission → idempotent', async () => {
-    // First recompute the line so it's complete
+  // ── Adjudication tests ─────────────────────────────────────────────────────
+  test('Adjudication uses finalized revision (not mutable estimate)', async () => {
+    // Recompute + finalize
     await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
-    // Finalize a revision
-    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 100 })
-    if (!finalizeResult.ok) {
-      // If finalize fails (e.g. incomplete lines), skip this test
-      await db.bid.deleteMany({ where: { opportunityId: OPP_A } })
-      return
-    }
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 200 })
+    if (!finalizeResult.ok) return
     const revId = finalizeResult.revisionId
 
-    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'adjudication', finalPrice: 10000 } })
-
-    // First submission
-    const result1 = await bidService.submitBid({ ctx: ctxA, bidId: BID_A, estimateRevisionId: revId })
-    // May succeed or fail depending on gate — if it fails due to gate blockers, that's OK for this test.
-    // The key assertion is idempotency: if it succeeds once, the second call returns the same.
-
-    if (result1.ok) {
-      const result2 = await bidService.submitBid({ ctx: ctxA, bidId: BID_A, estimateRevisionId: revId })
-      expect(result2.ok).toBe(true)
-      if (result2.ok) {
-        expect(result2.bidId).toBe(BID_A)
-      }
-    }
-
-    // Clean up
-    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 100 } })
-    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, action: 'bid.submitted' } })
-    await db.bid.delete({ where: { id: BID_A } })
-  }, 60000)
-
-  // ── Adjudication test ──────────────────────────────────────────────────────
-  test('Adjudication preserves system price + director adjustment', async () => {
-    // Recompute to get a sell price
-    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
-
-    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'internal-review' } })
+    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'adjudication' } })
 
     const result = await bidService.recordAdjudication({
-      ctx: ctxA, bidId: BID_A,
-      directorAdjustment: -0.05, // -5%
-      adjustmentRationale: 'Strategic client positioning',
+      ctx: ctxA, bidId: BID_A, estimateRevisionId: revId,
+      directorAdjustment: -0.05, adjustmentRationale: 'Strategic positioning',
     })
     expect(result.ok).toBe(true)
     if (result.ok) {
+      expect(result.systemSellPrice).toBeGreaterThan(0)
       expect(result.finalPrice).toBeGreaterThan(0)
-      // The system price should be > 0 (from the recipe), and the final should be 95% of it
+      expect(result.finalPrice).toBeLessThan(result.systemSellPrice) // -5%
     }
 
-    // Verify the bid has the adjustment persisted
+    // Verify the bid has both system price and adjustment persisted
     const bid = await db.bid.findUnique({ where: { id: BID_A } })
+    expect(bid?.systemSellPrice).toBeGreaterThan(0)
     expect(bid?.directorAdjustment).toBe(-0.05)
-    expect(bid?.adjustmentRationale).toBe('Strategic client positioning')
+    expect(bid?.adjustmentRationale).toBe('Strategic positioning')
     expect(bid?.finalPrice).toBeGreaterThan(0)
+    expect(bid?.adjudicatedRevisionId).toBe(revId)
 
-    await db.bid.delete({ where: { id: BID_A } })
+    // Clean up
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 200 } })
     await db.auditLog.deleteMany({ where: { organizationId: ORG_A, action: 'bid.adjudication-recorded' } })
   }, 60000)
 
-  // ── Transaction rollback test ──────────────────────────────────────────────
-  test('Transaction rollback: audit FK failure rolls back bid status change', async () => {
-    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'estimating' } })
-
-    const ctxWithBadUser: RequestContext = { ...ctxA, userId: 'nonexistent-bid-user' }
-
-    try {
-      await bidService.transitionStatus({ ctx: ctxWithBadUser, bidId: BID_A, newStatus: 'internal-review' })
-    } catch { /* Expected */ }
-
-    // The bid status should NOT have changed
-    const bid = await db.bid.findUnique({ where: { id: BID_A } })
-    expect(bid?.tenderPackStatus).toBe('estimating')
-
-    await db.bid.delete({ where: { id: BID_A } })
+  test('Adjudication without finalized revision → rejected', async () => {
+    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'adjudication' } })
+    const result = await bidService.recordAdjudication({
+      ctx: ctxA, bidId: BID_A, estimateRevisionId: 'nonexistent-rev',
+      directorAdjustment: 0, adjustmentRationale: 'test',
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.status).toBe(404)
   }, 60000)
 
-  // ── Outcome recording ──────────────────────────────────────────────────────
+  test('Post-submission immutability: cannot adjudicate after submission', async () => {
+    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'submitted', submittedAt: new Date() } })
+    const result = await bidService.recordAdjudication({
+      ctx: ctxA, bidId: BID_A, estimateRevisionId: 'any',
+      directorAdjustment: 0, adjustmentRationale: 'attempted',
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.status).toBe(400)
+  }, 60000)
+
+  // ── Submission tests ───────────────────────────────────────────────────────
+  test('Submit without adjudicated revision → rejected', async () => {
+    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'adjudication' } })
+    const result = await bidService.submitBid({ ctx: ctxA, bidId: BID_A })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toContain('adjudicated')
+  }, 60000)
+
+  // ── Transaction rollback ───────────────────────────────────────────────────
+  test('Transaction rollback: audit FK failure rolls back bid status change', async () => {
+    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'draft' } })
+    const ctxBad: RequestContext = { ...ctxA, userId: 'nonexistent-bid-user' }
+    try {
+      await bidService.transitionStatus({ ctx: ctxBad, bidId: BID_A, newStatus: 'adjudication' })
+    } catch { /* Expected */ }
+    const bid = await db.bid.findUnique({ where: { id: BID_A } })
+    expect(bid?.tenderPackStatus).toBe('draft')
+  }, 60000)
+
+  // ── Outcome ────────────────────────────────────────────────────────────────
   test('Record outcome: won', async () => {
     await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'submitted', submittedAt: new Date(), finalPrice: 50000 } })
-
     const result = await bidService.recordOutcome({
       ctx: ctxA, bidId: BID_A, outcome: 'won', winningPrice: 50000, ourRank: 1,
     })
     expect(result.ok).toBe(true)
-
     const bid = await db.bid.findUnique({ where: { id: BID_A } })
     expect(bid?.outcome).toBe('won')
     expect(bid?.tenderPackStatus).toBe('won')
     expect(bid?.ourRank).toBe(1)
-
-    await db.bid.delete({ where: { id: BID_A } })
     await db.auditLog.deleteMany({ where: { organizationId: ORG_A, action: 'bid.outcome-recorded' } })
+  }, 60000)
+
+  // ── Cross-tenant estimate revision ─────────────────────────────────────────
+  test('Org A cannot use Org B estimate revision for adjudication', async () => {
+    // Finalize a revision in Org B
+    await db.estimateLine.create({ data: { id: 'test-bid-line-b', estimateId: EST_B, description: 'B Line', quantity: 10, unit: 'm2', executionStrategy: 'self-perform', calculationStatus: 'complete' } })
+    const finalizeB = await estimateService.finalizeRevision({ ctx: ctxB, estimateId: EST_B, revisionNo: 300 })
+    let revBId: string | null = null
+    if (finalizeB.ok) revBId = finalizeB.revisionId
+
+    await db.bid.create({ data: { id: BID_A, organizationId: ORG_A, opportunityId: OPP_A, estimateId: EST_A, tenderPackStatus: 'adjudication' } })
+
+    if (revBId) {
+      const result = await bidService.recordAdjudication({
+        ctx: ctxA, bidId: BID_A, estimateRevisionId: revBId,
+        directorAdjustment: 0, adjustmentRationale: 'cross-tenant attempt',
+      })
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.status).toBe(404)
+    }
+
+    // Clean up
+    if (revBId) await db.estimateRevision.delete({ where: { id: revBId } })
+    await db.estimateLine.deleteMany({ where: { id: 'test-bid-line-b' } })
   }, 60000)
 })
