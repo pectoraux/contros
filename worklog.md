@@ -734,3 +734,44 @@ Stage Summary:
 - The pricing engine remains pure — the service orchestrates, not calculates.
 - Pattern established for remaining service extractions (OpportunityService,
   SubcontractService, BidService, KnowledgeService).
+
+---
+Task ID: app-service-correction
+Agent: principal-engineer
+Task: Application-service Phase 1 correction — atomic finalizeRevision, repository-only, WD ownership
+
+Work Log:
+- P0-1: finalizeRevision() is now fully transactional. Revision create + audit log
+  are wrapped in db.$transaction. Replay runs BEFORE the transaction — if it fails,
+  the transaction never starts. If audit creation fails, the revision is rolled back.
+- P0-2: finalizeRevision() no longer uses raw Prisma. All data access goes through
+  tenant-aware repositories: estimateRepository.getRevisionContext(),
+  subcontractQuoteRepository.getPackageLineForOrganization(),
+  estimateRevisionRepository.createFinalized(), auditLogRepository.createInTransaction().
+- P0-3: WorkDefinition/Resource ownership hardened. The service verifies
+  wd.organizationId === ctx.organizationId after loading. If a cross-tenant WD is
+  referenced, the service returns 403 — the WD's pricing knowledge is never used.
+- New estimateRevisionRepository with createFinalized() (transaction-scoped) and
+  getLatestRevisionNo().
+- New auditLogRepository.createInTransaction() for transaction-scoped audit creation.
+- 8 integration tests (all passing):
+  1. Org A line + Org B quote → not resolved
+  2. Inverse: Org B line + Org A quote → not resolved
+  3. Org A cannot recompute Org B's line (404)
+  4. Org A cannot finalize Org B's revision (404)
+  5. Same-org recompute works (control)
+  6. Org A line + Org B WorkDefinitionVersion → 403 (cross-tenant WD blocked)
+  7. Failed finalization leaves no revision (transaction rollback proof)
+  8. Successful finalization creates revision + audit atomically
+- 106 unit tests + 8 integration tests = 114 total, all passing.
+- Lint clean. Build succeeds.
+- All four SHAs: 19ce741d6c4e27e28dbbe4ea253cc7815f002f7c
+
+Stage Summary:
+- EstimateService vertical slice now meets the full standard:
+  * recomputeLine: transactional, repository-only, tenant-safe
+  * finalizeRevision: atomic transaction, repository-only, tenant-safe
+  * WorkDefinition/Resource ownership verified
+  * Real cross-tenant tests with actual DB data
+  * Transaction rollback test proves atomicity
+- Ready to use this as the template for remaining service extractions.
