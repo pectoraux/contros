@@ -105,6 +105,9 @@ export async function POST(
         strategy: seg.strategy as 'self-perform' | 'subcontract',
         quantityPct: seg.quantityPct,
         subcontractQuote: segQuote,
+        scopeDefinition: seg.scopeDefinition || undefined,
+        quoteCoversSegmentScope: seg.quoteCoversSegmentScope || undefined,
+        pricingBasis: (seg.pricingBasis as 'direct-segment-quote' | 'proportional-from-package') || undefined,
       })
     }
 

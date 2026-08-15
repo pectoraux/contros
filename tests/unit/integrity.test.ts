@@ -479,3 +479,90 @@ describe('P0-8: auth role validation', () => {
     expect(isValidRole('ESTIMATOR')).toBe(false) // case-sensitive
   })
 })
+
+// ── P0-4: Revision snapshot preserves pricingBasis + quoteCoversSegmentScope ─
+describe('P0-4: revision snapshot preserves hybrid commercial state', () => {
+  test('snapshot captures pricingBasis + quoteCoversSegmentScope, survives mutation', () => {
+    const recipe = [
+      pricedLine({ resourceKind: 'material', resourceName: 'Blocks', quantityPerUnit: 12.5, priceObservation: { price: 6.5, provenance: 'q', observedAt: '2025-01-01' } }),
+    ]
+    const policy = { overheadPct: 0.10, profitPct: 0.12, contingencyPct: 0.05 }
+    const lines = [{
+      lineId: 'l1', description: 'Blockwork', quantity: 1000, unit: 'm2',
+      executionStrategy: 'hybrid' as const,
+      workDefinitionVersion: { id: 'wdv-1', name: 'Blockwork', version: 1, unit: 'm2', wastage: 0.05, productivityRule: 12, costRecipeJson: JSON.stringify(recipe) },
+      executionSegments: [
+        { strategy: 'self-perform' as const, quantityPct: 0.7 },
+        {
+          strategy: 'subcontract' as const,
+          quantityPct: 0.3,
+          scopeDefinition: 'Specialist blockwork at level 3',
+          subcontractQuote: { totalAmount: 500000, coveragePct: 1.0 },
+          quoteCoversSegmentScope: true,
+          pricingBasis: 'direct-segment-quote' as const,
+        },
+      ],
+      subcontractQuote: null,
+    }]
+
+    // Finalize revision 1 with direct-segment-quote (cost = 500000)
+    const snapshotJson = finalizeRevision('est-1', 1, policy, lines)
+    const replay1 = replayRevision(snapshotJson)
+    expect(replay1.ok).toBe(true)
+    if (replay1.ok) {
+      // With direct-segment-quote, subcontract cost is the full 500000
+      expect(replay1.lines[0].breakdown.subcontract).toBe(500000)
+      // The snapshot preserved the pricingBasis
+      const seg = replay1.snapshot.lines[0].executionSegments[1]
+      expect(seg.pricingBasis).toBe('direct-segment-quote')
+      expect(seg.quoteCoversSegmentScope).toBe(true)
+
+      // Now mutate the live segments to proportional-from-package
+      // The snapshot must NOT change — replay still uses direct-segment-quote
+      const mutatedLines = JSON.parse(JSON.stringify(lines))
+      mutatedLines[0].executionSegments[1].pricingBasis = 'proportional-from-package'
+      const mutatedSnapshotJson = finalizeRevision('est-1', 2, policy, mutatedLines)
+      const replay2 = replayRevision(mutatedSnapshotJson)
+      expect(replay2.ok).toBe(true)
+      if (replay2.ok) {
+        // Mutated revision uses proportional: 500000 × 0.3 = 150000
+        expect(replay2.lines[0].breakdown.subcontract).toBe(150000)
+      }
+
+      // Re-replay the ORIGINAL snapshot — it must still use direct-segment-quote
+      const replay1Again = replayRevision(snapshotJson)
+      expect(replay1Again.ok).toBe(true)
+      if (replay1Again.ok) {
+        expect(replay1Again.lines[0].breakdown.subcontract).toBe(500000)
+        expect(replay1Again.snapshot.lines[0].executionSegments[1].pricingBasis).toBe('direct-segment-quote')
+      }
+    }
+  })
+
+  test('snapshot with proportional-from-package preserves the basis', () => {
+    const recipe = [pricedLine({ resourceKind: 'material', resourceName: 'Blocks', quantityPerUnit: 12.5, priceObservation: { price: 6.5, provenance: 'q', observedAt: '2025-01-01' } })]
+    const lines = [{
+      lineId: 'l1', description: 'Blockwork', quantity: 1000, unit: 'm2',
+      executionStrategy: 'hybrid' as const,
+      workDefinitionVersion: { id: 'wdv-1', name: 'Blockwork', version: 1, unit: 'm2', wastage: 0.05, costRecipeJson: JSON.stringify(recipe) },
+      executionSegments: [
+        { strategy: 'self-perform' as const, quantityPct: 0.7 },
+        {
+          strategy: 'subcontract' as const,
+          quantityPct: 0.3,
+          subcontractQuote: { totalAmount: 500000, coveragePct: 1.0 },
+          quoteCoversSegmentScope: true,
+          pricingBasis: 'proportional-from-package' as const,
+        },
+      ],
+      subcontractQuote: null,
+    }]
+    const snapshotJson = finalizeRevision('est-1', 1, { overheadPct: 0.1, profitPct: 0.12, contingencyPct: 0.05 }, lines)
+    const replay = replayRevision(snapshotJson)
+    expect(replay.ok).toBe(true)
+    if (replay.ok) {
+      expect(replay.lines[0].breakdown.subcontract).toBe(150000) // 500000 × 0.3
+      expect(replay.snapshot.lines[0].executionSegments[1].pricingBasis).toBe('proportional-from-package')
+    }
+  })
+})

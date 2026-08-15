@@ -146,6 +146,8 @@ export async function GET(
             scopeDefinition: seg.scopeDefinition,
             quantityPct: seg.quantityPct,
             subcontractQuoteId: seg.subcontractQuoteId,
+            pricingBasis: seg.pricingBasis,
+            quoteCoversSegmentScope: seg.quoteCoversSegmentScope,
           })),
           scopeItem: l.scopeItem
             ? { id: l.scopeItem.id, description: l.scopeItem.description, status: l.scopeItem.status }

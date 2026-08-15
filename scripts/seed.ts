@@ -1614,6 +1614,9 @@ async function createEstimateLine(
           // MVP: no real SubcontractQuote row linked — mock quote passed to
           // priceLine only. Persisted as null so the gate surfaces it for review.
           subcontractQuoteId: null,
+          // P0-1/P0-2: Persist the commercial decision so it's reproducible.
+          pricingBasis: seg.strategy === 'subcontract' ? 'proportional-from-package' : null,
+          quoteCoversSegmentScope: seg.strategy === 'subcontract' ? true : false,
         },
       });
     }

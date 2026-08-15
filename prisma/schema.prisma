@@ -380,6 +380,10 @@ model ExecutionSegment {
   scopeDefinition String
   quantityPct   Float    @default(1.0) // 0..1 share of the line's quantity
   subcontractQuoteId String?
+  // P0-1/P0-2: Persisted commercial state — the pricing engine consumes these.
+  // Without them, the commercial decision is ephemeral and not reproducible.
+  pricingBasis  String?  // direct-segment-quote | proportional-from-package
+  quoteCoversSegmentScope Boolean @default(false) // approved reconciliation result
   createdAt     DateTime @default(now())
 
   estimateLine  EstimateLine @relation(fields: [estimateLineId], references: [id])
