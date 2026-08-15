@@ -498,3 +498,29 @@ Stage Summary:
   - UI: render `semanticCoveragePct` vs `economicCoveragePct` side-by-side in the subcontract reconciliation table (they differ when weights are unequal). Surface `uncoveredSubcontractExposure` as a red banner on estimate lines where > 0.
   - UI: add a "Finalize Revision" button on the Estimate tab that POSTs to `/api/estimates/[id]/finalize-revision`, then links the resulting revisionId to the Bid.
   - Optional: add a `/api/estimates/[id]/revisions/[revisionId]/replay` GET endpoint that calls `replayRevision(snapshotJson)` and returns the replay totals — useful for verifying immutability in the UI.
+
+---
+Task ID: final-integrity-complete
+Agent: principal-engineer
+Task: Final commercial integrity pass — P0-1 through P0-8, deployment, verification
+
+Work Log:
+- P0-1: Separated semantic coverage (atom count) from economic coverage (value weight). ScopeAtom.valueWeight field added. economicCoveragePct = Σ(covered weights)/Σ(all weights). Falls back to semantic when weights are 0. Primary coveragePct uses economic. Verified on Vercel: VoltTech shows "Coverage 45%" (economic) with "Semantic coverage 29% differs from economic coverage 45%" warning.
+- P0-2: Invalid price observations (NaN, Infinity, -Infinity, negative) are now blocking inputs with kind 'invalid-price-observation', NEVER coerced to zero. Invalid quantities, wastage, and percentages also blocked. Tests cover all cases.
+- P0-3: Hardened hybrid validation — segments must be 0..1, sum to 1.0, contain at least one self-perform AND one subcontract segment. New blocking kinds: 'invalid-hybrid-segment', 'hybrid-missing-strategy'. Tests verify all invalid states.
+- P0-4: Subcontract pricing vs coverage — a partial quote (coveragePct < 1) is NOT silently treated as full segment price. New 'partial-subcontract-coverage' blocking input. New uncoveredSubcontractExposure field in PricingBreakdown. Tests verify exposure calculation.
+- P0-5: Domain validation at engine level — negative prices/quantities/percentages rejected.
+- P0-6: Estimate revision reproducibility — new revision-service.ts with finalizeRevision() and replayRevision(). Integration test proves: finalize → mutate prices/WD/quotes → replay → exact same commercial result.
+- P0-7: Bid submission invariant — validateBidSubmission() enforces estimateRevisionId required, revision finalized, estimate not draft, finalPrice set. New /api/estimates/[id]/finalize-revision endpoint.
+- P0-8: Auth hardening — NEXTAUTH_SECRET mandatory in production (fails fast if missing/< 16 chars). Role validated at runtime via isValidRole(). Unknown roles normalized to 'estimator'.
+- New: 28 integrity tests (71 total, all passing). Lint clean. Build succeeds.
+- Pushed to GitHub (commit 0c14985). Vercel deployed (dpl_41ZoYoGN13WisPMrH7NcERqRb7u6, READY).
+- Verified on Vercel: 401 on unauthenticated API calls, auth screen renders, login works, subcontract tab shows economic vs semantic coverage, tender pack gate shows BLOCKER with Incomplete Calculations check.
+
+Stage Summary:
+- All P0 issues from the reviewer's final integrity pass are fixed and verified on production.
+- 71 tests pass (43 existing + 28 new integrity tests).
+- The commercial engine can no longer produce misleading estimates through: invalid prices, hybrid heuristics, partial subcontract coverage, or semantic/economic coverage conflation.
+- Estimate revisions are provably reproducible.
+- Auth is production-safe (mandatory secret, runtime role validation).
+- Remaining P1 items (application services layer, structured WorkDefinition knowledge, document bindings) are deferred to the next phase per the reviewer's instruction.
