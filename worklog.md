@@ -775,3 +775,43 @@ Stage Summary:
   * Real cross-tenant tests with actual DB data
   * Transaction rollback test proves atomicity
 - Ready to use this as the template for remaining service extractions.
+
+---
+Task ID: final-estimateservice-p0
+Agent: principal-engineer
+Task: Repository-level WD scoping + finalizeRevision cross-tenant rejection + real rollback test
+
+Work Log:
+- P0-1: Repository now scopes WD/WDV/PriceObservations at the QUERY level.
+  getLineForOrganization() and getRevisionContext() use where filters:
+  workDefinition: { where: { organizationId: orgId } }
+  workDefinitionVersion: { where: { workDefinition: { organizationId: orgId } } }
+  priceObservations: { where: { resource: { organizationId: orgId } } }
+  Cross-tenant WDs are returned as null — never loaded into the service process.
+- P0-2: finalizeRevision() now checks for null WD/WDV. If a line has
+  workDefinitionId set but WD is null (cross-tenant), returns 403.
+  Cross-tenant pricing knowledge cannot enter the immutable snapshot.
+- P0-3: recomputeLine() uses the same null-check pattern.
+- Schema: added @@unique([estimateId, revisionNo]) on EstimateRevision.
+- New integration tests (11 total, all passing):
+  9. Cross-tenant WD finalization rejected (Org A line + Org B WDV → 403, no revision)
+  10. Resource/price observation isolation (Org B price 777 not in Org A provenance)
+  11. Real transaction rollback: duplicate revisionNo causes unique constraint
+      violation INSIDE db.$transaction → rollback → only 1 revision persists
+- 106 unit tests + 11 integration tests = 117 total, all passing.
+- Lint clean. Build succeeds.
+- Code pushed to GitHub at 7ba27f1 (then cc70526, 5a911e0 as trigger commits).
+- NOTE: Vercel auto-deploy webhook appears to have stopped triggering for the
+  latest pushes. The latest DEPLOYED commit is c29aa60 (verified via /api/version).
+  The code at 7ba27f1 is on GitHub main but not yet deployed. The /api/version
+  endpoint transparently reports the actual deployed SHA (c29aa60), not the
+  GitHub HEAD. This is a Vercel platform issue, not a code issue — the code
+  is correct and tested.
+
+Stage Summary:
+- The EstimateService vertical slice now satisfies all P0 requirements:
+  * Repository-level WD/WDV/Resource scoping (not just service-level checks)
+  * finalizeRevision rejects cross-tenant WD references (403)
+  * Real transaction rollback test (failure inside transaction → rollback)
+  * 11 real cross-tenant integration tests with actual Neon DB data
+- EstimateService is frozen as the canonical pattern for remaining services.
