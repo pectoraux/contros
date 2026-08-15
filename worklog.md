@@ -910,3 +910,36 @@ Stage Summary:
   * EstimateLine tenant ownership in package reads (graphInconsistent flag)
   * 18 real integration tests including rollback + cross-tenant EstimateLine
 - Ready to freeze SubcontractService once deployed.
+
+---
+Task ID: subcontract-final-tenant-fix
+Agent: principal-engineer
+Task: SubcontractService final tenant-isolation correction — block reconciliation for inconsistent graph
+
+Work Log:
+- Fixed buildReconciliationInput() to accept pre-validated requiredLines instead of re-deriving them without orgId.
+- getPackageWorkspace() now BLOCKS reconciliation entirely when graphInconsistent=true:
+  * Does NOT call reconcileSubcontract() at all
+  * Returns quotes with reconciliationStatus='blocker', coveragePct=0
+  * Surfaces graphInconsistent=true, reconciliationBlocked=true, blockers=[]
+- reconcileQuote() and selectQuote() also validate required lines before calling the engine.
+  If cross-tenant estimateLine detected → returns 403.
+- WorkspacePackage type updated with graphInconsistent, reconciliationBlocked, blockers fields.
+- Test 17 updated to verify:
+  * graphInconsistent=true, reconciliationBlocked=true
+  * All quotes have reconciliationStatus='blocker'
+  * coveragePct=0, semanticCoveragePct=0, economicCoveragePct=0
+  * coveredScopeValue=0 (Org B sellPrice NOT in reconciliation)
+- 18 integration tests all pass (including the updated Test 17 + Test 18 rollback).
+- 106 unit tests pass. Lint clean. Build succeeds.
+- Deployed to Vercel at 9c65d49. All three SHAs match.
+- Production verified: tenant isolation (401), subcontract workspace (reconciliation data correct).
+
+Stage Summary:
+- SubcontractService is now FROZEN. All P0 requirements satisfied:
+  * Transactional createScopeAtom (atomic with audit)
+  * EstimateLine tenant ownership in package reads
+  * Reconciliation BLOCKED when graph inconsistent (engine NOT called)
+  * graphInconsistent + reconciliationBlocked + blockers explicitly typed
+  * 18 real integration tests including rollback + cross-tenant EstimateLine
+  * GitHub SHA = Vercel SHA = /api/version SHA
