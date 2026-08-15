@@ -656,3 +656,38 @@ Stage Summary:
 - The database model and the commercial engine model are now aligned — no divergence.
 - pricingBasis and quoteCoversSegmentScope are persisted, serialized, snapshotted, and replayed.
 - The commercial foundation is frozen. Ready for the application-service layer.
+
+---
+Task ID: tenant-safe-dereferencing
+Agent: principal-engineer
+Task: P0 — tenant-safe subcontract quote dereferencing
+
+Work Log:
+- Found unscoped db.subcontractQuote.findUnique in price-line and finalize-revision
+  routes. The foreign key reference (seg.subcontractQuoteId) was trusted without
+  verifying the quote belongs to the same organization.
+- Fixed both routes: now uses findFirst with org scoping via the ownership chain:
+  subcontractQuote → subcontractPackage → opportunity → organizationId.
+- Also added org scoping to subcontractPackageLine lookups in both routes
+  (defense-in-depth).
+- Audited ALL findUnique/findFirst calls across all API routes — no other
+  unscoped lookups on org-owned entities remain.
+- Added 6 tenant-safety tests:
+  * Source-code audit: scans all API route files for unscoped findUnique on
+    any of 21 org-owned entity types. Fails if any found.
+  * price-line route: subcontract quote lookup is org-scoped
+  * finalize-revision route: subcontract quote lookup is org-scoped
+  * Both routes: subcontractPackageLine lookups are org-scoped
+  * Behavioral test documenting the cross-tenant prevention invariant
+- 107 tests pass. Lint clean. Build succeeds.
+- All four SHAs verified EXACTLY matching:
+  LOCAL: 692c1114631aa8ed1494cc30e05f43fa1559f9eb
+  GitHub: 692c1114631aa8ed1494cc30e05f43fa1559f9eb
+  Vercel: 692c1114631aa8ed1494cc30e05f43fa1559f9eb
+  /api/version: 692c1114631aa8ed1494cc30e05f43fa1559f9eb
+
+Stage Summary:
+- The tenant isolation gap in nested dereferences is closed.
+- A foreign key reference from Org A to Org B's quote is no longer trusted.
+- The source-code audit test will catch future regressions automatically.
+- Ready to proceed to the application-service layer.
