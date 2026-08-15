@@ -331,7 +331,7 @@ describe('DocumentService integration tests', () => {
     await db.estimate.delete({ where: { id: estimate.id } })
   }, 30000)
 
-  test('markReady updates TenderDeliverable status to ready', async () => {
+  test('markReady updates TenderDeliverable status to ready (requires finalized version)', async () => {
     const estimate = await db.estimate.create({
       data: { id: 'test-doc-est-ready', organizationId: ORG_A, opportunityId: OPP_A, status: 'draft' },
     })
@@ -342,12 +342,16 @@ describe('DocumentService integration tests', () => {
       data: { bidId: bid.id, kind: 'boq', required: true, status: 'missing' },
     })
 
-    // Save a draft (don't finalize)
+    // Save a draft + finalize (markReady requires a finalized version)
     const saveResult = await documentService.saveDraft({
       ctx: ctxA, opportunityId: OPP_A, kind: 'boq',
       content: '# BOQ draft',
     })
     if (!saveResult.ok) return
+    const finalizeResult = await documentService.finalizeVersion({
+      ctx: ctxA, documentId: saveResult.documentId,
+    })
+    if (!finalizeResult.ok) return
 
     // Mark as ready
     const readyResult = await documentService.markReady({
@@ -356,18 +360,120 @@ describe('DocumentService integration tests', () => {
     expect(readyResult.ok).toBe(true)
     if (!readyResult.ok) return
     expect(readyResult.deliverableUpdated).toBe(true)
+    expect(readyResult.revisionId).toBe(finalizeResult.versionId)
 
     // Verify the TenderDeliverable
     const deliverable = await db.tenderDeliverable.findFirst({
       where: { bidId: bid.id, kind: 'boq' },
     })
     expect(deliverable?.status).toBe('ready')
+    expect(deliverable?.revisionId).toBe(finalizeResult.versionId)
 
     // Cleanup
     await db.tenderDeliverable.deleteMany({ where: { bidId: bid.id } })
     await db.bid.delete({ where: { id: bid.id } })
     await db.estimate.delete({ where: { id: estimate.id } })
   }, 30000)
+
+  test('markReady rejects when no finalized version exists', async () => {
+    // Save a draft only (don't finalize)
+    const saveResult = await documentService.saveDraft({
+      ctx: ctxA, opportunityId: OPP_A, kind: 'cover-letter',
+      content: 'Draft only, not finalized',
+    })
+    if (!saveResult.ok) return
+
+    const result = await documentService.markReady({
+      ctx: ctxA, documentId: saveResult.documentId,
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(400)
+      expect(result.error).toContain('no finalized version')
+    }
+  }, 30000)
+
+  // ── FROZEN INVARIANT: Post-ready mutation safety ──────────────────────────
+
+  test('FROZEN INVARIANT: draft edits after markReady cannot change the ready snapshot', async () => {
+    // Setup: create a bid + deliverable for this opportunity
+    const estimate = await db.estimate.create({
+      data: { id: 'test-doc-est-inv', organizationId: ORG_A, opportunityId: OPP_A, status: 'draft' },
+    })
+    const bid = await db.bid.create({
+      data: { id: 'test-doc-bid-inv', organizationId: ORG_A, opportunityId: OPP_A, estimateId: estimate.id, tenderPackStatus: 'draft' },
+    })
+    await db.tenderDeliverable.create({
+      data: { bidId: bid.id, kind: 'method-statement', required: true, status: 'missing' },
+    })
+
+    // 1. Save a draft + finalize (version 1)
+    const saveResult = await documentService.saveDraft({
+      ctx: ctxA, opportunityId: OPP_A, kind: 'method-statement',
+      content: 'Version 1 — original method statement',
+      sourceProvenance: { wdvIds: ['wdv-1', 'wdv-2'] },
+    })
+    if (!saveResult.ok) return
+    const finalizeResult = await documentService.finalizeVersion({
+      ctx: ctxA, documentId: saveResult.documentId,
+    })
+    if (!finalizeResult.ok) return
+    const readyVersionId = finalizeResult.versionId
+
+    // 2. Mark as ready — captures revisionId = finalized version
+    const readyResult = await documentService.markReady({
+      ctx: ctxA, documentId: saveResult.documentId,
+    })
+    if (!readyResult.ok) return
+    expect(readyResult.revisionId).toBe(readyVersionId)
+
+    // 3. Capture the snapshot content at the "ready" point
+    const readyVersion = await db.documentVersion.findUnique({ where: { id: readyVersionId } })
+    const readySnapshot = JSON.parse(readyVersion?.snapshotJson ?? '{}')
+    expect(readySnapshot.content).toBe('Version 1 — original method statement')
+
+    // 4. Now edit the document — save a NEW draft (version 2)
+    const editResult = await documentService.saveDraft({
+      ctx: ctxA, opportunityId: OPP_A, kind: 'method-statement',
+      content: 'Version 2 — TAMPERED content that should NOT affect the ready snapshot',
+    })
+    if (!editResult.ok) return
+    expect(editResult.revisionNo).toBe(2) // new draft version
+
+    // 5. INVARIANT CHECK: TenderDeliverable.revisionId must NOT have changed
+    const deliverableAfter = await db.tenderDeliverable.findFirst({
+      where: { bidId: bid.id, kind: 'method-statement' },
+    })
+    expect(deliverableAfter?.revisionId).toBe(readyVersionId) // still version 1!
+    expect(deliverableAfter?.status).toBe('ready') // still ready
+
+    // 6. INVARIANT CHECK: The finalized version's snapshot must NOT have changed
+    const readyVersionAfter = await db.documentVersion.findUnique({ where: { id: readyVersionId } })
+    const readySnapshotAfter = JSON.parse(readyVersionAfter?.snapshotJson ?? '{}')
+    expect(readySnapshotAfter.content).toBe('Version 1 — original method statement')
+    expect(readySnapshotAfter.content).not.toContain('TAMPERED')
+
+    // 7. INVARIANT CHECK: document.currentVersionId must NOT have changed
+    // (only finalizeVersion changes it, not saveDraft)
+    const docAfter = await db.document.findUnique({ where: { id: saveResult.documentId } })
+    expect(docAfter?.currentVersionId).toBe(readyVersionId) // still version 1!
+
+    // 8. The new draft (version 2) IS editable — but it's a separate version
+    const draftVersion = await db.documentVersion.findFirst({
+      where: {
+        documentId: saveResult.documentId,
+        revisionNo: 2,
+      },
+    })
+    expect(draftVersion?.status).toBe('draft')
+    const draftSnapshot = JSON.parse(draftVersion?.snapshotJson ?? '{}')
+    expect(draftSnapshot.content).toContain('TAMPERED')
+
+    // Cleanup
+    await db.tenderDeliverable.deleteMany({ where: { bidId: bid.id } })
+    await db.bid.delete({ where: { id: bid.id } })
+    await db.estimate.delete({ where: { id: estimate.id } })
+  }, 45000)
 
   // ── Version history ──────────────────────────────────────────────────────
 

@@ -359,10 +359,30 @@ export const documentService = {
    * a tender pack but may still be edited. The BidService submission gate
    * accepts both 'ready' and 'finalized' for document-backed deliverables.
    *
+   * FROZEN INVARIANT — Post-ready mutation safety:
+   *
+   *   `markReady()` requires at least one FINALIZED DocumentVersion to exist
+   *   (i.e., `document.currentVersionId` must be non-null). The "ready"
+   *   state always references a specific immutable snapshot via
+   *   `TenderDeliverable.revisionId = document.currentVersionId`.
+   *
+   *   After `markReady()`, the user may call `saveDraft()` to create a NEW
+   *   draft version. This does NOT change `document.currentVersionId` (only
+   *   `finalizeVersion()` changes it) and does NOT change
+   *   `TenderDeliverable.revisionId`. The snapshot referenced by the
+   *   "ready" state is therefore immutable — later draft edits cannot
+   *   retroactively alter the content that the Bid submission gate
+   *   considers ready for submission.
+   *
+   *   If the user wants to update the "ready" snapshot, they must:
+   *     1. `saveDraft()` (creates a new draft)
+   *     2. `finalizeVersion()` (freezes the new draft, updates currentVersionId)
+   *     3. `markReady()` again (re-captures the new currentVersionId)
+   *
    * Updates the linked TenderDeliverable.status → 'ready' (if a bid exists).
    * Transactional with audit.
    */
-  async markReady(input: MarkReadyInput): Promise<{ ok: true; deliverableUpdated: boolean } | Err> {
+  async markReady(input: MarkReadyInput): Promise<{ ok: true; deliverableUpdated: boolean; revisionId: string | null } | Err> {
     const { ctx, documentId } = input
 
     try {
@@ -374,9 +394,13 @@ export const documentService = {
           throw new Error('DOCUMENT_NOT_FOUND')
         }
 
-        // Can only mark as ready if there's at least one version (draft or finalized)
-        if (document.versions.length === 0) {
-          throw new Error('NO_VERSIONS')
+        // FROZEN INVARIANT: markReady requires a finalized version.
+        // The "ready" state must reference an immutable snapshot via
+        // currentVersionId. If no version is finalized, the user must
+        // finalize first — this prevents the ambiguous state where
+        // "ready" references a mutable draft (or null).
+        if (!document.currentVersionId) {
+          throw new Error('NO_FINALIZED_VERSION')
         }
 
         // Update document status
@@ -384,7 +408,10 @@ export const documentService = {
           status: 'ready',
         })
 
-        // Update the linked TenderDeliverable (if a bid exists)
+        // Update the linked TenderDeliverable (if a bid exists).
+        // revisionId = currentVersionId (the finalized, immutable version).
+        // Subsequent saveDraft() calls do NOT change currentVersionId or
+        // this revisionId — the snapshot is frozen.
         const deliverableUpdated = await tenderDeliverableLinkRepository.updateForOpportunityKindInTransaction(
           tx, ctx.organizationId, document.opportunityId, document.kind,
           { status: 'ready', revisionId: document.currentVersionId },
@@ -394,14 +421,15 @@ export const documentService = {
           action: 'document.marked-ready',
           entityType: 'Document',
           entityId: documentId,
-          summary: `Document marked ready: kind=${document.kind}`,
+          summary: `Document marked ready: kind=${document.kind}, revisionId=${document.currentVersionId}`,
           afterJson: JSON.stringify({
             kind: document.kind,
             deliverableUpdated,
+            revisionId: document.currentVersionId,
           }),
         })
 
-        return { deliverableUpdated }
+        return { deliverableUpdated, revisionId: document.currentVersionId }
       })
 
       return { ok: true, ...result }
@@ -410,8 +438,8 @@ export const documentService = {
         if (e.message === 'DOCUMENT_NOT_FOUND') {
           return { ok: false, error: 'Document not found', status: 404 }
         }
-        if (e.message === 'NO_VERSIONS') {
-          return { ok: false, error: 'Cannot mark as ready — document has no versions. Save a draft first.', status: 400 }
+        if (e.message === 'NO_FINALIZED_VERSION') {
+          return { ok: false, error: 'Cannot mark as ready — no finalized version exists. Finalize a version first to create an immutable snapshot.', status: 400 }
         }
       }
       throw e

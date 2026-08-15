@@ -1353,3 +1353,44 @@ Stage Summary:
   WITHOUT modifying BidService.
 - Five application services: EstimateService (FROZEN), SubcontractService (FROZEN),
   BidService (FROZEN), OpportunityService (FROZEN), DocumentService (code-complete).
+
+---
+Task ID: document-service-hardening
+Agent: principal-engineer
+Task: DocumentService hardening — post-ready mutation invariant
+
+Work Log:
+- FROZEN INVARIANT: markReady() now requires a finalized DocumentVersion to exist.
+  Previously, markReady() accepted any version (including drafts), which meant
+  TenderDeliverable.revisionId could be null — the "ready" state would reference
+  no immutable snapshot. Subsequent draft edits could change the in-place draft
+  content with no frozen version protecting what the gate considers "ready".
+- Fix: markReady() checks document.currentVersionId !== null. If no version is
+  finalized, returns 400 with "Finalize a version first to create an immutable
+  snapshot." This ensures the "ready" state ALWAYS references a specific
+  immutable DocumentVersion via TenderDeliverable.revisionId.
+- Post-ready mutation safety proven by adversarial test:
+  1. saveDraft + finalize (version 1, currentVersionId = v1)
+  2. markReady (TenderDeliverable.revisionId = v1, status = 'ready')
+  3. saveDraft again (creates version 2 draft, currentVersionId stays = v1)
+  4. Assert: TenderDeliverable.revisionId still = v1 (unchanged)
+  5. Assert: version 1's snapshotJson unchanged (immutable)
+  6. Assert: document.currentVersionId still = v1 (saveDraft doesn't change it)
+  7. Assert: version 2 draft IS editable (separate version, doesn't affect v1)
+- Added explicit FROZEN INVARIANT documentation in markReady() service header.
+- Updated existing markReady test to finalize first (now required).
+- Added "markReady rejects when no finalized version exists" test.
+- markReady() now returns revisionId in its result (for caller visibility).
+
+Verification:
+- 16 integration tests pass (0 fail) — 14 original + 2 new.
+- 106 unit tests pass (0 fail).
+- Lint clean.
+
+Stage Summary:
+- DocumentService now satisfies the post-ready mutation invariant:
+  * The "ready" state always references an immutable snapshot.
+  * Draft edits after markReady cannot change the ready snapshot.
+  * The snapshot is frozen until the user explicitly re-finalizes + re-marks-ready.
+- Five application services: EstimateService (FROZEN), SubcontractService (FROZEN),
+  BidService (FROZEN), OpportunityService (FROZEN), DocumentService (FROZEN).
