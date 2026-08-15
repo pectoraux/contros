@@ -464,8 +464,8 @@ describe('Cross-tenant integration tests', () => {
     }
   }, 60000)
 
-  // ── Test 11: Real transaction rollback (failure after revision creation) ──
-  test('Transaction rollback: failure after revision creation leaves no extra revision', async () => {
+  // ── Test 11: Duplicate revision number rejected (unique constraint) ──────
+  test('Duplicate revision number → rejected, no duplicate created', async () => {
     // Ensure LINE_A is complete.
     await estimateService.recomputeLine({
       ctx: ctxA,
@@ -473,50 +473,86 @@ describe('Cross-tenant integration tests', () => {
       estimateLineId: LINE_A,
     })
 
-    // First, successfully create a revision at revisionNo=666.
+    // Create a revision at revisionNo=555.
     const firstResult = await estimateService.finalizeRevision({
       ctx: ctxA,
       estimateId: EST_A,
-      revisionNo: 666,
+      revisionNo: 555,
     })
     expect(firstResult.ok).toBe(true)
 
-    // Count revisions before the second attempt.
-    const revisionsBefore = await db.estimateRevision.count({
-      where: { estimateId: EST_A, revisionNo: 666 },
-    })
-    expect(revisionsBefore).toBe(1)
-
-    // Now try to finalize again with the same revisionNo. The transaction
-    // will attempt to INSERT a duplicate revision. If there's a unique
-    // constraint, the INSERT fails inside the transaction → rollback.
-    // If there's no unique constraint, two revisions would be created —
-    // but the test verifies the count stays at 1.
+    // Try to create another with the same revisionNo.
     try {
       await estimateService.finalizeRevision({
         ctx: ctxA,
         estimateId: EST_A,
-        revisionNo: 666,
+        revisionNo: 555,
       })
     } catch {
-      // Expected — the transaction may throw on constraint violation.
+      // Expected — unique constraint violation.
     }
 
-    // Verify only ONE revision with revisionNo=666 exists (the first one).
-    // If the transaction rolled back, the second insert didn't persist.
-    const revisionsAfter = await db.estimateRevision.count({
-      where: { estimateId: EST_A, revisionNo: 666 },
+    // Only one revision should exist.
+    const count = await db.estimateRevision.count({
+      where: { estimateId: EST_A, revisionNo: 555 },
     })
-    expect(revisionsAfter).toBe(1)
+    expect(count).toBe(1)
 
     // Clean up.
-    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 666 } })
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 555 } })
     await db.auditLog.deleteMany({
-      where: {
-        organizationId: ORG_A,
-        action: 'estimate.revision-finalized',
-        summary: { contains: 'revision 666' },
-      },
+      where: { organizationId: ORG_A, action: 'estimate.revision-finalized', summary: { contains: 'revision 555' } },
     })
+  }, 60000)
+
+  // ── Test 12: Real post-insert rollback (audit fails AFTER revision succeeds) ─
+  test('Post-insert rollback: audit INSERT failure rolls back the revision', async () => {
+    // Ensure LINE_A is complete.
+    await estimateService.recomputeLine({
+      ctx: ctxA,
+      estimateId: EST_A,
+      estimateLineId: LINE_A,
+    })
+
+    // Create a context with a non-existent userId. The service will pass
+    // its earlier validation (it doesn't check userId existence), but the
+    // tx.auditLog.create() will fail because AuditLog.actorId has a FK
+    // constraint to User.id.
+    const ctxWithBadUser: RequestContext = {
+      ...ctxA,
+      userId: 'nonexistent-user-id-that-does-not-exist',
+    }
+
+    // Count before.
+    const revisionsBefore = await db.estimateRevision.count({
+      where: { estimateId: EST_A, revisionNo: 444 },
+    })
+    expect(revisionsBefore).toBe(0)
+
+    // Attempt finalization with the bad user. The revision INSERT will
+    // succeed inside the transaction, but the audit INSERT will fail
+    // (FK violation on actorId). The transaction must roll back.
+    try {
+      await estimateService.finalizeRevision({
+        ctx: ctxWithBadUser,
+        estimateId: EST_A,
+        revisionNo: 444,
+      })
+    } catch {
+      // Expected — the FK violation causes the transaction to fail.
+    }
+
+    // CRITICAL: The revision must NOT exist. If the transaction rolled back
+    // properly, the revision INSERT was undone.
+    const revisionsAfter = await db.estimateRevision.count({
+      where: { estimateId: EST_A, revisionNo: 444 },
+    })
+    expect(revisionsAfter).toBe(0)
+
+    // Also verify no audit log was created.
+    const auditAfter = await db.auditLog.count({
+      where: { organizationId: ORG_A, summary: { contains: 'revision 444' } },
+    })
+    expect(auditAfter).toBe(0)
   }, 60000)
 })
