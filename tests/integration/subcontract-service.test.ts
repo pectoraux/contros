@@ -105,6 +105,8 @@ async function cleanupOrgData() {
     await db.subcontractPackageLine.deleteMany({
       where: { subcontractPackageId: { in: packageIds } },
     })
+    // Also clean up any cross-tenant test line by ID (may persist from prior runs).
+    await db.subcontractPackageLine.deleteMany({ where: { id: 'test-sc-cross-tenant-line' } })
     await db.subcontractPackage.deleteMany({
       where: { id: { in: packageIds } },
     })
@@ -842,5 +844,91 @@ describe('SubcontractService integration tests', () => {
       quoteId: newQuoteId,
     })
     expect(selectResult.ok).toBe(true)
+  }, 60000)
+
+  // ── Test 17: Cross-tenant EstimateLine in package workspace ──────────────
+  test('Org A package with Org B EstimateLine → graphInconsistent flagged, Org B sellPrice not used', async () => {
+    // Manually create a SubcontractPackageLine in Org A's package that
+    // references Org B's EstimateLine (simulating a corrupt/malformed reference).
+    await db.subcontractPackageLine.create({
+      data: {
+        id: 'test-sc-cross-tenant-line',
+        subcontractPackageId: PKG_A,
+        estimateLineId: LINE_B, // Org B's estimate line!
+        requiredScope: 'Cross-tenant reference',
+      },
+    })
+
+    // Get the workspace as Org A.
+    const result = await subcontractService.getPackageWorkspace({
+      ctx: ctxA,
+      opportunityId: OPP_A,
+    })
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      const pkg = result.packages.find((p) => p.id === PKG_A)
+      expect(pkg).toBeDefined()
+      if (pkg) {
+        // P0-2: The workspace must flag the inconsistent graph.
+        expect(pkg.graphInconsistent).toBe(true)
+        // Org B's sellPrice must NOT appear in requiredScopeValue.
+        // LINE_B has no sellPrice set (0), so requiredScopeValue should be 0
+        // from this line — not Org B's actual sell price.
+        const crossTenantLine = pkg.requiredLines.find((l) => l.id === LINE_B)
+        if (crossTenantLine) {
+          expect(crossTenantLine.sellPrice).toBe(0) // not Org B's sellPrice
+        }
+      }
+    }
+
+    // Clean up.
+    await db.subcontractPackageLine.deleteMany({ where: { id: 'test-sc-cross-tenant-line' } })
+  }, 60000)
+
+  // ── Test 18: Scope atom transaction rollback ────────────────────────────
+  test('Scope atom transaction rollback: audit FK failure rolls back the scope atom', async () => {
+    // Use a context with a non-existent userId — the scope atom INSERT will
+    // succeed inside the transaction, but the audit INSERT will fail
+    // (FK constraint: AuditLog.actorId → User.id).
+    const ctxWithBadUser: RequestContext = {
+      ...ctxA,
+      userId: 'nonexistent-sc-user-id',
+    }
+
+    // Count scope atoms before.
+    const atomsBefore = await db.scopeAtom.count({
+      where: { subcontractPackageId: PKG_A, name: 'Rollback Test Atom' },
+    })
+    expect(atomsBefore).toBe(0)
+
+    // Attempt to create a scope atom with the bad user.
+    try {
+      await subcontractService.createScopeAtom({
+        ctx: ctxWithBadUser,
+        packageId: PKG_A,
+        name: 'Rollback Test Atom',
+        valueWeight: 0.1,
+      })
+    } catch {
+      // Expected — the FK violation causes the transaction to fail.
+    }
+
+    // CRITICAL: The scope atom must NOT exist. If the transaction rolled back
+    // properly, the scope atom INSERT was undone.
+    const atomsAfter = await db.scopeAtom.count({
+      where: { subcontractPackageId: PKG_A, name: 'Rollback Test Atom' },
+    })
+    expect(atomsAfter).toBe(0)
+
+    // Also verify no audit log was created.
+    const auditAfter = await db.auditLog.count({
+      where: {
+        organizationId: ORG_A,
+        action: 'subcontract.scope-atom-created',
+        summary: { contains: 'Rollback Test Atom' },
+      },
+    })
+    expect(auditAfter).toBe(0)
   }, 60000)
 })

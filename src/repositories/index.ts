@@ -249,7 +249,12 @@ export const subcontractQuoteRepository = {
         subcontractPackage: {
           include: {
             scopeAtoms: true,
-            lines: { include: { estimateLine: true } },
+            // P0-2: estimateLine ownership verified in service after loading.
+            lines: {
+              include: {
+                estimateLine: { include: { estimate: { select: { organizationId: true } } } },
+              },
+            },
           },
         },
       },
@@ -522,7 +527,13 @@ export const subcontractPackageRepository = {
         opportunity: { organizationId: orgId },
       },
       include: {
-        lines: { include: { estimateLine: true } },
+        // P0-2: estimateLine ownership is verified in the service after loading.
+        // Prisma does not support `where` on 1:1 relation includes.
+        lines: {
+          include: {
+            estimateLine: { include: { estimate: { select: { organizationId: true } } } },
+          },
+        },
         quotes: { include: { scopeCoverages: true } },
         scopeAtoms: true,
       },
@@ -543,7 +554,12 @@ export const subcontractPackageRepository = {
         opportunity: { organizationId: orgId },
       },
       include: {
-        lines: { include: { estimateLine: true } },
+        // P0-2: estimateLine ownership is verified in the service after loading.
+        lines: {
+          include: {
+            estimateLine: { include: { estimate: { select: { organizationId: true } } } },
+          },
+        },
         quotes: { include: { scopeCoverages: true } },
         scopeAtoms: true,
       },
@@ -708,6 +724,42 @@ export const scopeAtomRepository = {
       },
     })
   },
+
+  /**
+   * Create a scope atom inside a transaction, verifying package ownership.
+   * P0: Used by createScopeAtom() for atomic scope-atom + audit creation.
+   * Returns null if the package doesn't exist OR belongs to another org.
+   */
+  async createForPackageInTransaction(
+    tx: PrismaTransaction,
+    orgId: string,
+    packageId: string,
+    data: {
+      name: string
+      description?: string | null
+      valueWeight: number
+      scopeAtomId?: string
+    },
+  ) {
+    const pkg = await tx.subcontractPackage.findFirst({
+      where: {
+        id: packageId,
+        organizationId: orgId,
+        opportunity: { organizationId: orgId },
+      },
+      select: { id: true },
+    })
+    if (!pkg) return null
+    return tx.scopeAtom.create({
+      data: {
+        id: data.scopeAtomId,
+        subcontractPackageId: packageId,
+        name: data.name,
+        description: data.description,
+        valueWeight: data.valueWeight,
+      },
+    })
+  },
 }
 
 // ─── Quote Scope Coverage Repository ─────────────────────────────────────────
@@ -809,7 +861,10 @@ export const subcontractPackageLineRepository = {
           opportunity: { organizationId: orgId },
         },
       },
-      include: { estimateLine: true },
+      include: {
+        // P0-2: estimateLine ownership verified in service after loading.
+        estimateLine: { include: { estimate: { select: { organizationId: true } } } },
+      },
       orderBy: { createdAt: 'asc' },
     })
   },

@@ -350,12 +350,23 @@ interface LoadedPackage {
   }>
 }
 
-function buildRequiredLines(pkg: LoadedPackage) {
-  return pkg.lines.map((l) => ({
-    id: l.estimateLineId,
-    description: l.requiredScope || l.estimateLine?.description || '',
-    sellPrice: l.estimateLine?.sellPrice ?? 0,
-  }))
+function buildRequiredLines(pkg: LoadedPackage, orgId?: string) {
+  return pkg.lines.map((l) => {
+    // P0-2: Verify estimateLine ownership. If the estimateLine's estimate
+    // belongs to a different org, treat it as unavailable (null).
+    const estimateOrgId = (l.estimateLine as unknown as { estimate?: { organizationId?: string } })?.estimate?.organizationId
+    const isCrossTenant = !!l.estimateLine && orgId && estimateOrgId !== orgId
+    const effectiveEstimateLine = isCrossTenant ? null : l.estimateLine
+
+    return {
+      id: l.estimateLineId,
+      description: l.requiredScope || effectiveEstimateLine?.description || '',
+      sellPrice: effectiveEstimateLine?.sellPrice ?? 0,
+      // P0-2: Flag inconsistent graph state — estimateLine was filtered out as
+      // cross-tenant. The service should not silently undercount required scope.
+      estimateLineMissing: (!!l.estimateLineId && !l.estimateLine) || isCrossTenant,
+    }
+  })
 }
 
 function buildScopeAtoms(pkg: LoadedPackage): ScopeAtomInput[] {
@@ -463,13 +474,18 @@ export const subcontractService = {
     )
 
     // 2. Build workspace, running reconciliation per quote.
+    // P0-2: Check for inconsistent graph state (cross-tenant estimateLine references).
     const workspacePackages: WorkspacePackage[] = packages.map((sp) => {
       const loadedPkg = sp as unknown as LoadedPackage
-      const requiredLines = buildRequiredLines(loadedPkg)
+      const requiredLines = buildRequiredLines(loadedPkg, ctx.organizationId)
       const scopeAtoms = buildScopeAtoms(loadedPkg)
       const requiredScopeValue = round2(
         requiredLines.reduce((s, l) => s + l.sellPrice, 0),
       )
+
+      // P0-2: If any package line references an estimateLine that was filtered
+      // out as cross-tenant, flag the workspace as inconsistent.
+      const hasInconsistentGraph = requiredLines.some((l) => l.estimateLineMissing)
 
       const quotes: WorkspaceQuote[] = loadedPkg.quotes.map((q) => {
         const reconciliationInput = buildReconciliationInput(loadedPkg, q)
@@ -503,6 +519,8 @@ export const subcontractService = {
         selectedQuote,
         hasUnselectedQuote: !sp.selectedQuoteId && quotes.length > 0,
         hasNoQuotes: quotes.length === 0,
+        // P0-2: Surface inconsistent graph state — do not silently undercount.
+        graphInconsistent: hasInconsistentGraph,
       }
     })
 
@@ -603,15 +621,34 @@ export const subcontractService = {
       }
     }
 
-    const atom = await scopeAtomRepository.createForPackage(
-      ctx.organizationId,
-      packageId,
-      {
-        name: name.trim(),
-        description: description ?? null,
-        valueWeight,
-      },
-    )
+    // P0: Transactional — scope atom + audit succeed or fail together.
+    const atom = await db.$transaction(async (tx) => {
+      const created = await scopeAtomRepository.createForPackageInTransaction(
+        tx,
+        ctx.organizationId,
+        packageId,
+        {
+          name: name.trim(),
+          description: description ?? null,
+          valueWeight,
+        },
+      )
+      if (!created) return null
+
+      await auditLogRepository.createInTransaction(
+        tx,
+        ctx.organizationId,
+        ctx.userId,
+        {
+          action: 'subcontract.scope-atom-created',
+          entityType: 'ScopeAtom',
+          entityId: created.id,
+          summary: `Scope atom "${created.name}" (weight ${created.valueWeight}) added to package ${packageId}`,
+        },
+      )
+
+      return created
+    })
     if (!atom) {
       return {
         ok: false,
@@ -619,18 +656,6 @@ export const subcontractService = {
         status: 404,
       }
     }
-
-    // Audit.
-    await auditLogRepository.create(
-      ctx.organizationId,
-      ctx.userId,
-      {
-        action: 'subcontract.scope-atom-created',
-        entityType: 'ScopeAtom',
-        entityId: atom.id,
-        summary: `Scope atom "${atom.name}" (weight ${atom.valueWeight}) added to package ${packageId}`,
-      },
-    )
 
     return {
       ok: true,
