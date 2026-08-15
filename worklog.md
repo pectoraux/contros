@@ -404,3 +404,97 @@ Stage Summary:
 - P1-12 (knowledge loop) and P1-13 (tests) implemented.
 - Remaining P1 items (application services layer, reproducible revision snapshots, structured WorkDefinition knowledge, document bindings) are architectural improvements that don't block commercial correctness — recommended for next phase.
 - The app is now commercially trustworthy: missing prices can't silently become zero, hybrid can't invent 50%, margins reflect real expected profit, subcontract coverage is semantic, and every org is isolated.
+
+---
+Task ID: final-integrity
+Agent: api-seed-updater
+Task: Final commercial integrity pass — wire P0-1 (semantic vs economic coverage), P0-2/P0-3/P0-4 (hardened pricing inputs), P0-6 (reproducible revisions) into API routes + seed.
+
+Work Log:
+- Read prior worklog sections + the 4 engine modules (pricing-engine, subcontract-reconciliation, revision-service, pre-submission-gate) + prisma/schema.prisma to understand the final-integrity contract:
+  * PricingBreakdown now exposes `uncoveredSubcontractExposure` (GHS at risk for partial subcontract coverage) and the new blocking input kinds: `invalid-price-observation`, `invalid-quantity`, `invalid-wastage`, `invalid-percentage`, `invalid-hybrid-segment`, `partial-subcontract-coverage`, `hybrid-missing-strategy`.
+  * ReconciliationResult now exposes `semanticCoveragePct`, `economicCoveragePct`, `economicCoverageUnknown`. ScopeAtomInput gained optional `valueWeight` (0..1) — economic coverage = Σ(covered weights) / Σ(all weights), falling back to semantic when all weights are 0.
+  * revision-service gained `finalizeRevision()` (builds immutable snapshot JSON), `replayRevision()` (hermetic replay), `validateBidSubmission()` (blocks bid submission without a finalized revision).
+  * Schema: ScopeAtom gained `valueWeight Float @default(0)`; EstimateRevision gained `status String @default("finalized")` (immutable once finalized).
+
+- Updated `/api/subcontract/[opportunityId]/route.ts`:
+  * Added `valueWeight: a.valueWeight` to the `ScopeAtomInput` mapping so the engine computes economic coverage.
+  * Added `semanticCoveragePct`, `economicCoveragePct`, `economicCoverageUnknown` to each quote's response payload (alongside the existing `coveragePct`, which is the primary coverage the engine already derives — economic when available, else semantic).
+  * Added `valueWeight` to the `scopeAtoms` array in the response so the UI can render the economic-weight column.
+
+- Updated `/api/estimates/[id]/price-line/route.ts`:
+  * `uncoveredSubcontractExposure` is NOT persisted as a new schema field (it's a derived value from the pricing engine). It's surfaced in three places in the response: the top-level `breakdown.uncoveredSubcontractExposure`, the audit log's `afterJson`, and — when > 0 — appended to the `provenanceSummary` string as `UNCOVERED SUBCONTRACT EXPOSURE: GHS X.XX` so reviewers see the GHS-at-risk at a glance on the line.
+  * `blockingInputsJson` continues to be `JSON.stringify(breakdown.blockingInputs)` — already covers the new blocking input kinds (`invalid-price-observation`, `invalid-quantity`, `invalid-wastage`, `invalid-percentage`, `invalid-hybrid-segment`, `partial-subcontract-coverage`, `hybrid-missing-strategy`) because they are returned by the engine and serialized verbatim.
+
+- Updated `/api/opportunities/[id]/route.ts`:
+  * Added `valueWeight: a.valueWeight` to the serialized `scopeAtoms` array inside the `subcontractPackages` payload (so the Opportunity detail response includes the economic weight per atom for UI rendering).
+
+- Updated `/api/pre-submission/[opportunityId]/route.ts`:
+  * Verified `GateSubcontractPackage.isLumpSum` is already populated from `recon.isLumpSum` (no change needed — confirmed in code).
+  * Verified `GateEstimateLine.calculationStatus` is already populated from `l.calculationStatus` on the EstimateLine record (no change needed).
+  * Verified `GateEstimateLine.exceptionApproved` is already populated from `l.commercialExceptions.some((ex) => !!ex.approvedById)` (no change needed).
+  * Added `valueWeight: a.valueWeight` to the inline `scopeAtoms` mapping inside the reconcileSubcontract call so the pre-submission gate also sees economic coverage (was previously omitted — the engine would have fallen back to semantic coverage since all weights were undefined/0).
+
+- Created `/api/estimates/[id]/finalize-revision/route.ts` (NEW):
+  * POST endpoint — `requireAuth()` + tenant scoping via `db.estimate.findFirst({ where: { id, organizationId: ctx.organizationId } })`.
+  * Refuses to finalize if the estimate has zero lines, or if any line has `calculationStatus === 'incomplete'` (returns 400 with the offending line IDs). This enforces INVARIANT 5 (no provisional price silently committed).
+  * For each EstimateLine, captures a `LineSnapshot`:
+    - WorkDefinitionVersion (id, name, version, unit, wastage, productivityRule, costRecipeJson).
+    - ExecutionSegments (strategy, quantityPct, subcontractQuote snapshot — fetched from the segment's `subcontractQuoteId`).
+    - SubcontractQuote (line-level — fetched via SubcontractPackageLine → SubcontractPackage → selectedQuote, captures totalAmount + coveragePct).
+    - description, quantity, unit, executionStrategy.
+  * Calls `finalizeRevision(estimateId, revisionNo, policy, lineSnapshots)` to build the immutable `snapshotJson`.
+  * Persists `EstimateRevision` with `status: 'finalized'` — only finalized revisions can be referenced by a Bid (per `validateBidSubmission()`).
+  * Auto-increments `revisionNo` from the latest existing revision if not provided in the request body.
+  * Runs `replayRevision(snapshotJson)` as a sanity check and includes the replay totals in the response + audit log.
+  * Appends an `estimate.revision-finalized` AuditLog entry (append-only) with the revision ID, status, line count, and replay summary.
+
+- Updated `scripts/seed.ts`:
+  * Imports: added `finalizeRevision` and `type LineSnapshot` from `../src/lib/engines`.
+  * `CLASSROOM_ELEC_SCOPE_ATOMS` (7 atoms for the electrical first-fix package) now each carry a `valueWeight`:
+    - manufacture: 0.40, delivery: 0.05, installation: 0.35, sealant: 0.05, scaffolding: 0.05, finishing: 0.05, testing: 0.05
+    - Sum = 1.00 (manufacture + installation = 0.75 of the package's commercial value, reflecting reality for supply-and-install electrical scopes).
+  * ScopeAtom creation in `seedSubcontractForClassroom()` now persists `valueWeight` on each row.
+  * `scopeAtomsInput` mapping now includes `valueWeight` — so the in-seed `reconcileSubcontract()` calls compute economic coverage, not just semantic. VoltTech now shows economic coverage = 0.45 (manufacture 0.40 + finishing 0.05) vs semantic coverage ≈ 0.286 (2/7 atoms) — economic coverage is HIGHER than semantic, which is the correct signal for a quote that covers the high-value atoms but excludes the low-value ones. PowerLine stays at 1.0 (all atoms covered, full weight).
+  * `seedEstimateAndBidForOffice()` — replaced the hand-rolled snapshot object with a `finalizeRevision()` call:
+    - Fetches all EstimateLines for the office estimate with `workDefinition`, `workDefinitionVersion`, and `executionSegments` relations.
+    - Builds `LineSnapshot[]` (WDV cost recipe, wastage, productivity; segments with strategy/quantityPct; line-level subcontractQuote=null since office lines are self-perform).
+    - Calls `finalizeRevision(estimateId, 1, { overheadPct: 0.1, profitPct: 0.12, contingencyPct: 0.05 }, lineSnapshots)`.
+    - Persists the EstimateRevision with `status: 'finalized'`.
+    - Sanity-checks via `replayRevision(snapshotJson)` and logs the replay totals. The replay produces the SAME totalSellPrice/totalDirectCost as the live estimate because the snapshot captured the actual WDV cost recipes.
+  * The existing CommercialException (unsourced electrical line), ProjectActual (office blockwork productivity variance), and CalibrationProposal (revise productivity 12 → 9.5 m²/crew-day) are unchanged.
+
+Verification:
+- `bun run lint` — clean (no errors, no warnings).
+- `DATABASE_URL=... DIRECT_DATABASE_URL=... bun run build` — succeeds. The new `/api/estimates/[id]/finalize-revision` route appears in the route manifest as a server-rendered dynamic route. All 17 routes compile.
+- `bun test tests/unit/` — 71 pass / 0 fail (172 expect() calls across 6 files). The integrity tests cover `uncoveredSubcontractExposure`, `semanticCoveragePct`/`economicCoveragePct`/`economicCoverageUnknown`, `valueWeight`, `finalizeRevision`/`replayRevision`/`validateBidSubmission`. All green.
+
+Stage Summary:
+- All 6 required changes implemented:
+  1. `/api/subcontract/[opportunityId]/route.ts` — valueWeight + semantic/economic coverage fields in response.
+  2. `/api/estimates/[id]/price-line/route.ts` — uncoveredSubcontractExposure in response + provenance summary + audit log.
+  3. `/api/opportunities/[id]/route.ts` — valueWeight on serialized scopeAtoms.
+  4. `scripts/seed.ts` — valueWeight on the 7 electrical atoms; office revision now built via `finalizeRevision()` with `status: 'finalized'`.
+  5. `/api/pre-submission/[opportunityId]/route.ts` — verified isLumpSum + calculationStatus + exceptionApproved already wired; added valueWeight to the inline reconcile call.
+  6. NEW `/api/estimates/[id]/finalize-revision/route.ts` — POST endpoint that finalizes an EstimateRevision via `finalizeRevision()`, with auth + tenant scoping + incomplete-calculation guard + replay sanity check + audit log.
+- Files changed:
+  - `/home/z/my-project/src/app/api/subcontract/[opportunityId]/route.ts`
+  - `/home/z/my-project/src/app/api/estimates/[id]/price-line/route.ts`
+  - `/home/z/my-project/src/app/api/opportunities/[id]/route.ts`
+  - `/home/z/my-project/src/app/api/pre-submission/[opportunityId]/route.ts`
+  - `/home/z/my-project/src/app/api/estimates/[id]/finalize-revision/route.ts` (NEW)
+  - `/home/z/my-project/scripts/seed.ts`
+- Critical rule compliance:
+  - INVARIANT 5 (AI cannot silently commit a price): the finalize-revision endpoint refuses to finalize if any line has `calculationStatus === 'incomplete'` — provisional prices can never become an immutable revision.
+  - INVARIANT 8 (submitted bids reproducible from immutable revisions): the office seed revision is now built via `finalizeRevision()`, capturing every pricing input (WDV cost recipe, wastage, productivity, executionSegments, line-level subcontractQuote, estimate policy). `replayRevision()` produces the same totals.
+  - INVARIANT 12 (tenant isolation): the new endpoint uses `db.estimate.findFirst({ where: { id, organizationId: ctx.organizationId } })` — no unscoped lookups.
+  - P0-1 (semantic vs economic coverage): valueWeight is now threaded through every API surface — subcontract route, opportunity route, pre-submission route, and the seed. Economic coverage is computed end-to-end.
+  - P0-4 (uncovered subcontract exposure): surfaced in three places (response, audit log, provenance summary) — never silently absorbed into the price.
+- Deviations:
+  - The seed's VoltTech quote now has economic coverage = 0.45 (was 0.286 semantic). This is a CHANGE in the seeded coveragePct value persisted to `SubcontractQuote.coveragePct` (the engine writes `result.coveragePct` which is now the economic value when weights are present). Both are still < 0.8 → blocker status, so the pre-submission gate behaviour is unchanged. The demo still shows VoltTech as a blocker, PowerLine as ok.
+  - The new finalize-revision endpoint imports `replayRevision` directly from `@/lib/engines` (the barrel) — the seed uses a dynamic `await import('../src/lib/engines/revision-service')` for its sanity check to avoid adding another top-level import. Both styles resolve to the same function.
+  - `uncoveredSubcontractExposure` is NOT persisted on the EstimateLine row — per spec ("it's a computed value, so just include it in the response"). The value is recomputed on every `priceLine` POST and surfaced in the response + audit log + provenance summary. If a future use case needs it stored, a schema migration would be required.
+- Next actions for downstream agents:
+  - UI: render `semanticCoveragePct` vs `economicCoveragePct` side-by-side in the subcontract reconciliation table (they differ when weights are unequal). Surface `uncoveredSubcontractExposure` as a red banner on estimate lines where > 0.
+  - UI: add a "Finalize Revision" button on the Estimate tab that POSTs to `/api/estimates/[id]/finalize-revision`, then links the resulting revisionId to the Bid.
+  - Optional: add a `/api/estimates/[id]/revisions/[revisionId]/replay` GET endpoint that calls `replayRevision(snapshotJson)` and returns the replay totals — useful for verifying immutability in the UI.

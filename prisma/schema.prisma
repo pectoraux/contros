@@ -310,14 +310,15 @@ model Estimate {
 }
 
 model EstimateRevision {
-  id           String   @id @default(cuid())
-  estimateId   String
-  revisionNo   Int
-  snapshotJson String   // immutable snapshot of lines + pricing inputs
-  finalizedAt  DateTime @default(now())
+  id            String   @id @default(cuid())
+  estimateId    String
+  revisionNo    Int
+  snapshotJson  String   // immutable snapshot of lines + pricing inputs (P0-6 reproducibility)
+  status        String   @default("finalized") // finalized (immutable) — only finalized revisions can be referenced by a Bid
+  finalizedAt   DateTime @default(now())
   finalizedById String?
 
-  estimate     Estimate @relation(fields: [estimateId], references: [id])
+  estimate      Estimate @relation(fields: [estimateId], references: [id])
 }
 
 model EstimateLine {
@@ -453,6 +454,11 @@ model ScopeAtom {
   subcontractPackageId String
   name                 String   // e.g. "installation"
   description          String?
+  // P0-1 fix: economic weight for this atom (0..1). Enables economic coverage
+  // = sum(covered atom weights) / sum(all atom weights), distinct from semantic
+  // coverage = covered atoms / total atoms. If all weights are equal (or 0),
+  // economic coverage falls back to semantic coverage.
+  valueWeight          Float    @default(0)
   createdAt            DateTime @default(now())
 
   subcontractPackage   SubcontractPackage @relation(fields: [subcontractPackageId], references: [id])

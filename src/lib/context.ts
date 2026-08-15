@@ -1,5 +1,5 @@
 import { getServerSession } from 'next-auth'
-import { authOptions } from '@/lib/auth'
+import { authOptions, isValidRole, type AllowedRole } from '@/lib/auth'
 
 /**
  * Server-side request context — the single source of truth for the
@@ -12,7 +12,7 @@ import { authOptions } from '@/lib/auth'
 export interface RequestContext {
   userId: string
   organizationId: string
-  role: 'estimator' | 'manager' | 'director' | 'admin'
+  role: AllowedRole
   isDemo: boolean
   name: string | null
   email: string | null
@@ -20,8 +20,8 @@ export interface RequestContext {
 
 /**
  * Require an authenticated session. Returns the server-derived context.
- * Throws a 401-shaped error if unauthenticated — callers should catch and
- * return NextResponse.json({ error }, { status: 401 }).
+ * P0-8: Role is validated at runtime — unknown roles are normalized to 'estimator'.
+ * Throws a 401-shaped error if unauthenticated.
  */
 export async function requireAuth(): Promise<RequestContext> {
   const session = await getServerSession(authOptions)
@@ -41,7 +41,7 @@ export async function requireAuth(): Promise<RequestContext> {
   return {
     userId: u.id,
     organizationId: u.organizationId,
-    role: (u.role as RequestContext['role']) ?? 'estimator',
+    role: isValidRole(u.role) ? u.role : 'estimator',
     isDemo: u.isDemo ?? false,
     name: u.name ?? null,
     email: u.email ?? null,

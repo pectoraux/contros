@@ -46,11 +46,12 @@ export async function GET(
         sellPrice: l.estimateLine?.sellPrice ?? 0,
       }))
 
-      // P0-7: structured scope atoms.
+      // P0-7: structured scope atoms. P0-1: include valueWeight for economic coverage.
       const scopeAtoms: ScopeAtomInput[] = sp.scopeAtoms.map((a) => ({
         id: a.id,
         name: a.name,
         description: a.description ?? undefined,
+        valueWeight: a.valueWeight,
       }))
 
       const quotes = sp.quotes.map((q) => {
@@ -85,6 +86,10 @@ export async function GET(
           coveragePct: result.coveragePct,
           coverageBasis: result.coverageBasis,
           isLumpSum: result.isLumpSum,
+          // P0-1: semantic vs economic coverage (separate signals).
+          semanticCoveragePct: result.semanticCoveragePct,
+          economicCoveragePct: result.economicCoveragePct,
+          economicCoverageUnknown: result.economicCoverageUnknown,
           atomReconciliations: result.atomReconciliations,
           excludedAtoms: result.excludedAtoms,
           unstatedAtoms: result.unstatedAtoms,
@@ -108,7 +113,12 @@ export async function GET(
         executionStrategy: sp.executionStrategy,
         status: sp.status,
         selectedQuoteId: sp.selectedQuoteId,
-        scopeAtoms: scopeAtoms.map((a) => ({ id: a.id, name: a.name, description: a.description })),
+        scopeAtoms: scopeAtoms.map((a) => ({
+          id: a.id,
+          name: a.name,
+          description: a.description,
+          valueWeight: a.valueWeight,
+        })),
         requiredLines: requiredLines.map((l) => ({
           id: l.id,
           description: l.description,

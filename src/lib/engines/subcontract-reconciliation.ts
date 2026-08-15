@@ -2,90 +2,84 @@
  * Subcontract Reconciliation Engine — deterministic reconciliation of a
  * subcontract quote against the required scope (INVARIANT 7).
  *
- * P0-7 fix: Reconciliation is now based on structured SCOPE ATOMS, not
- * bidirectional substring matching. A lump-sum quote with no scope detail
- * is 'unknown' coverage, NOT 100%.
+ * Final integrity pass fix (P0-1):
+ * - Separates SEMANTIC coverage (atom count) from ECONOMIC coverage (value weight).
+ * - ScopeAtoms now carry a `valueWeight` (0..1) representing their share of the
+ *   package's commercial value. economicCoveragePct = Σ(covered weights) / Σ(all weights).
+ * - If all weights are 0 or equal, economic coverage falls back to semantic coverage.
+ * - A lump-sum quote with no scope-atom detail is 'unknown' coverage (blocker).
  *
  * Pure: no `Math.random`, no `Date.now`, no I/O, no Prisma client.
  */
 
 import { round2, sum, formatGHS } from './money';
 
-/** A required scope atom (e.g. "manufacture", "delivery", "installation"). */
 export interface ScopeAtomInput {
   id: string;
   name: string;
   description?: string;
+  /** P0-1: Economic weight (0..1). If 0, falls back to equal weighting. */
+  valueWeight?: number;
 }
 
-/** A quote's coverage status for a specific scope atom. */
 export interface QuoteScopeCoverageInput {
   scopeAtomId: string;
-  /** covered | excluded | unstated */
   status: 'covered' | 'excluded' | 'unstated';
   note?: string;
 }
 
-/** A required scope line (estimate line linked to the package). */
 export interface RequiredLine {
   id: string;
   description: string;
   sellPrice: number;
 }
 
-/** A subcontract quote (flattened projection). */
 export interface SubcontractQuoteInput {
   id: string;
   totalAmount: number;
-  /** Structured scope-atom coverages (P0-7). */
   scopeCoverages: QuoteScopeCoverageInput[];
-  /** Legacy exclusion/assumption text arrays (still surfaced as warnings). */
   exclusionsJson?: string;
   assumptionsJson?: string;
 }
 
-/** Input to `reconcileSubcontract`. */
 export interface ReconcileSubcontractInput {
   requiredLines: RequiredLine[];
   scopeAtoms: ScopeAtomInput[];
   quote: SubcontractQuoteInput | null;
 }
 
-/** Per-atom reconciliation result. */
 export interface AtomReconciliation {
   scopeAtomId: string;
   name: string;
   status: 'covered' | 'excluded' | 'unstated';
+  valueWeight: number;
   note?: string;
 }
 
-/** Result of `reconcileSubcontract`. */
 export interface ReconciliationResult {
-  /** 0..1, based on structured atom coverage. */
-  coveragePct: number;
-  /** 'atoms' = structured; 'lump-sum' = no atom detail (unknown). */
+  /** Semantic coverage = covered atoms / total atoms. */
+  semanticCoveragePct: number;
+  /** Economic coverage = Σ(covered weights) / Σ(all weights). Falls back to semantic if weights are 0/equal. */
+  economicCoveragePct: number;
+  /** 'atoms' = structured; 'lump-sum' = no atom detail; 'none' = no quote. */
   coverageBasis: 'atoms' | 'lump-sum' | 'none';
+  /** The primary coverage used for status determination (economic when available, else semantic). */
+  coveragePct: number;
   requiredScopeValue: number;
   coveredScopeValue: number;
   uncoveredValue: number;
-  /** Required lines with no matching quote coverage. */
   gaps: string[];
-  /** Atoms that are explicitly excluded by the quote. */
   excludedAtoms: string[];
-  /** Atoms the quote didn't address — must be reviewed. */
   unstatedAtoms: string[];
-  /** Atoms the quote explicitly covers. */
   coveredAtoms: string[];
   atomReconciliations: AtomReconciliation[];
-  /** Supplier quote exclusions (legacy text). */
   exclusions: string[];
-  /** Supplier quote assumptions (legacy text). */
   assumptions: string[];
-  /** Human-readable warnings. */
   warnings: string[];
   status: 'ok' | 'warning' | 'blocker';
-  /** True if the quote has no scope-atom detail (lump-sum). */
   isLumpSum: boolean;
+  /** True if economic coverage couldn't be determined (all weights 0). */
+  economicCoverageUnknown: boolean;
 }
 
 function parseStringArray(json: string | undefined | null): string[] {
@@ -95,31 +89,10 @@ function parseStringArray(json: string | undefined | null): string[] {
     if (Array.isArray(parsed)) {
       return parsed.filter((x): x is string => typeof x === 'string');
     }
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   return [];
 }
 
-/**
- * Reconcile a subcontract quote against the required scope using structured
- * scope atoms (P0-7).
- *
- * Algorithm:
- * - If `quote` is null → status = 'blocker', coverage = 0.
- * - If `scopeAtoms` is empty → we can't do structured reconciliation;
- *   coverage is 'unknown' (basis = 'lump-sum' if quote exists). status = blocker.
- * - If the quote has NO scopeCoverages → it's a lump-sum quote. coverageBasis
- *   = 'lump-sum', all atoms are 'unstated'. status = blocker (must be reviewed).
- * - Otherwise: for each scope atom, look up its coverage status in the quote.
- *   covered = counts toward coverage; excluded/unstated = gap.
- * - coveragePct = coveredAtoms / totalAtoms (NOT based on dollar value —
- *   scope coverage is semantic, not financial).
- * - status = 'blocker' if any excluded atom intersects required scope OR
- *   coverage < 0.8; 'warning' if < 0.95; 'ok' if >= 0.95.
- *
- * A lump-sum quote NEVER gets 100% coverage automatically.
- */
 export function reconcileSubcontract(
   input: ReconcileSubcontractInput,
 ): ReconciliationResult {
@@ -129,8 +102,10 @@ export function reconcileSubcontract(
 
   if (!input.quote) {
     return {
-      coveragePct: 0,
+      semanticCoveragePct: 0,
+      economicCoveragePct: 0,
       coverageBasis: 'none',
+      coveragePct: 0,
       requiredScopeValue,
       coveredScopeValue: 0,
       uncoveredValue: requiredScopeValue,
@@ -142,12 +117,14 @@ export function reconcileSubcontract(
         scopeAtomId: a.id,
         name: a.name,
         status: 'unstated',
+        valueWeight: a.valueWeight ?? 0,
       })),
       exclusions: [],
       assumptions: [],
       warnings: ['No subcontract quote provided.'],
       status: 'blocker',
       isLumpSum: false,
+      economicCoverageUnknown: false,
     };
   }
 
@@ -155,11 +132,12 @@ export function reconcileSubcontract(
   const assumptions = parseStringArray(input.quote.assumptionsJson);
   const quote = input.quote;
 
-  // No scope atoms defined → can't do structured reconciliation.
   if (scopeAtoms.length === 0) {
     return {
-      coveragePct: 0,
+      semanticCoveragePct: 0,
+      economicCoveragePct: 0,
       coverageBasis: 'lump-sum',
+      coveragePct: 0,
       requiredScopeValue,
       coveredScopeValue: 0,
       uncoveredValue: requiredScopeValue,
@@ -176,48 +154,67 @@ export function reconcileSubcontract(
       ],
       status: 'blocker',
       isLumpSum: true,
+      economicCoverageUnknown: true,
     };
   }
 
-  // Build atom coverage map.
   const coverageMap = new Map<string, QuoteScopeCoverageInput>();
   for (const c of quote.scopeCoverages ?? []) {
     coverageMap.set(c.scopeAtomId, c);
   }
 
-  // If the quote has NO scopeCoverages at all → lump-sum, all unstated.
   const isLumpSum = (quote.scopeCoverages ?? []).length === 0;
 
   const atomReconciliations: AtomReconciliation[] = [];
   const coveredAtoms: string[] = [];
   const excludedAtoms: string[] = [];
   const unstatedAtoms: string[] = [];
+  let coveredWeightSum = 0;
+  let totalWeightSum = 0;
+  let allWeightsZero = true;
 
   for (const atom of scopeAtoms) {
     const cov = coverageMap.get(atom.id);
     const status = cov?.status ?? 'unstated';
+    const weight = atom.valueWeight ?? 0;
+    totalWeightSum += weight;
+    if (weight > 0) allWeightsZero = false;
+
     atomReconciliations.push({
       scopeAtomId: atom.id,
       name: atom.name,
       status,
+      valueWeight: weight,
       note: cov?.note,
     });
-    if (status === 'covered') coveredAtoms.push(atom.name);
-    else if (status === 'excluded') excludedAtoms.push(atom.name);
-    else unstatedAtoms.push(atom.name);
+
+    if (status === 'covered') {
+      coveredAtoms.push(atom.name);
+      coveredWeightSum += weight;
+    } else if (status === 'excluded') {
+      excludedAtoms.push(atom.name);
+    } else {
+      unstatedAtoms.push(atom.name);
+    }
   }
 
-  // Coverage = covered atoms / total atoms (semantic, not financial).
-  const coveragePct = scopeAtoms.length > 0
+  // Semantic coverage = covered atoms / total atoms.
+  const semanticCoveragePct = scopeAtoms.length > 0
     ? Math.min(1, round2(coveredAtoms.length / scopeAtoms.length))
     : 0;
 
-  // Covered scope value = proportional coverage × required value.
+  // Economic coverage = covered weights / total weights.
+  // If all weights are 0, economic coverage is 'unknown' — fall back to semantic.
+  const economicCoverageUnknown = allWeightsZero || totalWeightSum === 0;
+  const economicCoveragePct = economicCoverageUnknown
+    ? semanticCoveragePct
+    : Math.min(1, round2(coveredWeightSum / totalWeightSum));
+
+  // Primary coverage for status: use economic when available, else semantic.
+  const coveragePct = economicCoverageUnknown ? semanticCoveragePct : economicCoveragePct;
   const coveredScopeValue = round2(requiredScopeValue * coveragePct);
   const uncoveredValue = round2(requiredScopeValue - coveredScopeValue);
 
-  // Gaps = required lines with no coverage (all uncovered for now, since
-  // atom-level gaps are more precise).
   const gaps = uncoveredValue > 0
     ? [`${unstatedAtoms.length + excludedAtoms.length} scope atom(s) not covered`]
     : [];
@@ -235,11 +232,15 @@ export function reconcileSubcontract(
   if (coveragePct < 1) {
     warnings.push(`Coverage ${Math.round(coveragePct * 100)}% — uncovered value ${formatGHS(uncoveredValue)}.`);
   }
+  if (economicCoverageUnknown && scopeAtoms.length > 0) {
+    warnings.push('Economic coverage unknown — scope atoms have no value weights. Assign value weights for economic coverage.');
+  } else if (semanticCoveragePct !== economicCoveragePct) {
+    warnings.push(`Semantic coverage ${Math.round(semanticCoveragePct * 100)}% differs from economic coverage ${Math.round(economicCoveragePct * 100)}%.`);
+  }
   if (assumptions.length > 0) {
     warnings.push(`Quote contains ${assumptions.length} assumption(s) — review before awarding.`);
   }
 
-  // Status: blocker if excluded atoms exist OR coverage < 0.8; warning if < 0.95.
   let status: 'ok' | 'warning' | 'blocker';
   if (isLumpSum || excludedAtoms.length > 0 || coveragePct < 0.8) {
     status = 'blocker';
@@ -250,8 +251,10 @@ export function reconcileSubcontract(
   }
 
   return {
-    coveragePct,
+    semanticCoveragePct,
+    economicCoveragePct,
     coverageBasis: isLumpSum ? 'lump-sum' : 'atoms',
+    coveragePct,
     requiredScopeValue,
     coveredScopeValue,
     uncoveredValue,
@@ -265,5 +268,6 @@ export function reconcileSubcontract(
     warnings,
     status,
     isLumpSum,
+    economicCoverageUnknown,
   };
 }

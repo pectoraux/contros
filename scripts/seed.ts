@@ -27,9 +27,11 @@ import {
   reconcileSubcontract,
   formatGHS,
   round2,
+  finalizeRevision,
   type CostRecipeLine,
   type PricingBreakdown,
   type ExecutionSegmentInput,
+  type LineSnapshot,
 } from '../src/lib/engines';
 
 async function hashPassword(plain: string): Promise<string> {
@@ -1676,15 +1678,19 @@ async function seedEstimateForClassroom(
 // Subcontract Package + Quotes + Scope Atoms for Opportunity #1
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Scope atoms for the electrical first-fix package (P0-7 structured reconciliation). */
+/** Scope atoms for the electrical first-fix package (P0-7 structured reconciliation).
+ *  P0-1: each atom carries a `valueWeight` representing its share of the
+ *  package's commercial value. Weights sum to 1.0 — manufacture (0.40) and
+ *  installation (0.35) are the high-value portions; delivery, sealant,
+ *  scaffolding, finishing, and testing are each 0.05. */
 const CLASSROOM_ELEC_SCOPE_ATOMS = [
-  { id: 'sa-classroom-1', name: 'manufacture', description: 'Manufacture/fabrication of conduit, boxes, fittings' },
-  { id: 'sa-classroom-2', name: 'delivery', description: 'Delivery to site' },
-  { id: 'sa-classroom-3', name: 'installation', description: 'Installation of conduit, boxes, pull-wires' },
-  { id: 'sa-classroom-4', name: 'sealant', description: 'Sealant and fire-stopping at penetrations' },
-  { id: 'sa-classroom-5', name: 'scaffolding', description: 'Scaffolding for installation at high level' },
-  { id: 'sa-classroom-6', name: 'finishing', description: 'Making good / finishing around boxes' },
-  { id: 'sa-classroom-7', name: 'testing', description: 'Continuity testing and certification' },
+  { id: 'sa-classroom-1', name: 'manufacture', description: 'Manufacture/fabrication of conduit, boxes, fittings', valueWeight: 0.40 },
+  { id: 'sa-classroom-2', name: 'delivery', description: 'Delivery to site', valueWeight: 0.05 },
+  { id: 'sa-classroom-3', name: 'installation', description: 'Installation of conduit, boxes, pull-wires', valueWeight: 0.35 },
+  { id: 'sa-classroom-4', name: 'sealant', description: 'Sealant and fire-stopping at penetrations', valueWeight: 0.05 },
+  { id: 'sa-classroom-5', name: 'scaffolding', description: 'Scaffolding for installation at high level', valueWeight: 0.05 },
+  { id: 'sa-classroom-6', name: 'finishing', description: 'Making good / finishing around boxes', valueWeight: 0.05 },
+  { id: 'sa-classroom-7', name: 'testing', description: 'Continuity testing and certification', valueWeight: 0.05 },
 ] as const;
 
 /**
@@ -1723,7 +1729,8 @@ async function seedSubcontractForClassroom(
     },
   });
 
-  // P0-7: create the 7 ScopeAtoms for this package.
+  // P0-7: create the 7 ScopeAtoms for this package. P0-1: persist valueWeight
+  // so economic coverage can be computed downstream.
   for (const sa of CLASSROOM_ELEC_SCOPE_ATOMS) {
     await prisma.scopeAtom.create({
       data: {
@@ -1731,6 +1738,7 @@ async function seedSubcontractForClassroom(
         subcontractPackageId: packageId,
         name: sa.name,
         description: sa.description,
+        valueWeight: sa.valueWeight,
       },
     });
   }
@@ -1738,6 +1746,7 @@ async function seedSubcontractForClassroom(
     id: sa.id,
     name: sa.name,
     description: sa.description,
+    valueWeight: sa.valueWeight,
   }));
 
   // Link the electrical estimate line to the package.
@@ -2111,27 +2120,58 @@ async function seedEstimateAndBidForOffice(
   const finalPrice = lines.reduce((s, l) => s + l.sellPrice, 0);
   console.log(`  • Final bid price: ${formatGHS(finalPrice)}.`);
 
-  // EstimateRevision — immutable snapshot of the lines submitted.
-  const snapshot = {
-    estimateId,
-    finalizedAt: iso(daysAgo(8)),
-    overheadPct: 0.1,
-    profitPct: 0.12,
-    contingencyPct: 0.05,
-    lines: lines.map((l, i) => ({
-      index: i + 1,
-      lineId: l.lineId,
-      description: OFFICE_LINES[i].description,
-      quantity: OFFICE_LINES[i].quantity,
-      unitRate: l.breakdown.unitRate,
-      sellPrice: l.sellPrice,
-      material: l.breakdown.material,
-      labour: l.breakdown.labour,
-      plant: l.breakdown.plant,
-      subcontract: l.breakdown.subcontract,
+  // P0-6: build the immutable revision snapshot via finalizeRevision().
+  // The snapshot captures EVERY pricing input — WDV (id, version, cost recipe,
+  // wastage, productivity), executionSegments, subcontractQuote, and policy — so
+  // that replayRevision() can reconstruct the EXACT same commercial result, even
+  // if current WorkDefinitions, prices, or quotes have since changed.
+  const snapshotLines = await prisma.estimateLine.findMany({
+    where: { estimateId },
+    include: {
+      workDefinition: { select: { name: true, unit: true } },
+      workDefinitionVersion: true,
+      executionSegments: true,
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  const lineSnapshots: LineSnapshot[] = snapshotLines.map((l) => ({
+    lineId: l.id,
+    description: l.description,
+    quantity: l.quantity,
+    unit: l.unit,
+    executionStrategy: l.executionStrategy as
+      | 'self-perform'
+      | 'subcontract'
+      | 'hybrid'
+      | 'undecided',
+    workDefinitionVersion: l.workDefinitionVersion
+      ? {
+          id: l.workDefinitionVersion.id,
+          name: l.workDefinition?.name ?? '',
+          version: l.workDefinitionVersion.version,
+          unit: l.workDefinition?.unit ?? l.unit,
+          wastage: l.workDefinitionVersion.wastage,
+          productivityRule: l.workDefinitionVersion.productivityRule ?? undefined,
+          costRecipeJson: l.workDefinitionVersion.costRecipeJson,
+        }
+      : null,
+    executionSegments: l.executionSegments.map((seg) => ({
+      strategy: seg.strategy as 'self-perform' | 'subcontract',
+      quantityPct: seg.quantityPct,
+      // MVP: office lines are self-perform — no segment-level subcontract quote.
+      subcontractQuote: null,
     })),
-    totalSellPrice: finalPrice,
-  };
+    // Office lines are self-perform — no line-level subcontract quote.
+    subcontractQuote: null,
+  }));
+
+  const snapshotJson = finalizeRevision(
+    estimateId,
+    1,
+    { overheadPct: 0.1, profitPct: 0.12, contingencyPct: 0.05 },
+    lineSnapshots,
+  );
 
   const revisionId = 'rev-office-1';
   await prisma.estimateRevision.create({
@@ -2139,11 +2179,25 @@ async function seedEstimateAndBidForOffice(
       id: revisionId,
       estimateId,
       revisionNo: 1,
-      snapshotJson: JSON.stringify(snapshot),
+      snapshotJson,
+      // P0-6: finalized revisions are immutable — only finalized revisions can
+      // be referenced by a Bid (validated by validateBidSubmission()).
+      status: 'finalized',
       finalizedAt: daysAgo(8),
       finalizedById: ctx.userIds.kwesi,
     },
   });
+
+  // Sanity check: replay the snapshot and confirm the totals match.
+  const { replayRevision } = await import('../src/lib/engines/revision-service');
+  const replay = replayRevision(snapshotJson);
+  if (replay.ok) {
+    console.log(
+      `  • Revision replay verified: totalSellPrice=${formatGHS(replay.totalSellPrice)} totalDirectCost=${formatGHS(replay.totalDirectCost)} (${replay.lines.length} lines).`,
+    );
+  } else {
+    console.warn(`  ⚠ Revision replay failed: ${replay.error}`);
+  }
 
   // Mark estimate as superseded (the revision is the immutable snapshot).
   // Actually keep it as 'submitted' since that was the submitted state.

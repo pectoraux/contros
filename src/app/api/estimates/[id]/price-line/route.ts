@@ -145,12 +145,17 @@ export async function POST(
       unit: line.unit,
     })
 
-    // Provenance summary string
-    const provenanceSummary = breakdown.provenance.length
+    // Provenance summary string.
+    // P0-4: when uncoveredSubcontractExposure > 0, surface it in the provenance
+    // summary so reviewers see the GHS-at-risk at a glance.
+    const baseProvenance = breakdown.provenance.length
       ? breakdown.provenance
           .map((p) => `${p.resourceName}: ${p.provenance}${p.sourceReference ? ` #${p.sourceReference}` : ''} @ GHS ${p.price.toFixed(2)} (${new Date(p.observedAt).toLocaleDateString()})`)
           .join('; ')
       : 'No price observations — unsourced'
+    const provenanceSummary = breakdown.uncoveredSubcontractExposure > 0
+      ? `${baseProvenance}; UNCOVERED SUBCONTRACT EXPOSURE: GHS ${breakdown.uncoveredSubcontractExposure.toFixed(2)}`
+      : baseProvenance
 
     // Persist deterministic computation to canonical estimate (P0-4/P0-6 new fields).
     const updated = await db.estimateLine.update({
@@ -228,6 +233,8 @@ export async function POST(
           unsourced: breakdown.unsourced,
           calculationStatus: breakdown.calculationStatus,
           blockingInputs: breakdown.blockingInputs,
+          // P0-4: uncovered subcontract exposure (GHS at risk).
+          uncoveredSubcontractExposure: breakdown.uncoveredSubcontractExposure,
         }),
       },
     })
@@ -252,6 +259,8 @@ export async function POST(
           labour: breakdown.labour,
           plant: breakdown.plant,
           subcontract: breakdown.subcontract,
+          // P0-4: uncovered subcontract exposure (GHS at risk).
+          uncoveredSubcontractExposure: breakdown.uncoveredSubcontractExposure,
           directCost: breakdown.directCost,
           projectCost: breakdown.projectCost,
           riskCost: breakdown.riskCost,

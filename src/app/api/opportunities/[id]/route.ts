@@ -217,6 +217,8 @@ export async function GET(
             id: a.id,
             name: a.name,
             description: a.description,
+            // P0-1: economic weight for this atom (0..1).
+            valueWeight: a.valueWeight,
           })),
           lines: sp.lines.map((l) => ({
             id: l.id,

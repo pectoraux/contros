@@ -108,6 +108,8 @@ export async function GET(
           id: a.id,
           name: a.name,
           description: a.description ?? undefined,
+          // P0-1: pass valueWeight so economic coverage is computed.
+          valueWeight: a.valueWeight,
         }))
         const scopeCoverages = selectedQuote.scopeCoverages.map((c) => ({
           scopeAtomId: c.scopeAtomId,

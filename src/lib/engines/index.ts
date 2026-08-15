@@ -72,3 +72,10 @@ export type {
   GenerateProgrammeInput,
 } from './schedule-engine';
 export { computeSchedule, generateProgrammeFromEstimate } from './schedule-engine';
+
+export type {
+  LineSnapshot,
+  PolicySnapshot,
+  RevisionSnapshot,
+} from './revision-service';
+export { finalizeRevision, replayRevision, validateBidSubmission } from './revision-service';

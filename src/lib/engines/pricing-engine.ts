@@ -4,16 +4,16 @@
  * This is the canonical financial calculation layer (INVARIANT 6).
  * The LLM never performs financial arithmetic — it always delegates here.
  *
- * P0 fixes applied:
- * - P0-4: A missing price observation makes the calculation `incomplete` with
- *   `blockingInputs`. The engine does NOT silently contribute 0 for missing
- *   prices. An incomplete calculation cannot produce a commit-ready sellPrice.
- * - P0-5: The 50% hybrid heuristic is REMOVED. Hybrid requires explicit
- *   ExecutionSegments. Missing allocation → incomplete.
- * - P0-6: Margin semantics fixed. We now distinguish:
- *     directCost, projectCost, riskCost, overheadCost, estimatedTotalCost,
- *     expectedProfit, expectedMargin. `estimatedTotalCost` = direct + risk +
- *     overhead (excludes profit). `expectedMargin` = expectedProfit / sellPrice.
+ * Final integrity pass fixes:
+ * - P0-2: Invalid price observations (NaN, Infinity, -Infinity, negative) are
+ *   blocking inputs, NEVER silently coerced to zero. Invalid quantities,
+ *   wastage, and percentages are also blocking inputs.
+ * - P0-3: Hybrid validation hardened — segments must be 0..1, sum to 1.0,
+ *   contain at least one self-perform AND one subcontract segment. Subcontract
+ *   segments must reference a valid quote.
+ * - P0-4: Subcontract pricing vs coverage — a partial quote (coveragePct < 1)
+ *   is NOT silently treated as the full segment price. The uncovered scope
+ *   exposure is surfaced as a blocking input.
  *
  * Pure: no `Math.random`, no `Date.now`, no I/O, no Prisma client.
  */
@@ -26,9 +26,7 @@ export interface CostRecipeLine {
   resourceCode: string;
   resourceName: string;
   unit: string;
-  /** Quantity per unit of work (e.g. 0.05 tonne of cement per m3 of concrete). */
   quantityPerUnit: number;
-  /** Price observation backing this resource, or null if unsourced. */
   priceObservation: {
     price: number;
     provenance: string;
@@ -37,7 +35,6 @@ export interface CostRecipeLine {
   } | null;
 }
 
-/** The work definition version driving this price build-up. */
 export interface PricingWorkDefinitionVersion {
   id: string;
   name: string;
@@ -48,33 +45,25 @@ export interface PricingWorkDefinitionVersion {
   costRecipeJson: string;
 }
 
-/** An explicit execution segment for hybrid strategy (P0-5). */
+/** An explicit execution segment for hybrid strategy (P0-3). */
 export interface ExecutionSegmentInput {
   strategy: 'self-perform' | 'subcontract';
-  /** 0..1 share of the line's quantity allocated to this segment. */
   quantityPct: number;
-  /** Subcontract quote total (only used when strategy === 'subcontract'). */
+  /** Subcontract quote (required for subcontract segments). */
   subcontractQuote?: { totalAmount: number; coveragePct: number } | null;
 }
 
-/** Inputs to `priceLine`. */
 export interface PricingInput {
   workDefinitionVersion: PricingWorkDefinitionVersion | null;
   quantity: number;
   executionStrategy: 'self-perform' | 'subcontract' | 'hybrid' | 'undecided';
-  /** Required for hybrid strategy. Ignored for other strategies. */
   executionSegments?: ExecutionSegmentInput[];
-  /** 0.10 = 10%. */
   overheadPct: number;
-  /** 0.12 = 12%. */
   profitPct: number;
-  /** 0.05 = 5%. Contingency/risk. */
   contingencyPct: number;
-  /** Subcontract quote (used for pure subcontract strategy). */
   subcontractQuote?: { totalAmount: number; coveragePct: number } | null;
 }
 
-/** A single provenance entry — the lineage of a price used in the build-up. */
 export interface PricingProvenanceEntry {
   resourceCode: string;
   resourceName: string;
@@ -84,22 +73,15 @@ export interface PricingProvenanceEntry {
   observedAt: string;
 }
 
-/** A blocking input that makes a calculation incomplete (P0-4). */
 export interface BlockingInput {
-  kind: 'missing-price' | 'missing-hybrid-allocation' | 'missing-work-definition' | 'invalid-recipe' | 'missing-subcontract-quote';
+  kind: 'missing-price' | 'missing-hybrid-allocation' | 'missing-work-definition' | 'invalid-recipe' | 'missing-subcontract-quote' | 'invalid-price-observation' | 'invalid-quantity' | 'invalid-wastage' | 'invalid-percentage' | 'invalid-hybrid-segment' | 'partial-subcontract-coverage' | 'hybrid-missing-strategy';
   resourceName?: string;
   resourceCode?: string;
   detail: string;
 }
 
-/**
- * Calculation status (P0-4):
- * - 'complete': all inputs present, sellPrice is commit-ready.
- * - 'incomplete': one or more blocking inputs; sellPrice is provisional only.
- */
 export type CalculationStatus = 'complete' | 'incomplete';
 
-/** Full deterministic breakdown of a single estimate line's pricing. */
 export interface PricingBreakdown {
   calculationStatus: CalculationStatus;
   blockingInputs: BlockingInput[];
@@ -107,29 +89,24 @@ export interface PricingBreakdown {
   labour: number;
   plant: number;
   subcontract: number;
+  /** P0-4: uncovered subcontract scope exposure (GHS at risk). */
+  uncoveredSubcontractExposure: number;
   directCost: number;
   projectCost: number;
   riskCost: number;
   overhead: number;
   profit: number;
-  /** P0-6: estimatedTotalCost = direct + risk + overhead (excludes profit). */
   estimatedTotalCost: number;
-  /** P0-6: expectedProfit = sellPrice - estimatedTotalCost. */
   expectedProfit: number;
   sellPrice: number;
   unitRate: number;
-  /** P0-6: expectedMargin = expectedProfit / sellPrice (the real margin). */
   expectedMarginPct: number;
-  /** Legacy margin = (sellPrice - directCost) / sellPrice — kept for UI compat but NOT the real margin. */
   marginPct: number;
   provenance: PricingProvenanceEntry[];
-  /** True if any recipe line is missing a price observation, or no workDefinitionVersion. */
   unsourced: boolean;
-  /** Human-readable names of unsourced resources. */
   unsourcedResources: string[];
 }
 
-/** Sentinel empty breakdown used for early-return paths. */
 function emptyBreakdown(
   unsourced: boolean,
   blockingInputs: BlockingInput[] = [],
@@ -141,6 +118,7 @@ function emptyBreakdown(
     labour: 0,
     plant: 0,
     subcontract: 0,
+    uncoveredSubcontractExposure: 0,
     directCost: 0,
     projectCost: 0,
     riskCost: 0,
@@ -158,41 +136,31 @@ function emptyBreakdown(
   };
 }
 
-/**
- * Compute a deterministic price breakdown for a single estimate line.
- *
- * Algorithm:
- * 1. If no workDefinitionVersion → incomplete (blocking: missing-work-definition).
- * 2. Parse `costRecipeJson`. Invalid → incomplete (blocking: invalid-recipe).
- * 3. For each recipe line: if `priceObservation` is missing → record a
- *    `missing-price` blocking input. The line does NOT contribute 0 silently —
- *    the calculation is marked incomplete (P0-4 fix).
- *    If priced: `lineCost = quantityPerUnit * quantity * (1 + wastage) * price`.
- * 4. Execution strategy (P0-5 fix):
- *    - `self-perform` / `undecided`: use recipe as-is.
- *    - `subcontract`: requires `subcontractQuote`. If missing → incomplete.
- *      If present: subcontract = quote.totalAmount; self-perform buckets = 0.
- *    - `hybrid`: requires `executionSegments` summing to 1.0. If missing or
- *      not summing to 1.0 → incomplete (blocking: missing-hybrid-allocation).
- *      Each segment contributes its share of self-perform cost OR its
- *      subcontract quote proportional to quantityPct.
- *      NO 50% HEURISTIC.
- * 5. directCost = material + labour + plant + subcontract.
- * 6. projectCost = directCost (no separate project-specific layer for MVP).
- * 7. riskCost = directCost * contingencyPct.
- * 8. overhead = (projectCost + riskCost) * overheadPct.
- * 9. estimatedTotalCost = projectCost + riskCost + overhead (P0-6 — excludes profit).
- * 10. profit = estimatedTotalCost * profitPct.
- * 11. sellPrice = estimatedTotalCost + profit.
- * 12. expectedProfit = sellPrice - estimatedTotalCost (P0-6).
- * 13. expectedMarginPct = expectedProfit / sellPrice (P0-6 — the real margin).
- * 14. unitRate = sellPrice / quantity (guard 0).
- * 15. marginPct (legacy) = (sellPrice - directCost) / sellPrice — for UI compat.
- *
- * If calculationStatus === 'incomplete', the returned sellPrice is provisional
- * (computed from whatever inputs ARE available) but must NOT be committed to a
- * finalized estimate. The pre-submission gate treats incomplete as a blocker.
- */
+/** P0-2: Validate a numeric financial value. Returns true if safe and non-negative. */
+function isValidPrice(n: unknown): n is number {
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0;
+}
+
+/** P0-2: Validate a non-negative finite quantity. */
+function isValidQuantity(n: unknown): n is number {
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0;
+}
+
+/** P0-2: Validate a percentage (0..1 allowed, but not negative or non-finite). */
+function isValidPct(n: unknown): n is number {
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0;
+}
+
+/** P0-2: Validate wastage (allow 0..1, reject negative or > 1 or non-finite). */
+function isValidWastage(n: unknown): n is number {
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 1;
+}
+
+/** P0-2: Validate a hybrid segment quantityPct (0..1). */
+function isValidSegmentPct(n: unknown): n is number {
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 1;
+}
+
 export function priceLine(input: PricingInput): PricingBreakdown {
   const {
     workDefinitionVersion,
@@ -211,6 +179,25 @@ export function priceLine(input: PricingInput): PricingBreakdown {
     ]);
   }
 
+  // P0-2: Validate top-level numeric inputs.
+  const blockingInputs: BlockingInput[] = [];
+
+  if (!isValidQuantity(quantity)) {
+    blockingInputs.push({ kind: 'invalid-quantity', detail: `Quantity "${quantity}" is invalid (negative, NaN, or non-finite).` });
+  }
+  if (!isValidWastage(workDefinitionVersion.wastage)) {
+    blockingInputs.push({ kind: 'invalid-wastage', detail: `Wastage "${workDefinitionVersion.wastage}" is invalid (must be 0..1).` });
+  }
+  if (!isValidPct(overheadPct)) {
+    blockingInputs.push({ kind: 'invalid-percentage', detail: `Overhead percentage "${overheadPct}" is invalid (negative or non-finite).` });
+  }
+  if (!isValidPct(profitPct)) {
+    blockingInputs.push({ kind: 'invalid-percentage', detail: `Profit percentage "${profitPct}" is invalid (negative or non-finite).` });
+  }
+  if (!isValidPct(contingencyPct)) {
+    blockingInputs.push({ kind: 'invalid-percentage', detail: `Contingency percentage "${contingencyPct}" is invalid (negative or non-finite).` });
+  }
+
   // Parse recipe defensively.
   let recipe: CostRecipeLine[] = [];
   try {
@@ -219,21 +206,20 @@ export function priceLine(input: PricingInput): PricingBreakdown {
       recipe = parsed as CostRecipeLine[];
     } else {
       return emptyBreakdown(true, [
+        ...blockingInputs,
         { kind: 'invalid-recipe', detail: 'Cost recipe JSON is not an array.' },
       ]);
     }
   } catch {
     return emptyBreakdown(true, [
+      ...blockingInputs,
       { kind: 'invalid-recipe', detail: 'Cost recipe JSON is invalid.' },
     ]);
   }
 
-  const wastage = Number.isFinite(workDefinitionVersion.wastage)
-    ? workDefinitionVersion.wastage
-    : 0;
-  const qty = Number.isFinite(quantity) ? quantity : 0;
+  const wastage = isValidWastage(workDefinitionVersion.wastage) ? workDefinitionVersion.wastage : 0;
+  const qty = isValidQuantity(quantity) ? quantity : 0;
 
-  const blockingInputs: BlockingInput[] = [];
   const unsourcedResources: string[] = [];
   const provenance: PricingProvenanceEntry[] = [];
   let material = 0;
@@ -252,9 +238,10 @@ export function priceLine(input: PricingInput): PricingBreakdown {
       kind === 'fee';
     if (!knownKind) continue;
 
-    // P0-4: missing price observation → blocking input, NOT silent zero.
+    const label = line.resourceName || line.resourceCode || 'unknown resource';
+
+    // P0-2: Missing price observation → blocking input.
     if (!line.priceObservation) {
-      const label = line.resourceName || line.resourceCode || 'unknown resource';
       if (!unsourcedResources.includes(label)) {
         unsourcedResources.push(label);
       }
@@ -267,30 +254,44 @@ export function priceLine(input: PricingInput): PricingBreakdown {
       continue;
     }
 
-    const price = Number.isFinite(line.priceObservation.price)
-      ? line.priceObservation.price
-      : 0;
-    const qpu = Number.isFinite(line.quantityPerUnit)
-      ? line.quantityPerUnit
-      : 0;
+    // P0-2: Invalid price (NaN, Infinity, negative) → blocking input, NOT zero.
+    if (!isValidPrice(line.priceObservation.price)) {
+      if (!unsourcedResources.includes(label)) {
+        unsourcedResources.push(label);
+      }
+      blockingInputs.push({
+        kind: 'invalid-price-observation',
+        resourceName: line.resourceName,
+        resourceCode: line.resourceCode,
+        detail: `Resource "${label}" (${kind}) has an invalid price: "${line.priceObservation.price}" (NaN, Infinity, or negative).`,
+      });
+      continue;
+    }
 
+    // P0-2: Invalid quantityPerUnit → blocking input.
+    if (!isValidQuantity(line.quantityPerUnit)) {
+      if (!unsourcedResources.includes(label)) {
+        unsourcedResources.push(label);
+      }
+      blockingInputs.push({
+        kind: 'invalid-quantity',
+        resourceName: line.resourceName,
+        resourceCode: line.resourceCode,
+        detail: `Resource "${label}" (${kind}) has an invalid quantityPerUnit: "${line.quantityPerUnit}".`,
+      });
+      continue;
+    }
+
+    const price = line.priceObservation.price;
+    const qpu = line.quantityPerUnit;
     const lineCost = round2(qpu * qty * (1 + wastage) * price);
 
     switch (kind) {
-      case 'material':
-        material += lineCost;
-        break;
-      case 'labour':
-        labour += lineCost;
-        break;
-      case 'plant':
-        plant += lineCost;
-        break;
-      case 'subcontract':
-        subcontractFromRecipe += lineCost;
-        break;
-      case 'fee':
-        break;
+      case 'material': material += lineCost; break;
+      case 'labour': labour += lineCost; break;
+      case 'plant': plant += lineCost; break;
+      case 'subcontract': subcontractFromRecipe += lineCost; break;
+      case 'fee': break;
     }
 
     provenance.push({
@@ -305,8 +306,9 @@ export function priceLine(input: PricingInput): PricingBreakdown {
 
   const unsourced = unsourcedResources.length > 0;
 
-  // ── Execution strategy (P0-5 fix: NO 50% heuristic) ──────────────────────
+  // ── Execution strategy ────────────────────────────────────────────────────
   let subcontractCost = subcontractFromRecipe;
+  let uncoveredSubcontractExposure = 0;
 
   if (executionStrategy === 'subcontract') {
     if (!subcontractQuote) {
@@ -315,50 +317,140 @@ export function priceLine(input: PricingInput): PricingBreakdown {
         detail: 'Execution strategy is "subcontract" but no subcontract quote is provided.',
       });
     } else {
-      // Use the quote as the price; zero out self-perform buckets.
-      material = 0;
-      labour = 0;
-      plant = 0;
-      subcontractCost = subcontractQuote.totalAmount;
+      // P0-4: Check coverage — a partial quote can't be the full price.
+      if (!isValidPrice(subcontractQuote.totalAmount)) {
+        blockingInputs.push({
+          kind: 'invalid-price-observation',
+          detail: `Subcontract quote totalAmount "${subcontractQuote.totalAmount}" is invalid.`,
+        });
+      } else if (subcontractQuote.coveragePct < 1) {
+        // Partial coverage — the quote doesn't cover the full scope.
+        // The quote amount is used as the covered cost, but the uncovered
+        // exposure is surfaced as a blocking input.
+        material = 0;
+        labour = 0;
+        plant = 0;
+        subcontractCost = subcontractQuote.totalAmount;
+        // Uncovered exposure = proportional value of uncovered scope.
+        // We don't know the exact required value here, so we estimate from
+        // the quote: if coverage is 40%, the full package ≈ quote / 0.4,
+        // and uncovered ≈ full - quote.
+        const estimatedFullValue = subcontractQuote.coveragePct > 0
+          ? subcontractQuote.totalAmount / subcontractQuote.coveragePct
+          : subcontractQuote.totalAmount;
+        uncoveredSubcontractExposure = round2(estimatedFullValue - subcontractQuote.totalAmount);
+        blockingInputs.push({
+          kind: 'partial-subcontract-coverage',
+          detail: `Subcontract quote covers only ${(subcontractQuote.coveragePct * 100).toFixed(0)}% of the required scope. Uncovered exposure: GHS ${uncoveredSubcontractExposure.toFixed(2)}. The uncovered scope must be assigned an execution strategy.`,
+        });
+      } else {
+        // Full coverage — safe to use the quote as the price.
+        material = 0;
+        labour = 0;
+        plant = 0;
+        subcontractCost = subcontractQuote.totalAmount;
+      }
     }
   } else if (executionStrategy === 'hybrid') {
-    // P0-5: hybrid requires explicit execution segments. NO heuristic.
+    // P0-3: Hardened hybrid validation.
     const segments = executionSegments ?? [];
+
     if (segments.length === 0) {
       blockingInputs.push({
         kind: 'missing-hybrid-allocation',
-        detail: 'Execution strategy is "hybrid" but no execution segments are defined. Explicit allocation required (no 50% heuristic).',
+        detail: 'Execution strategy is "hybrid" but no execution segments are defined. Explicit allocation required.',
       });
     } else {
-      const totalPct = segments.reduce((s, seg) => s + (Number.isFinite(seg.quantityPct) ? seg.quantityPct : 0), 0);
-      // Segments must sum to ~1.0 (within 0.01 tolerance).
-      if (Math.abs(totalPct - 1.0) > 0.01) {
-        blockingInputs.push({
-          kind: 'missing-hybrid-allocation',
-          detail: `Hybrid execution segments sum to ${(totalPct * 100).toFixed(1)}%, not 100%. Explicit allocation required.`,
+      // Validate each segment.
+      let hasSelfPerform = false;
+      let hasSubcontract = false;
+      let totalPct = 0;
+      const segmentErrors: BlockingInput[] = [];
+
+      for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        if (!isValidSegmentPct(seg.quantityPct)) {
+          segmentErrors.push({
+            kind: 'invalid-hybrid-segment',
+            detail: `Segment ${i + 1} has invalid quantityPct "${seg.quantityPct}" (must be 0..1).`,
+          });
+          continue;
+        }
+        totalPct += seg.quantityPct;
+
+        if (seg.strategy === 'self-perform') {
+          hasSelfPerform = true;
+        } else if (seg.strategy === 'subcontract') {
+          hasSubcontract = true;
+          if (!seg.subcontractQuote) {
+            segmentErrors.push({
+              kind: 'missing-subcontract-quote',
+              detail: `Hybrid subcontract segment ${i + 1} (${(seg.quantityPct * 100).toFixed(0)}%) has no subcontract quote.`,
+            });
+          } else if (!isValidPrice(seg.subcontractQuote.totalAmount)) {
+            segmentErrors.push({
+              kind: 'invalid-price-observation',
+              detail: `Hybrid subcontract segment ${i + 1} has an invalid quote totalAmount.`,
+            });
+          } else if (seg.subcontractQuote.coveragePct < 1) {
+            // P0-4: Partial coverage in a hybrid subcontract segment.
+            const segExposure = round2(
+              seg.subcontractQuote.totalAmount / Math.max(seg.subcontractQuote.coveragePct, 0.001) * (1 - seg.subcontractQuote.coveragePct) * seg.quantityPct,
+            );
+            uncoveredSubcontractExposure = round2(uncoveredSubcontractExposure + segExposure);
+            segmentErrors.push({
+              kind: 'partial-subcontract-coverage',
+              detail: `Hybrid subcontract segment ${i + 1} quote covers only ${(seg.subcontractQuote.coveragePct * 100).toFixed(0)}% of its scope. Uncovered exposure: GHS ${segExposure.toFixed(2)}.`,
+            });
+          }
+        } else {
+          segmentErrors.push({
+            kind: 'invalid-hybrid-segment',
+            detail: `Segment ${i + 1} has invalid strategy "${seg.strategy}" (must be self-perform or subcontract).`,
+          });
+        }
+      }
+
+      // P0-3: Must have both strategies.
+      if (!hasSelfPerform) {
+        segmentErrors.push({
+          kind: 'hybrid-missing-strategy',
+          detail: 'Hybrid allocation must contain at least one self-perform segment.',
         });
+      }
+      if (!hasSubcontract) {
+        segmentErrors.push({
+          kind: 'hybrid-missing-strategy',
+          detail: 'Hybrid allocation must contain at least one subcontract segment.',
+        });
+      }
+
+      // P0-3: Segments must sum to 1.0 (within 0.01 tolerance).
+      if (Math.abs(totalPct - 1.0) > 0.01) {
+        segmentErrors.push({
+          kind: 'missing-hybrid-allocation',
+          detail: `Hybrid execution segments sum to ${(totalPct * 100).toFixed(1)}%, not 100%.`,
+        });
+      }
+
+      if (segmentErrors.length > 0) {
+        blockingInputs.push(...segmentErrors);
       } else {
-        // Apply each segment: self-perform segments scale the recipe cost;
-        // subcontract segments use their quote proportional to quantityPct.
+        // Apply valid segments.
         let selfPerformMaterial = 0;
         let selfPerformLabour = 0;
         let selfPerformPlant = 0;
         let hybridSubcontract = 0;
         for (const seg of segments) {
-          const pct = Number.isFinite(seg.quantityPct) ? seg.quantityPct : 0;
+          const pct = seg.quantityPct;
           if (seg.strategy === 'self-perform') {
             selfPerformMaterial += material * pct;
             selfPerformLabour += labour * pct;
             selfPerformPlant += plant * pct;
-          } else if (seg.strategy === 'subcontract') {
-            if (seg.subcontractQuote) {
-              hybridSubcontract += seg.subcontractQuote.totalAmount * pct;
-            } else {
-              blockingInputs.push({
-                kind: 'missing-subcontract-quote',
-                detail: `Hybrid subcontract segment (${(pct * 100).toFixed(0)}%) has no subcontract quote.`,
-              });
-            }
+          } else if (seg.strategy === 'subcontract' && seg.subcontractQuote) {
+            // P0-4: Use the quote amount scaled by quantityPct.
+            // If coverage is partial, the uncovered exposure is already recorded.
+            hybridSubcontract += seg.subcontractQuote.totalAmount * pct;
           }
         }
         material = round2(selfPerformMaterial);
@@ -378,17 +470,12 @@ export function priceLine(input: PricingInput): PricingBreakdown {
   const projectCost = directCost;
   const riskCost = round2(directCost * contingencyPct);
   const overhead = round2((projectCost + riskCost) * overheadPct);
-  // P0-6: estimatedTotalCost excludes profit.
   const estimatedTotalCost = round2(projectCost + riskCost + overhead);
   const profit = round2(estimatedTotalCost * profitPct);
   const sellPrice = round2(estimatedTotalCost + profit);
-  // P0-6: expectedProfit = sellPrice - estimatedTotalCost (which already excludes profit,
-  // so expectedProfit === profit by construction, but we compute it explicitly for clarity).
   const expectedProfit = round2(sellPrice - estimatedTotalCost);
   const unitRate = qty > 0 ? round2(sellPrice / qty) : 0;
-  // P0-6: the real margin is expectedProfit / sellPrice.
   const expectedMarginPct = sellPrice > 0 ? round2(expectedProfit / sellPrice) : 0;
-  // Legacy margin (direct-cost spread) kept for UI backward-compat.
   const marginPct = sellPrice > 0 ? round2((sellPrice - directCost) / sellPrice) : 0;
 
   const calculationStatus: CalculationStatus =
@@ -401,6 +488,7 @@ export function priceLine(input: PricingInput): PricingBreakdown {
     labour,
     plant,
     subcontract: subcontractCost,
+    uncoveredSubcontractExposure,
     directCost,
     projectCost,
     riskCost,
