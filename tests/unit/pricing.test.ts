@@ -109,7 +109,7 @@ describe('P0-5: hybrid requires explicit allocation, NO 50% heuristic', () => {
       executionStrategy: 'hybrid',
       executionSegments: [
         { strategy: 'self-perform', quantityPct: 0.7 },
-        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 5000, coveragePct: 1.0 } },
+        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 5000, coveragePct: 1.0 }, quoteCoversSegmentScope: true },
       ],
     }))
     expect(result.calculationStatus).toBe('complete')

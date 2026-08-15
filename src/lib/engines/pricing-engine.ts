@@ -4,16 +4,14 @@
  * This is the canonical financial calculation layer (INVARIANT 6).
  * The LLM never performs financial arithmetic — it always delegates here.
  *
- * Final integrity pass fixes:
- * - P0-2: Invalid price observations (NaN, Infinity, -Infinity, negative) are
- *   blocking inputs, NEVER silently coerced to zero. Invalid quantities,
- *   wastage, and percentages are also blocking inputs.
- * - P0-3: Hybrid validation hardened — segments must be 0..1, sum to 1.0,
- *   contain at least one self-perform AND one subcontract segment. Subcontract
- *   segments must reference a valid quote.
- * - P0-4: Subcontract pricing vs coverage — a partial quote (coveragePct < 1)
- *   is NOT silently treated as the full segment price. The uncovered scope
- *   exposure is surfaced as a blocking input.
+ * Final mini-pass fixes:
+ * - Fix #1: Removed subcontract exposure extrapolation. Uncovered exposure
+ *   now comes from `uncoveredScopeValue` (the actual GHS value of uncovered
+ *   required scope, computed by the reconciliation engine). If not provided,
+ *   the exposure is 'unknown' (blocker) — NEVER extrapolated from quote/coverage.
+ * - Fix #2: Subcontract segments carry `scopeDefinition` + `quoteCoversSegmentScope`
+ *   so the engine can verify the quote covers the segment's specific scope.
+ * - Fix #4: Percentages (overhead, profit, contingency) bounded to 0..1, not just >= 0.
  *
  * Pure: no `Math.random`, no `Date.now`, no I/O, no Prisma client.
  */
@@ -45,12 +43,41 @@ export interface PricingWorkDefinitionVersion {
   costRecipeJson: string;
 }
 
-/** An explicit execution segment for hybrid strategy (P0-3). */
+/**
+ * An explicit execution segment for hybrid strategy (P0-3 + Fix #2).
+ * Fix #2: subcontract segments now carry `scopeDefinition` and
+ * `quoteCoversSegmentScope` so the engine can verify the quote
+ * actually covers the segment's required scope.
+ */
 export interface ExecutionSegmentInput {
   strategy: 'self-perform' | 'subcontract';
   quantityPct: number;
+  /** Human-readable description of the scope this segment covers. */
+  scopeDefinition?: string;
   /** Subcontract quote (required for subcontract segments). */
-  subcontractQuote?: { totalAmount: number; coveragePct: number } | null;
+  subcontractQuote?: SubcontractQuotePricingInput | null;
+  /**
+   * Fix #2: Whether the subcontract quote explicitly covers this segment's
+   * required scope. If false or undefined, the segment is incomplete.
+   */
+  quoteCoversSegmentScope?: boolean;
+}
+
+/**
+ * Subcontract quote input for pricing.
+ * Fix #1: `uncoveredScopeValue` is the actual GHS value of the uncovered
+ * required scope (from the reconciliation engine). If not provided and
+ * coverage < 100%, the exposure is 'unknown' (blocker, never extrapolated).
+ */
+export interface SubcontractQuotePricingInput {
+  totalAmount: number;
+  coveragePct: number;
+  /**
+   * Fix #1: The actual GHS value of the uncovered required scope.
+   * Computed by the reconciliation engine from uncovered scope atoms.
+   * If coveragePct < 1 and this is not provided, exposure is 'unknown'.
+   */
+  uncoveredScopeValue?: number;
 }
 
 export interface PricingInput {
@@ -61,7 +88,7 @@ export interface PricingInput {
   overheadPct: number;
   profitPct: number;
   contingencyPct: number;
-  subcontractQuote?: { totalAmount: number; coveragePct: number } | null;
+  subcontractQuote?: SubcontractQuotePricingInput | null;
 }
 
 export interface PricingProvenanceEntry {
@@ -74,7 +101,7 @@ export interface PricingProvenanceEntry {
 }
 
 export interface BlockingInput {
-  kind: 'missing-price' | 'missing-hybrid-allocation' | 'missing-work-definition' | 'invalid-recipe' | 'missing-subcontract-quote' | 'invalid-price-observation' | 'invalid-quantity' | 'invalid-wastage' | 'invalid-percentage' | 'invalid-hybrid-segment' | 'partial-subcontract-coverage' | 'hybrid-missing-strategy';
+  kind: 'missing-price' | 'missing-hybrid-allocation' | 'missing-work-definition' | 'invalid-recipe' | 'missing-subcontract-quote' | 'invalid-price-observation' | 'invalid-quantity' | 'invalid-wastage' | 'invalid-percentage' | 'invalid-hybrid-segment' | 'partial-subcontract-coverage' | 'hybrid-missing-strategy' | 'uncovered-exposure-unknown' | 'segment-scope-not-covered';
   resourceName?: string;
   resourceCode?: string;
   detail: string;
@@ -89,8 +116,9 @@ export interface PricingBreakdown {
   labour: number;
   plant: number;
   subcontract: number;
-  /** P0-4: uncovered subcontract scope exposure (GHS at risk). */
   uncoveredSubcontractExposure: number;
+  /** True when exposure couldn't be determined (no uncoveredScopeValue provided). */
+  exposureUnknown: boolean;
   directCost: number;
   projectCost: number;
   riskCost: number;
@@ -119,6 +147,7 @@ function emptyBreakdown(
     plant: 0,
     subcontract: 0,
     uncoveredSubcontractExposure: 0,
+    exposureUnknown: false,
     directCost: 0,
     projectCost: 0,
     riskCost: 0,
@@ -146,9 +175,12 @@ function isValidQuantity(n: unknown): n is number {
   return typeof n === 'number' && Number.isFinite(n) && n >= 0;
 }
 
-/** P0-2: Validate a percentage (0..1 allowed, but not negative or non-finite). */
+/**
+ * Fix #4: Validate a commercial percentage — must be 0..1 (not just >= 0).
+ * A value of 4.0 (400%) is almost certainly a data error in a 0..1 model.
+ */
 function isValidPct(n: unknown): n is number {
-  return typeof n === 'number' && Number.isFinite(n) && n >= 0;
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 1;
 }
 
 /** P0-2: Validate wastage (allow 0..1, reject negative or > 1 or non-finite). */
@@ -159,6 +191,32 @@ function isValidWastage(n: unknown): n is number {
 /** P0-2: Validate a hybrid segment quantityPct (0..1). */
 function isValidSegmentPct(n: unknown): n is number {
   return typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 1;
+}
+
+/**
+ * Handle partial subcontract coverage — Fix #1: no extrapolation.
+ * Returns the uncovered exposure if determinable, or marks it unknown.
+ */
+function handlePartialCoverage(
+  quote: SubcontractQuotePricingInput,
+  blockingInputs: BlockingInput[],
+  context: string,
+): { exposure: number; unknown: boolean } {
+  if (quote.uncoveredScopeValue !== undefined && isValidPrice(quote.uncoveredScopeValue)) {
+    // Fix #1: Use the actual uncovered scope value from the reconciliation engine.
+    const exposure = round2(quote.uncoveredScopeValue);
+    blockingInputs.push({
+      kind: 'partial-subcontract-coverage',
+      detail: `${context} covers only ${(quote.coveragePct * 100).toFixed(0)}% of the required scope. Uncovered exposure: GHS ${exposure.toFixed(2)} (from uncovered scope atoms). The uncovered scope must be assigned an execution strategy.`,
+    });
+    return { exposure, unknown: false };
+  }
+  // Fix #1: No uncoveredScopeValue provided — exposure is UNKNOWN, not extrapolated.
+  blockingInputs.push({
+    kind: 'uncovered-exposure-unknown',
+    detail: `${context} covers only ${(quote.coveragePct * 100).toFixed(0)}% of the required scope, but the uncovered scope value was not provided. Cannot extrapolate exposure from the quote amount — provide the actual uncovered scope value from the reconciliation engine.`,
+  });
+  return { exposure: 0, unknown: true };
 }
 
 export function priceLine(input: PricingInput): PricingBreakdown {
@@ -179,7 +237,6 @@ export function priceLine(input: PricingInput): PricingBreakdown {
     ]);
   }
 
-  // P0-2: Validate top-level numeric inputs.
   const blockingInputs: BlockingInput[] = [];
 
   if (!isValidQuantity(quantity)) {
@@ -188,14 +245,15 @@ export function priceLine(input: PricingInput): PricingBreakdown {
   if (!isValidWastage(workDefinitionVersion.wastage)) {
     blockingInputs.push({ kind: 'invalid-wastage', detail: `Wastage "${workDefinitionVersion.wastage}" is invalid (must be 0..1).` });
   }
+  // Fix #4: Percentages must be 0..1, not just >= 0.
   if (!isValidPct(overheadPct)) {
-    blockingInputs.push({ kind: 'invalid-percentage', detail: `Overhead percentage "${overheadPct}" is invalid (negative or non-finite).` });
+    blockingInputs.push({ kind: 'invalid-percentage', detail: `Overhead percentage "${overheadPct}" is invalid (must be 0..1, got ${overheadPct}).` });
   }
   if (!isValidPct(profitPct)) {
-    blockingInputs.push({ kind: 'invalid-percentage', detail: `Profit percentage "${profitPct}" is invalid (negative or non-finite).` });
+    blockingInputs.push({ kind: 'invalid-percentage', detail: `Profit percentage "${profitPct}" is invalid (must be 0..1, got ${profitPct}).` });
   }
   if (!isValidPct(contingencyPct)) {
-    blockingInputs.push({ kind: 'invalid-percentage', detail: `Contingency percentage "${contingencyPct}" is invalid (negative or non-finite).` });
+    blockingInputs.push({ kind: 'invalid-percentage', detail: `Contingency percentage "${contingencyPct}" is invalid (must be 0..1, got ${contingencyPct}).` });
   }
 
   // Parse recipe defensively.
@@ -240,11 +298,8 @@ export function priceLine(input: PricingInput): PricingBreakdown {
 
     const label = line.resourceName || line.resourceCode || 'unknown resource';
 
-    // P0-2: Missing price observation → blocking input.
     if (!line.priceObservation) {
-      if (!unsourcedResources.includes(label)) {
-        unsourcedResources.push(label);
-      }
+      if (!unsourcedResources.includes(label)) unsourcedResources.push(label);
       blockingInputs.push({
         kind: 'missing-price',
         resourceName: line.resourceName,
@@ -254,11 +309,8 @@ export function priceLine(input: PricingInput): PricingBreakdown {
       continue;
     }
 
-    // P0-2: Invalid price (NaN, Infinity, negative) → blocking input, NOT zero.
     if (!isValidPrice(line.priceObservation.price)) {
-      if (!unsourcedResources.includes(label)) {
-        unsourcedResources.push(label);
-      }
+      if (!unsourcedResources.includes(label)) unsourcedResources.push(label);
       blockingInputs.push({
         kind: 'invalid-price-observation',
         resourceName: line.resourceName,
@@ -268,11 +320,8 @@ export function priceLine(input: PricingInput): PricingBreakdown {
       continue;
     }
 
-    // P0-2: Invalid quantityPerUnit → blocking input.
     if (!isValidQuantity(line.quantityPerUnit)) {
-      if (!unsourcedResources.includes(label)) {
-        unsourcedResources.push(label);
-      }
+      if (!unsourcedResources.includes(label)) unsourcedResources.push(label);
       blockingInputs.push({
         kind: 'invalid-quantity',
         resourceName: line.resourceName,
@@ -309,6 +358,7 @@ export function priceLine(input: PricingInput): PricingBreakdown {
   // ── Execution strategy ────────────────────────────────────────────────────
   let subcontractCost = subcontractFromRecipe;
   let uncoveredSubcontractExposure = 0;
+  let exposureUnknown = false;
 
   if (executionStrategy === 'subcontract') {
     if (!subcontractQuote) {
@@ -317,34 +367,21 @@ export function priceLine(input: PricingInput): PricingBreakdown {
         detail: 'Execution strategy is "subcontract" but no subcontract quote is provided.',
       });
     } else {
-      // P0-4: Check coverage — a partial quote can't be the full price.
       if (!isValidPrice(subcontractQuote.totalAmount)) {
         blockingInputs.push({
           kind: 'invalid-price-observation',
           detail: `Subcontract quote totalAmount "${subcontractQuote.totalAmount}" is invalid.`,
         });
       } else if (subcontractQuote.coveragePct < 1) {
-        // Partial coverage — the quote doesn't cover the full scope.
-        // The quote amount is used as the covered cost, but the uncovered
-        // exposure is surfaced as a blocking input.
+        // Fix #1: No extrapolation — use uncoveredScopeValue or mark unknown.
+        const result = handlePartialCoverage(subcontractQuote, blockingInputs, 'Subcontract quote');
+        uncoveredSubcontractExposure = result.exposure;
+        exposureUnknown = result.unknown;
         material = 0;
         labour = 0;
         plant = 0;
         subcontractCost = subcontractQuote.totalAmount;
-        // Uncovered exposure = proportional value of uncovered scope.
-        // We don't know the exact required value here, so we estimate from
-        // the quote: if coverage is 40%, the full package ≈ quote / 0.4,
-        // and uncovered ≈ full - quote.
-        const estimatedFullValue = subcontractQuote.coveragePct > 0
-          ? subcontractQuote.totalAmount / subcontractQuote.coveragePct
-          : subcontractQuote.totalAmount;
-        uncoveredSubcontractExposure = round2(estimatedFullValue - subcontractQuote.totalAmount);
-        blockingInputs.push({
-          kind: 'partial-subcontract-coverage',
-          detail: `Subcontract quote covers only ${(subcontractQuote.coveragePct * 100).toFixed(0)}% of the required scope. Uncovered exposure: GHS ${uncoveredSubcontractExposure.toFixed(2)}. The uncovered scope must be assigned an execution strategy.`,
-        });
       } else {
-        // Full coverage — safe to use the quote as the price.
         material = 0;
         labour = 0;
         plant = 0;
@@ -352,7 +389,6 @@ export function priceLine(input: PricingInput): PricingBreakdown {
       }
     }
   } else if (executionStrategy === 'hybrid') {
-    // P0-3: Hardened hybrid validation.
     const segments = executionSegments ?? [];
 
     if (segments.length === 0) {
@@ -361,7 +397,6 @@ export function priceLine(input: PricingInput): PricingBreakdown {
         detail: 'Execution strategy is "hybrid" but no execution segments are defined. Explicit allocation required.',
       });
     } else {
-      // Validate each segment.
       let hasSelfPerform = false;
       let hasSubcontract = false;
       let totalPct = 0;
@@ -393,14 +428,20 @@ export function priceLine(input: PricingInput): PricingBreakdown {
               detail: `Hybrid subcontract segment ${i + 1} has an invalid quote totalAmount.`,
             });
           } else if (seg.subcontractQuote.coveragePct < 1) {
-            // P0-4: Partial coverage in a hybrid subcontract segment.
-            const segExposure = round2(
-              seg.subcontractQuote.totalAmount / Math.max(seg.subcontractQuote.coveragePct, 0.001) * (1 - seg.subcontractQuote.coveragePct) * seg.quantityPct,
+            // Fix #1: No extrapolation for hybrid segments either.
+            const segResult = handlePartialCoverage(
+              seg.subcontractQuote,
+              segmentErrors,
+              `Hybrid subcontract segment ${i + 1}`,
             );
-            uncoveredSubcontractExposure = round2(uncoveredSubcontractExposure + segExposure);
+            uncoveredSubcontractExposure = round2(uncoveredSubcontractExposure + segResult.exposure);
+            if (segResult.unknown) exposureUnknown = true;
+          }
+          // Fix #2: Verify the quote covers this segment's specific scope.
+          if (seg.subcontractQuote && seg.quoteCoversSegmentScope !== true) {
             segmentErrors.push({
-              kind: 'partial-subcontract-coverage',
-              detail: `Hybrid subcontract segment ${i + 1} quote covers only ${(seg.subcontractQuote.coveragePct * 100).toFixed(0)}% of its scope. Uncovered exposure: GHS ${segExposure.toFixed(2)}.`,
+              kind: 'segment-scope-not-covered',
+              detail: `Hybrid subcontract segment ${i + 1} quote has not been verified to cover the segment's required scope${seg.scopeDefinition ? ` ("${seg.scopeDefinition}")` : ''}. Explicitly confirm quoteCoversSegmentScope=true after reconciling the quote against the segment's scope atoms.`,
             });
           }
         } else {
@@ -411,7 +452,6 @@ export function priceLine(input: PricingInput): PricingBreakdown {
         }
       }
 
-      // P0-3: Must have both strategies.
       if (!hasSelfPerform) {
         segmentErrors.push({
           kind: 'hybrid-missing-strategy',
@@ -425,7 +465,6 @@ export function priceLine(input: PricingInput): PricingBreakdown {
         });
       }
 
-      // P0-3: Segments must sum to 1.0 (within 0.01 tolerance).
       if (Math.abs(totalPct - 1.0) > 0.01) {
         segmentErrors.push({
           kind: 'missing-hybrid-allocation',
@@ -436,7 +475,6 @@ export function priceLine(input: PricingInput): PricingBreakdown {
       if (segmentErrors.length > 0) {
         blockingInputs.push(...segmentErrors);
       } else {
-        // Apply valid segments.
         let selfPerformMaterial = 0;
         let selfPerformLabour = 0;
         let selfPerformPlant = 0;
@@ -448,8 +486,6 @@ export function priceLine(input: PricingInput): PricingBreakdown {
             selfPerformLabour += labour * pct;
             selfPerformPlant += plant * pct;
           } else if (seg.strategy === 'subcontract' && seg.subcontractQuote) {
-            // P0-4: Use the quote amount scaled by quantityPct.
-            // If coverage is partial, the uncovered exposure is already recorded.
             hybridSubcontract += seg.subcontractQuote.totalAmount * pct;
           }
         }
@@ -489,6 +525,7 @@ export function priceLine(input: PricingInput): PricingBreakdown {
     plant,
     subcontract: subcontractCost,
     uncoveredSubcontractExposure,
+    exposureUnknown,
     directCost,
     projectCost,
     riskCost,

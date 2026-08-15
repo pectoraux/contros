@@ -121,7 +121,7 @@ describe('P0-3: hybrid execution validation', () => {
       executionStrategy: 'hybrid',
       executionSegments: [
         { strategy: 'self-perform', quantityPct: 0.7 },
-        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 5000, coveragePct: 1.0 } },
+        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 5000, coveragePct: 1.0 }, quoteCoversSegmentScope: true },
       ],
     }))
     expect(result.calculationStatus).toBe('complete')
@@ -141,30 +141,41 @@ describe('P0-4: subcontract pricing vs coverage', () => {
     expect(result.uncoveredSubcontractExposure).toBe(0)
   })
 
-  test('pure subcontract with partial coverage (40%) → incomplete + exposure', () => {
+  test('pure subcontract with partial coverage (40%) → incomplete, exposure unknown without uncoveredScopeValue', () => {
     const result = priceLine(baseInput({
       executionStrategy: 'subcontract',
       subcontractQuote: { totalAmount: 40000, coveragePct: 0.4 },
     }))
     expect(result.calculationStatus).toBe('incomplete')
-    expect(result.blockingInputs.some((b) => b.kind === 'partial-subcontract-coverage')).toBe(true)
-    // Estimated full value = 40000 / 0.4 = 100000; uncovered = 100000 - 40000 = 60000
-    expect(result.uncoveredSubcontractExposure).toBe(60000)
+    expect(result.blockingInputs.some((b) => b.kind === 'uncovered-exposure-unknown')).toBe(true)
+    expect(result.exposureUnknown).toBe(true)
+    expect(result.uncoveredSubcontractExposure).toBe(0) // NOT extrapolated to 60000
   })
 
-  test('hybrid subcontract segment with partial coverage → incomplete + exposure', () => {
+  test('pure subcontract with partial coverage + uncoveredScopeValue → uses actual value', () => {
+    const result = priceLine(baseInput({
+      executionStrategy: 'subcontract',
+      subcontractQuote: { totalAmount: 40000, coveragePct: 0.4, uncoveredScopeValue: 55000 },
+    }))
+    expect(result.calculationStatus).toBe('incomplete')
+    expect(result.blockingInputs.some((b) => b.kind === 'partial-subcontract-coverage')).toBe(true)
+    expect(result.uncoveredSubcontractExposure).toBe(55000) // actual, not extrapolated
+    expect(result.exposureUnknown).toBe(false)
+  })
+
+  test('hybrid subcontract segment with partial coverage → incomplete, exposure unknown', () => {
     const recipe = [pricedLine({ resourceKind: 'material', resourceName: 'Blocks', quantityPerUnit: 12.5, priceObservation: { price: 6.5, provenance: 'q', observedAt: '2025-01-01' } })]
     const result = priceLine(baseInput({
       workDefinitionVersion: WD(recipe),
       executionStrategy: 'hybrid',
       executionSegments: [
         { strategy: 'self-perform', quantityPct: 0.7 },
-        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 10000, coveragePct: 0.5 } },
+        { strategy: 'subcontract', quantityPct: 0.3, subcontractQuote: { totalAmount: 10000, coveragePct: 0.5 }, quoteCoversSegmentScope: true },
       ],
     }))
     expect(result.calculationStatus).toBe('incomplete')
-    expect(result.blockingInputs.some((b) => b.kind === 'partial-subcontract-coverage')).toBe(true)
-    expect(result.uncoveredSubcontractExposure).toBeGreaterThan(0)
+    expect(result.blockingInputs.some((b) => b.kind === 'uncovered-exposure-unknown')).toBe(true)
+    expect(result.exposureUnknown).toBe(true)
   })
 })
 

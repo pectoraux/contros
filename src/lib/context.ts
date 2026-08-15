@@ -38,10 +38,19 @@ export async function requireAuth(): Promise<RequestContext> {
     name?: string | null
     email?: string | null
   }
+  // Fix #3: Fail closed on invalid roles — reject the request entirely.
+  // A corrupted or unexpected role must NOT silently become 'estimator'.
+  if (!isValidRole(u.role)) {
+    const err = new Error(
+      `Forbidden: invalid role "${u.role}" — authentication rejected.`,
+    ) as Error & { status: number }
+    err.status = 403
+    throw err
+  }
   return {
     userId: u.id,
     organizationId: u.organizationId,
-    role: isValidRole(u.role) ? u.role : 'estimator',
+    role: u.role,
     isDemo: u.isDemo ?? false,
     name: u.name ?? null,
     email: u.email ?? null,

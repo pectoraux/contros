@@ -20,6 +20,7 @@ export type {
   CostRecipeLine,
   PricingWorkDefinitionVersion,
   ExecutionSegmentInput,
+  SubcontractQuotePricingInput,
   BlockingInput,
   CalculationStatus,
   PricingInput,

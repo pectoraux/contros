@@ -53,14 +53,18 @@ export const authOptions: NextAuthOptions = {
         const valid = await bcrypt.compare(credentials.password, user.passwordHash)
         if (!valid) return null
 
-        // P0-8: Validate role at runtime — reject unknown roles.
-        const role = isValidRole(user.role) ? user.role : 'estimator'
+        // Fix #3: Fail closed on invalid roles — reject the login entirely.
+        // A corrupted or unexpected persisted role must NOT silently become 'estimator'.
+        if (!isValidRole(user.role)) {
+          console.error(`FATAL: User ${user.email} has invalid role "${user.role}" — rejecting login.`)
+          return null
+        }
 
         return {
           id: user.id,
           name: user.name,
           email: user.email,
-          role,
+          role: user.role,
           organizationId: user.organizationId,
           isDemo: user.isDemo,
         }
@@ -74,8 +78,13 @@ export const authOptions: NextAuthOptions = {
       if (user) {
         const u = user as { role: string; organizationId: string; isDemo: boolean }
         token.id = user.id
-        // P0-8: Validate role before putting it in the token.
-        token.role = isValidRole(u.role) ? u.role : 'estimator'
+        // Fix #3: Fail closed — if the role in the user object is invalid,
+        // clear the token so the session is rejected.
+        if (!isValidRole(u.role)) {
+          console.error(`FATAL: Invalid role "${u.role}" in JWT callback — clearing token.`)
+          return { ...token, role: undefined, organizationId: undefined, isDemo: undefined, id: undefined }
+        }
+        token.role = u.role
         token.organizationId = u.organizationId
         token.isDemo = u.isDemo
       }
@@ -84,8 +93,12 @@ export const authOptions: NextAuthOptions = {
     async session({ session, token }) {
       if (session.user) {
         const role = token.role as string
+        // Fix #3: Fail closed — if the token role is invalid, return no session.
+        if (!isValidRole(role)) {
+          return { ...session, user: undefined } as typeof session
+        }
         ;(session.user as { id?: string }).id = token.id as string
-        ;(session.user as { role?: string }).role = isValidRole(role) ? role : 'estimator'
+        ;(session.user as { role?: string }).role = role
         ;(session.user as { organizationId?: string }).organizationId = token.organizationId as string
         ;(session.user as { isDemo?: boolean }).isDemo = token.isDemo as boolean
       }
