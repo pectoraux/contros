@@ -1291,3 +1291,65 @@ Stage Summary:
   * Scope mutation transaction rollback test passes
 - Four application services: EstimateService (FROZEN), SubcontractService (FROZEN),
   BidService (FROZEN), OpportunityService (FROZEN).
+
+---
+Task ID: document-service-1
+Agent: principal-engineer
+Task: DocumentService — tender document lifecycle, immutable versions, TenderDeliverable integration
+
+Work Log:
+- Added Prisma schema: Document + DocumentVersion models.
+  * Document: organizationId, opportunityId, kind (7 document-backed kinds),
+    status (missing|draft|ready|finalized), currentVersionId.
+    @@unique([opportunityId, kind]) — one document per kind per opportunity.
+  * DocumentVersion: documentId, revisionNo, snapshotJson (immutable content +
+    source provenance), status (draft|finalized), finalizedAt, finalizedById.
+    @@unique([documentId, revisionNo]) — monotonic per-document numbering.
+  * Follows the EstimateRevision immutable-snapshot pattern.
+- Created src/repositories/document-repositories.ts with 3 tenant-scoped repos:
+  * documentRepository (getForOpportunity, getForOpportunityInTransaction,
+    listForOrganization, getForOrganization, createInTransaction,
+    updateInTransaction, getLatestRevisionNoInTransaction)
+  * documentVersionRepository (createDraftInTransaction,
+    updateDraftSnapshotInTransaction [drafts only — finalized=immutable],
+    finalizeInTransaction, getForOrganization, listForDocument,
+    getLatestDraftForDocument)
+  * tenderDeliverableLinkRepository (updateForOpportunityKindInTransaction —
+    connects DocumentService to BidService's TenderDeliverable without
+    modifying BidService)
+- Created src/application/document-service.ts with 6 service methods:
+  * getDocument, listDocuments, saveDraft, finalizeVersion, markReady,
+    getVersionHistory
+  * All follow the frozen pattern: RequestContext → Service → Repository →
+    Transaction → Audit
+  * Zero raw db.* or tx.document* calls — all through tenant-scoped repos
+  * saveDraft: creates document if needed, updates existing draft or creates
+    new version with monotonic revisionNo
+  * finalizeVersion: freezes draft as immutable, updates Document.status,
+    updates linked TenderDeliverable (status→'finalized', revisionId→versionId)
+  * markReady: lighter status (ready=editable, finalized=immutable)
+  * Idempotent finalization (already-finalized → success, no duplicate audit)
+- Created 5 API routes (thin adapters):
+  * GET /api/documents/[opportunityId] — list
+  * GET/PUT /api/documents/[opportunityId]/[kind] — get/save draft
+  * POST /api/documents/[documentId]/finalize — finalize
+  * POST /api/documents/[documentId]/ready — mark ready
+  * GET /api/documents/[documentId]/versions — version history
+- 14 integration tests pass:
+  * Document lifecycle (create, save draft, finalize, new version after finalize)
+  * Immutability (finalized version cannot be modified)
+  * Cross-tenant isolation (Org B cannot get/finalize/save to Org A)
+  * TenderDeliverable integration (finalize + markReady update the deliverable)
+  * Version history (latest-first ordering)
+  * Invalid kind validation (rejects 'programme' — revision-backed, not document-backed)
+  * Transaction rollback (version insert + audit failure → rollback)
+- 106 unit tests pass. Lint clean.
+
+Stage Summary:
+- DocumentService is code-complete and tested.
+- INVARIANT 9 preserved: documents are projections, not canonical state.
+- Immutable versions (finalized DocumentVersion cannot be modified).
+- TenderDeliverable integration connects to BidService's submission gate
+  WITHOUT modifying BidService.
+- Five application services: EstimateService (FROZEN), SubcontractService (FROZEN),
+  BidService (FROZEN), OpportunityService (FROZEN), DocumentService (code-complete).

@@ -36,6 +36,7 @@ model Organization {
   commercialExceptions CommercialException[]
   projectActuals   ProjectActual[]
   calibrationProposals CalibrationProposal[]
+  documents      Document[]
 }
 
 model User {
@@ -119,6 +120,7 @@ model Opportunity {
   estimates          Estimate[]
   subcontractPackages SubcontractPackage[]
   bid                Bid?
+  documents          Document[]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -641,11 +643,59 @@ model TenderDeliverable {
   kind        String   // boq | programme | method-statement | jha | cover-letter | assumptions | clarifications | certificate
   required    Boolean  @default(true)
   status      String   @default("missing") // missing | draft | ready | finalized
-  revisionId  String?  // references an EstimateRevision (for programme) or future document ID
+  revisionId  String?  // references an EstimateRevision (for programme) or a DocumentVersion (for document-backed kinds)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   bid         Bid @relation(fields: [bidId], references: [id])
 
   @@unique([bidId, kind])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Documents — tender document artifacts (method statements, JHAs, BOQs, etc.)
+//
+// INVARIANT 9: Documents are projections/working copies, not canonical state.
+// The Estimate is canonical; documents are assembled FROM the estimate + WDV.
+//
+// A Document is the per-opportunity, per-kind artifact (e.g. "the method
+// statement for Opportunity X"). It has immutable DocumentVersions — each
+// finalization creates a new version with an immutable snapshotJson.
+//
+// When a DocumentVersion is finalized, the linked TenderDeliverable
+// (matched by bidId + kind) is updated: status → 'finalized',
+// revisionId → DocumentVersion.id. This connects DocumentService to
+// BidService's submission gate without modifying BidService.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Document {
+  id              String   @id @default(cuid())
+  organizationId  String
+  opportunityId   String
+  kind            String   // boq | method-statement | jha | cover-letter | assumptions | clarifications | certificate
+  status          String   @default("missing") // missing | draft | ready | finalized
+  currentVersionId String?  // points to the latest finalized DocumentVersion
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  opportunity     Opportunity  @relation(fields: [opportunityId], references: [id])
+  versions        DocumentVersion[]
+
+  @@unique([opportunityId, kind]) // one document per kind per opportunity
+}
+
+model DocumentVersion {
+  id              String    @id @default(cuid())
+  documentId      String
+  revisionNo      Int       // monotonic per document (1, 2, 3, ...)
+  snapshotJson    String    // immutable content + source provenance (WDV IDs, estimate line IDs, assembled body)
+  status          String    @default("draft") // draft | finalized — finalized = immutable
+  finalizedAt     DateTime?
+  finalizedById   String?
+  createdAt       DateTime  @default(now())
+
+  document        Document @relation(fields: [documentId], references: [id])
+
+  @@unique([documentId, revisionNo])
 }

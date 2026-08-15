@@ -1315,3 +1315,11 @@ export {
   opportunityDetailGraphRepository,
 } from './opportunity-repositories'
 export type { GraphInconsistency, HardenedOpportunityDetail } from './opportunity-repositories'
+
+// ─── Document Repositories ──────────────────────────────────────────────────
+// Re-exported from a dedicated module. Tenant-scoped via document → org.
+export {
+  documentRepository,
+  documentVersionRepository,
+  tenderDeliverableLinkRepository,
+} from './document-repositories'
