@@ -170,6 +170,9 @@ export const bidService = {
 
           // P0-2: Build subcontract packages from the FROZEN revision snapshot.
           // The snapshot contains subcontractQuote per line — use it, NOT current packages.
+          // P0 (final): If the frozen snapshot has zero subcontract quotes, that means
+          // NO subcontract commercial basis existed at adjudication. Do NOT fall back
+          // to current mutable subcontract packages. Empty = empty.
           const frozenQuotes = replay.subcontractScopeSnapshots
           subcontractPackages = frozenQuotes.map((sq) => ({
             id: sq.id,
@@ -178,14 +181,7 @@ export const bidService = {
             selectedQuoteId: sq.id,
             isLumpSum: sq.economicCoverageUnknown,
           }))
-          // If no subcontract quotes in snapshot, use empty array (no packages = no blocker)
-          if (frozenQuotes.length === 0) {
-            subcontractPackages = opportunity.subcontractPackages.map((sp) => ({
-              id: sp.id, name: sp.name,
-              coveragePct: sp.quotes.find((q) => q.id === sp.selectedQuoteId)?.coveragePct ?? 0,
-              selectedQuoteId: sp.selectedQuoteId, isLumpSum: false,
-            }))
-          }
+          // No fallback to current packages — empty snapshot = empty packages.
         }
       }
     } else {
@@ -223,9 +219,15 @@ export const bidService = {
       tenderPack: bid?.tenderPackStatus === 'ready' || bid?.tenderPackStatus === 'submitted',
     }
 
-    const commercialApproval =
-      (bid?.directorAdjustment !== undefined && bid?.directorAdjustment !== 0) ||
-      estimate?.status === 'adjudicated' || estimate?.status === 'submitted'
+    // P0 (final): Commercial approval must NOT come from current mutable Estimate.status.
+    // After adjudication, approval is derived from the bid's adjudication state, not the estimate.
+    // Before adjudication, current estimate status is acceptable.
+    const commercialApproval = bid?.adjudicatedRevisionId
+      ? // Post-adjudication: approval exists if adjudication was recorded (directorAdjustment or systemSellPrice set)
+        !!(bid.directorAdjustment !== 0 || bid.systemSellPrice)
+      : // Pre-adjudication: use current estimate status (acceptable before commercial freeze)
+        (bid?.directorAdjustment !== undefined && bid?.directorAdjustment !== 0) ||
+        estimate?.status === 'adjudicated' || estimate?.status === 'submitted'
 
     const gate = runPreSubmissionGate({
       scopeCompleteness, unresolvedAssumptions, estimateLines, subcontractPackages, deliverables, commercialApproval,
@@ -286,6 +288,8 @@ export const bidService = {
       if (!created) return null
       // P1-3: Create tender deliverables — use caller-specified requirements
       // or sensible defaults if not provided.
+      // NOTE: These defaults are MVP defaults and are not the final industry/tender
+      // requirement model. The full tender-requirement derivation will come later.
       const defaults: TenderDeliverableRequirement[] = requiredDeliverables ?? [
         { kind: 'boq', required: true },
         { kind: 'programme', required: true },

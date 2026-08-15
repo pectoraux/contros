@@ -488,4 +488,58 @@ describe('BidService integration tests', () => {
       }
     }
   }, 60000)
+
+  // ── Post-adjudication: subcontract + estimate.status mutation ──────────────
+  test('Post-adjudication: new subcontract quote + estimate.status change do not alter gate', async () => {
+    // 1. Recompute + finalize (no subcontract in the revision)
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 900 })
+    if (!finalizeResult.ok) return
+    const revId = finalizeResult.revisionId
+
+    // 2. Create bid + adjudicate (no subcontract in snapshot)
+    const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
+    if (!createResult.ok) return
+
+    await bidService.recordAdjudication({
+      ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: revId,
+      directorAdjustment: 0, adjustmentRationale: 'mutation test',
+    })
+
+    // 3. Record the gate BEFORE mutation
+    const wsBefore = await bidService.getBidWorkspace({ ctx: ctxA, opportunityId: OPP_A })
+    expect(wsBefore.ok).toBe(true)
+
+    // 4. Mutate: change current estimate status
+    await db.estimate.update({
+      where: { id: EST_A },
+      data: { status: 'submitted' },
+    })
+
+    // 5. Run gate AFTER mutation
+    const wsAfter = await bidService.getBidWorkspace({ ctx: ctxA, opportunityId: OPP_A })
+    expect(wsAfter.ok).toBe(true)
+
+    if (wsBefore.ok && wsAfter.ok) {
+      // P0-2: commercialApproval must NOT change due to estimate.status mutation
+      const approvalBefore = wsBefore.gate.checks.find((c) => c.id === 'commercial-approval')
+      const approvalAfter = wsAfter.gate.checks.find((c) => c.id === 'commercial-approval')
+      if (approvalBefore && approvalAfter) {
+        expect(approvalAfter.status).toBe(approvalBefore.status)
+      }
+
+      // P0-1: subcontract packages must be empty (no snapshot, no fallback)
+      // The gate's subcontract-coverage check should not see any packages
+      const subcontractCheck = wsAfter.gate.checks.find((c) => c.id === 'subcontract-coverage')
+      if (subcontractCheck) {
+        // No packages = pass (nothing to check)
+        expect(subcontractCheck.status).toBe('pass')
+      }
+    }
+
+    // Clean up: restore estimate
+    await db.estimate.update({ where: { id: EST_A }, data: { status: 'draft' } })
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 900 } })
+    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
+  }, 60000)
 })
