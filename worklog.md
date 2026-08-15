@@ -1067,3 +1067,28 @@ Work Log:
 Stage Summary:
 - BidService FROZEN. All final requirements satisfied.
 - Three frozen application services: EstimateService, SubcontractService, BidService.
+
+---
+Task ID: bid-service-final-freeze-correction
+Agent: principal-engineer
+Task: BidService final freeze correction — remove subcontract fallback + estimate.status from commercialApproval
+
+Work Log:
+- P0-1: Removed mutable subcontract fallback after adjudication.
+  When frozen snapshot has zero subcontract quotes, subcontractPackages = [].
+  No fallback to current opportunity.subcontractPackages.
+- P0-2: Removed current Estimate.status from commercialApproval after adjudication.
+  Post-adjudication: approval derived from bid.directorAdjustment/systemSellPrice.
+  Pre-adjudication: current estimate status still acceptable.
+- P1-3: Added comment that deliverable defaults are MVP, not final tender model.
+- New regression test: post-adjudication estimate.status mutation + no subcontract fallback.
+  19 integration tests all pass.
+- Code on GitHub at 59a55a4. Vercel deploy limit exceeded — deployment pending.
+
+Stage Summary:
+- BidService now satisfies ALL final freeze requirements:
+  * No mutable subcontract fallback after adjudication
+  * No current Estimate.status in commercialApproval after adjudication
+  * Frozen commercial state is the ONLY source after adjudication
+  * 19 real integration tests including the regression test
+- Three frozen application services: EstimateService, SubcontractService, BidService.
