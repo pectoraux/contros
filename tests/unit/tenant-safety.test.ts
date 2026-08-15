@@ -1,19 +1,18 @@
 /**
- * Cross-tenant adversarial tests — verify tenant-safe dereferencing.
+ * Tenant-safe dereferencing — source code audit.
+ *
+ * Scans the application service and repository files for unscoped lookups.
+ * The business logic now lives in src/application/ and src/repositories/,
+ * not in the API routes.
  *
  * Run: bun test tests/unit/tenant-safety.test.ts
- *
- * These tests verify that:
- * 1. The price-line route's subcontract quote lookup is org-scoped
- * 2. The finalize-revision route's subcontract quote lookup is org-scoped
- * 3. The subcontractPackageLine lookups are org-scoped
- * 4. No unscoped findUnique calls remain on org-owned entities
  */
 import { test, expect, describe } from 'bun:test'
 import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-const API_DIR = join(process.cwd(), 'src', 'app', 'api')
+const APP_DIR = join(process.cwd(), 'src', 'application')
+const REPO_DIR = join(process.cwd(), 'src', 'repositories')
 
 /** Recursively find all .ts files under a directory. */
 async function findTsFiles(dir: string): Promise<string[]> {
@@ -31,13 +30,12 @@ async function findTsFiles(dir: string): Promise<string[]> {
 }
 
 describe('Tenant-safe dereferencing — source code audit', () => {
-  test('no unscoped findUnique on org-owned entities in API routes', async () => {
-    const files = await findTsFiles(API_DIR)
+  test('no unscoped findUnique on org-owned entities in application/repositories', async () => {
+    const files = [...(await findTsFiles(APP_DIR)), ...(await findTsFiles(REPO_DIR))]
     const violations: string[] = []
 
     for (const file of files) {
       const content = await readFile(file, 'utf-8')
-      // Find findUnique calls on org-owned entities (not User/WaitlistEntry)
       const orgOwnedEntities = [
         'opportunity', 'estimate', 'estimateLine', 'estimateRevision',
         'subcontractQuote', 'subcontractPackage', 'subcontractPackageLine',
@@ -46,14 +44,12 @@ describe('Tenant-safe dereferencing — source code audit', () => {
         'projectActual', 'calibrationProposal', 'client', 'auditLog', 'knowledgeAlert',
       ]
       for (const entity of orgOwnedEntities) {
-        // Match: db.<entity>.findUnique({ where: { id: ... } }) without organizationId
         const pattern = new RegExp(`db\\.${entity}\\.findUnique\\(`, 'g')
         let match
         while ((match = pattern.exec(content)) !== null) {
-          // Check if the next ~200 chars contain organizationId
           const after = content.substring(match.index, match.index + 300)
           if (!after.includes('organizationId') && !after.includes('ctx.organizationId')) {
-            violations.push(`${file}:${content.substring(0, match.index).split('\n').length} — db.${entity}.findUnique without organizationId`)
+            violations.push(`${file}: db.${entity}.findUnique without organizationId`)
           }
         }
       }
@@ -62,68 +58,35 @@ describe('Tenant-safe dereferencing — source code audit', () => {
     expect(violations).toEqual([])
   })
 
-  test('price-line route scopes subcontract quote lookup via subcontractPackage.opportunity.organizationId', async () => {
-    const content = await readFile(join(API_DIR, 'estimates', '[id]', 'price-line', 'route.ts'), 'utf-8')
-    // The subcontract quote lookup must use findFirst with org scoping
-    expect(content).toContain('db.subcontractQuote.findFirst')
+  test('estimate-service scopes subcontract quote lookup via org chain', async () => {
+    const content = await readFile(join(APP_DIR, 'estimate-service.ts'), 'utf-8')
+    // The service uses subcontractQuoteRepository.getForOrganization which is org-scoped
+    expect(content).toContain('subcontractQuoteRepository.getForOrganization')
     expect(content).not.toContain('db.subcontractQuote.findUnique')
-    // Must chain through subcontractPackage → opportunity → organizationId
+  })
+
+  test('repositories expose org-scoped methods, not getById', async () => {
+    const content = await readFile(join(REPO_DIR, 'index.ts'), 'utf-8')
+    expect(content).toContain('getForOrganization')
+    expect(content).not.toMatch(/getById\(/)
+    // The subcontractQuoteRepository must scope via subcontractPackage.opportunity.organizationId
     expect(content).toContain('subcontractPackage:')
     expect(content).toContain('opportunity:')
-    expect(content).toContain('organizationId: ctx.organizationId')
+    expect(content).toContain('organizationId')
   })
 
-  test('finalize-revision route scopes subcontract quote lookup', async () => {
-    const content = await readFile(join(API_DIR, 'estimates', '[id]', 'finalize-revision', 'route.ts'), 'utf-8')
-    expect(content).toContain('db.subcontractQuote.findFirst')
-    expect(content).not.toContain('db.subcontractQuote.findUnique')
-    expect(content).toContain('organizationId: ctx.organizationId')
+  test('price-line route is a thin adapter (no direct Prisma access)', async () => {
+    const content = await readFile(join(process.cwd(), 'src', 'app', 'api', 'estimates', '[id]', 'price-line', 'route.ts'), 'utf-8')
+    expect(content).not.toContain('db.estimateLine.findFirst')
+    expect(content).not.toContain('db.subcontractQuote.findFirst')
+    expect(content).not.toContain('db.subcontractPackageLine.findFirst')
+    expect(content).toContain('estimateService.recomputeLine')
   })
 
-  test('price-line route scopes subcontractPackageLine lookup', async () => {
-    const content = await readFile(join(API_DIR, 'estimates', '[id]', 'price-line', 'route.ts'), 'utf-8')
-    // The package line lookup must include org scoping
-    const pkgLineSection = content.substring(
-      content.indexOf('db.subcontractPackageLine.findFirst'),
-      content.indexOf('db.subcontractPackageLine.findFirst') + 400,
-    )
-    expect(pkgLineSection).toContain('organizationId: ctx.organizationId')
-  })
-
-  test('finalize-revision route scopes subcontractPackageLine lookup', async () => {
-    const content = await readFile(join(API_DIR, 'estimates', '[id]', 'finalize-revision', 'route.ts'), 'utf-8')
-    const pkgLineSection = content.substring(
-      content.indexOf('db.subcontractPackageLine.findFirst'),
-      content.indexOf('db.subcontractPackageLine.findFirst') + 400,
-    )
-    expect(pkgLineSection).toContain('organizationId: ctx.organizationId')
-  })
-})
-
-describe('Cross-tenant access prevention — behavioral', () => {
-  test('a foreign-key reference from Org A to Org B is not trusted', () => {
-    // This test documents the invariant: even if an ExecutionSegment in Org A
-    // has a subcontractQuoteId pointing to a quote in Org B, the quote must
-    // NOT be resolved. The findFirst query with the org scoping filter
-    // ensures the quote is only found if it belongs to the same org.
-    //
-    // The query pattern is:
-    //   db.subcontractQuote.findFirst({
-    //     where: {
-    //       id: seg.subcontractQuoteId,
-    //       subcontractPackage: {
-    //         opportunity: {
-    //           organizationId: ctx.organizationId,  // ← this is the guard
-    //         },
-    //       },
-    //     },
-    //   })
-    //
-    // If the quote belongs to Org B but ctx.organizationId is Org A,
-    // the query returns null — the quote is not resolved, its data is not
-    // exposed, and pricing does not use it.
-    //
-    // This is verified by the source-code audit tests above.
-    expect(true).toBe(true)
+  test('finalize-revision route is a thin adapter', async () => {
+    const content = await readFile(join(process.cwd(), 'src', 'app', 'api', 'estimates', '[id]', 'finalize-revision', 'route.ts'), 'utf-8')
+    expect(content).not.toContain('db.estimate.findFirst')
+    expect(content).not.toContain('db.subcontractQuote.findFirst')
+    expect(content).toContain('estimateService.finalizeRevision')
   })
 })
