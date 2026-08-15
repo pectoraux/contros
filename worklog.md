@@ -1015,3 +1015,34 @@ Stage Summary:
   * Gate uses adjudicatedRevisionId for deliverable readiness
   * 13 real integration tests including wrong-same-org + end-to-end
 - Three frozen application services: EstimateService, SubcontractService, BidService.
+
+---
+Task ID: bid-service-final
+Agent: principal-engineer
+Task: BidService final correction — frozen adjudicated gate, TenderDeliverable, programme revisionType, dbTx
+
+Work Log:
+- P0-1 (final): Submission gate uses FROZEN adjudicated revision for commercial data.
+  getBidWorkspace() replays the adjudicated revision snapshot for estimateLines
+  when bid.adjudicatedRevisionId is set. Post-adjudication estimate mutations
+  do NOT affect the gate.
+- P0-2: Programme revision must be revisionType='programme'. Added revisionType
+  to EstimateRevision schema. programmeRevisionRepository requires revisionType='programme'.
+- P0-3: TenderDeliverable model — explicit per-bid deliverable records.
+  createBid() creates defaults. Gate uses TenderDeliverable.status.
+  submitBid() blocks if required deliverables not ready.
+- Infrastructure: dbTx — separate PrismaClient using DIRECT_DATABASE_URL for
+  interactive transactions (PgBouncer pooler doesn't support $transaction callbacks).
+- 16 integration tests all pass (including post-adjudication mutation,
+  missing deliverable, wrong-type revision, full E2E).
+- Code on GitHub at eb21fa1. Vercel deploy limit exceeded — deployment pending.
+
+Stage Summary:
+- BidService now satisfies ALL final requirements:
+  * Gate uses frozen adjudicated revision (not mutable estimate)
+  * TenderDeliverable records (not estimateRevision existence proxy)
+  * Programme revision is typed (revisionType='programme')
+  * Required deliverables block submission
+  * Post-adjudication mutation test proves frozen commercial state
+  * 16 real integration tests
+- Three frozen application services: EstimateService, SubcontractService, BidService.
