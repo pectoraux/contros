@@ -555,3 +555,48 @@ Stage Summary:
   /api/version: 7eadf8d1b49ddbe6d577d8ca263c1732a33a0670
 - GitHub raw content at 7eadf8d confirms all fixes present (isValidPrice, resolveAuthSecret, EstimateRevision.status, ScopeAtom.valueWeight, semanticCoveragePct/economicCoveragePct).
 - The /version endpoint eliminates this entire class of release-integrity confusion going forward.
+
+---
+Task ID: final-mini-pass
+Agent: principal-engineer
+Task: Final mini-pass — 4 fixes before application-service layer
+
+Work Log:
+- Fix #1: Removed subcontract exposure extrapolation. The old code computed
+  `quote.totalAmount / coveragePct * (1 - coveragePct)` — an indefensible
+  heuristic. Now: uncoveredScopeValue (the actual GHS value of uncovered
+  required scope from the reconciliation engine) is used directly. If not
+  provided, exposure is 'unknown' (new blocking kind 'uncovered-exposure-unknown',
+  new field exposureUnknown on PricingBreakdown). NEVER extrapolated.
+- Fix #2: Subcontract segments now carry scopeDefinition + quoteCoversSegmentScope.
+  The engine verifies the quote explicitly covers the segment's required scope.
+  If quoteCoversSegmentScope is not true, blocker: 'segment-scope-not-covered'.
+  This makes the segment↔quote scope relationship explicit.
+- Fix #3: Fail closed on invalid roles. auth.ts authorize() returns null (rejects
+  login) for invalid persisted roles. context.ts requireAuth() throws 403.
+  jwt/session callbacks clear the token/session for invalid roles. The old
+  normalization to 'estimator' is GONE — invalid roles get NO access.
+- Fix #4: Commercial percentages bounded to 0..1. isValidPct now checks
+  0<=n<=1, not just >= 0. A value of 4.0 (400%) is rejected. Edge cases
+  (0 and 1) are valid.
+- 20 new adversarial tests in mini-pass.test.ts covering all four fixes.
+- Updated 4 existing integrity tests to match the new corrected behavior
+  (partial coverage without uncoveredScopeValue → unknown, not extrapolated;
+  hybrid segments need quoteCoversSegmentScope=true).
+- 94 tests total, all passing. Lint clean. Build succeeds.
+- Pushed to GitHub (commit a7fb42f). Vercel deployed (dpl_1sYuH8pXUNV9zRFvz6gT5e4MzcU8, READY).
+- All four SHAs verified synchronized:
+  LOCAL: a7fb42fb533a7c4b8cca062a0a16ebd63b008705
+  GitHub: a7fb42fb533a7c4b8cca062a0a16ebd63b008705
+  Vercel: a7fb42fb533a7c4b8cca062a0a16ebd63b008705
+  /api/version: a7fb42fb533a7c4b8cca062a0a16ebd63b008705
+- Tenant isolation verified: unauthenticated API → 401.
+
+Stage Summary:
+- All 4 reviewer-identified issues fixed and verified on production.
+- The commercial engine is now commercially trustworthy:
+  * No exposure extrapolation from quote amounts
+  * Segment scope must be explicitly verified against quotes
+  * Invalid roles fail closed (no access, not normalized)
+  * Percentages bounded to 0..1 (no 400% profit rates)
+- Ready to proceed to the application-service layer.
