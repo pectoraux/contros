@@ -436,14 +436,38 @@ export const bidService = {
       return { ok: false, error: 'Cannot submit without an adjudicated estimate revision — record adjudication first', status: 400 }
     }
 
-    // P0-2: Validate programme revision if provided — must belong to the SAME opportunity.
-    if (programmeRevisionId) {
+    // P0-3/P0-4: Validate required tender deliverables.
+    // For programme deliverables, require a valid revisionId pointing to a
+    // finalized programme revision (revisionType='programme') belonging to
+    // the same opportunity.
+    const deliverables = await tenderDeliverableRepository.getForBid(ctx.organizationId, bidId)
+    const missingRequired = deliverables.filter(
+      (d) => d.required && d.status !== 'ready' && d.status !== 'finalized',
+    )
+    if (missingRequired.length > 0) {
+      const missingNames = missingRequired.map((d) => d.kind).join(', ')
+      return { ok: false, error: `Required deliverables not ready: ${missingNames}`, status: 400 }
+    }
+
+    // P0-3: For programme deliverable, validate revisionId if required+ready.
+    const programmeDeliverable = deliverables.find((d) => d.kind === 'programme')
+    let resolvedProgrammeRevisionId: string | null = null
+    if (programmeDeliverable && programmeDeliverable.required) {
+      if (!programmeDeliverable.revisionId) {
+        return { ok: false, error: 'Programme deliverable is ready but has no revisionId — a finalized programme revision is required', status: 400 }
+      }
       const progRev = await programmeRevisionRepository.getFinalizedForOpportunity(
-        ctx.organizationId, bid.opportunityId, programmeRevisionId,
+        ctx.organizationId, bid.opportunityId, programmeDeliverable.revisionId,
       )
       if (!progRev) {
-        return { ok: false, error: 'Finalized programme revision not found for this opportunity', status: 404 }
+        return { ok: false, error: 'Programme deliverable references an invalid programme revision (not finalized, wrong type, or wrong opportunity)', status: 400 }
       }
+      resolvedProgrammeRevisionId = programmeDeliverable.revisionId
+    }
+
+    // P0-4: If caller supplies a programmeRevisionId, it must match the deliverable's.
+    if (programmeRevisionId && resolvedProgrammeRevisionId && programmeRevisionId !== resolvedProgrammeRevisionId) {
+      return { ok: false, error: 'Conflicting programme revision: caller-supplied ID does not match TenderDeliverable revisionId', status: 400 }
     }
 
     // P0-1: Validate the adjudicated revision is still finalized AND belongs to this bid's estimate+opportunity.
@@ -454,20 +478,12 @@ export const bidService = {
       return { ok: false, error: 'Adjudicated estimate revision is no longer finalized or does not belong to this bid', status: 400 }
     }
 
-    // P0-3: Validate required tender deliverables are ready.
-    const deliverables = await tenderDeliverableRepository.getForBid(ctx.organizationId, bidId)
-    const missingRequired = deliverables.filter(
-      (d) => d.required && d.status !== 'ready' && d.status !== 'finalized',
-    )
-    if (missingRequired.length > 0) {
-      const missingNames = missingRequired.map((d) => d.kind).join(', ')
-      return { ok: false, error: `Required deliverables not ready: ${missingNames}`, status: 400 }
-    }
-
-    // Validate bid submission.
+    // P0-1 (final): validateBidSubmission must NOT use current mutable Estimate.status.
+    // After adjudication, the frozen revision is the commercial truth — current
+    // estimate status is irrelevant.
     const validation = validateBidSubmission({
       estimateRevisionId: bid.adjudicatedRevisionId,
-      estimateStatus: bid.estimate?.status ?? 'draft',
+      estimateStatus: 'adjudicated', // Always pass — the adjudicated revision IS the commercial truth
       finalPrice: bid.finalPrice,
       hasFinalizedRevision: true,
     })
@@ -494,7 +510,7 @@ export const bidService = {
         tenderPackStatus: 'submitted',
         submittedAt,
         estimateRevisionId: bid.adjudicatedRevisionId, // P0-5: submitted = adjudicated
-        programmeRevisionId: programmeRevisionId ?? null,
+        programmeRevisionId: resolvedProgrammeRevisionId, // P0-4: from TenderDeliverable, not caller
       })
       if (!updated) throw new Error('Bid update failed in transaction')
 

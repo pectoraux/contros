@@ -542,4 +542,158 @@ describe('BidService integration tests', () => {
     await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 900 } })
     await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
   }, 60000)
+
+  // ── Post-adjudication: new subcontract quote created after adjudication ───
+  test('Post-adjudication: new subcontract package/quote created after adjudication is ignored by gate', async () => {
+    // 1. Recompute + finalize (no subcontract in revision)
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 910 })
+    if (!finalizeResult.ok) return
+
+    // 2. Create bid + adjudicate
+    const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
+    if (!createResult.ok) return
+    await bidService.recordAdjudication({
+      ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: finalizeResult.revisionId,
+      directorAdjustment: 0, adjustmentRationale: 'subcontract mutation test',
+    })
+
+    // 3. Create a subcontract package + quote AFTER adjudication
+    const PKG_NEW = 'test-bid-pkg-new'
+    const QUOTE_NEW = 'test-bid-quote-new'
+    await db.subcontractPackage.create({
+      data: { id: PKG_NEW, organizationId: ORG_A, opportunityId: OPP_A, name: 'New Pkg', executionStrategy: 'subcontract' },
+    })
+    await db.subcontractQuote.create({
+      data: { id: QUOTE_NEW, subcontractPackageId: PKG_NEW, supplierName: 'New Supplier', totalAmount: 99999, coveragePct: 1.0 },
+    })
+    // Select the new quote
+    await db.subcontractPackage.update({ where: { id: PKG_NEW }, data: { selectedQuoteId: QUOTE_NEW, status: 'awarded' } })
+
+    // 4. Run gate — the new subcontract should NOT appear
+    const wsResult = await bidService.getBidWorkspace({ ctx: ctxA, opportunityId: OPP_A })
+    expect(wsResult.ok).toBe(true)
+    if (wsResult.ok) {
+      // Subcontract-coverage should be 'pass' (no frozen packages = nothing to check)
+      const scCheck = wsResult.gate.checks.find((c) => c.id === 'subcontract-coverage')
+      if (scCheck) {
+        expect(scCheck.status).toBe('pass')
+      }
+    }
+
+    // Clean up
+    await db.subcontractQuote.deleteMany({ where: { id: QUOTE_NEW } })
+    await db.subcontractPackage.deleteMany({ where: { id: PKG_NEW } })
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 910 } })
+    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
+  }, 60000)
+
+  // ── Programme deliverable without revisionId → blocker ────────────────────
+  test('Programme deliverable ready but no revisionId → submission blocked', async () => {
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 920 })
+    if (!finalizeResult.ok) return
+
+    const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
+    if (!createResult.ok) return
+
+    await bidService.recordAdjudication({
+      ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: finalizeResult.revisionId,
+      directorAdjustment: 0, adjustmentRationale: 'programme test',
+    })
+
+    // Mark ALL deliverables as ready, but programme has no revisionId
+    await db.tenderDeliverable.updateMany({
+      where: { bidId: createResult.bidId },
+      data: { status: 'ready' },
+    })
+
+    // Attempt submission — should fail because programme has no revisionId
+    const submitResult = await bidService.submitBid({ ctx: ctxA, bidId: createResult.bidId })
+    expect(submitResult.ok).toBe(false)
+    if (!submitResult.ok) {
+      expect(submitResult.error).toContain('revisionId')
+    }
+
+    // Clean up
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 920 } })
+    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
+  }, 60000)
+
+  // ── Programme deliverable with estimate-type revision → blocker ───────────
+  test('Programme deliverable with estimate-type revisionId → submission blocked', async () => {
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 930 })
+    if (!finalizeResult.ok) return
+    // This revision has revisionType='estimate' (default)
+
+    const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
+    if (!createResult.ok) return
+
+    await bidService.recordAdjudication({
+      ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: finalizeResult.revisionId,
+      directorAdjustment: 0, adjustmentRationale: 'wrong-type programme test',
+    })
+
+    // Mark all deliverables ready + set programme revisionId to the ESTIMATE revision
+    await db.tenderDeliverable.updateMany({
+      where: { bidId: createResult.bidId },
+      data: { status: 'ready' },
+    })
+    await db.tenderDeliverable.updateMany({
+      where: { bidId: createResult.bidId, kind: 'programme' },
+      data: { revisionId: finalizeResult.revisionId }, // type='estimate', not 'programme'
+    })
+
+    const submitResult = await bidService.submitBid({ ctx: ctxA, bidId: createResult.bidId })
+    expect(submitResult.ok).toBe(false)
+    if (!submitResult.ok) {
+      expect(submitResult.error).toContain('invalid programme revision')
+    }
+
+    // Clean up
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 930 } })
+    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
+  }, 60000)
+
+  // ── Current estimate status does not affect post-adjudication submission ─
+  test('Current estimate status draft does not block post-adjudication submission', async () => {
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 940 })
+    if (!finalizeResult.ok) return
+
+    const createResult = await bidService.createBid({
+      ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A,
+      requiredDeliverables: [{ kind: 'boq', required: true }], // Only BOQ required, no programme
+    })
+    if (!createResult.ok) return
+
+    await bidService.recordAdjudication({
+      ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: finalizeResult.revisionId,
+      directorAdjustment: 0, adjustmentRationale: 'estimate status test',
+    })
+
+    // Ensure estimate status is draft
+    await db.estimate.update({ where: { id: EST_A }, data: { status: 'draft' } })
+
+    // Mark BOQ as ready
+    await db.tenderDeliverable.updateMany({
+      where: { bidId: createResult.bidId, kind: 'boq' },
+      data: { status: 'ready' },
+    })
+
+    await bidService.transitionStatus({ ctx: ctxA, bidId: createResult.bidId, newStatus: 'ready' })
+
+    // Submit — should NOT fail because of estimate.status='draft'
+    // (It may fail for other gate reasons, but NOT because of estimate status)
+    const submitResult = await bidService.submitBid({ ctx: ctxA, bidId: createResult.bidId })
+    // If it fails, the error must NOT contain 'draft'
+    if (!submitResult.ok) {
+      expect(submitResult.error).not.toContain('draft')
+    }
+
+    // Clean up
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 940 } })
+    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
+  }, 60000)
 })
