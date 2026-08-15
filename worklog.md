@@ -852,3 +852,31 @@ Stage Summary:
   * finalizeRevision atomicity ✓
 - Remaining gate: Vercel deployment must sync to GitHub SHA (blocked by rate limit).
 - Once deployed, EstimateService is FROZEN as the canonical pattern.
+
+---
+Task ID: subcontract-service
+Agent: principal-engineer + subcontract-builder
+Task: SubcontractService — application-service Phase 2
+
+Work Log:
+- Created src/application/subcontract-service.ts with 8 service methods following the frozen EstimateService pattern.
+- Extended src/repositories/index.ts with 5 new tenant-aware repository objects (subcontractPackageRepository, subcontractQuoteRepository extensions, scopeAtomRepository, quoteScopeCoverageRepository, subcontractPackageLineRepository). Every method verifies ownership chains.
+- Converted GET /api/subcontract/[opportunityId] to a thin adapter calling subcontractService.getPackageWorkspace().
+- Implemented guarded selectQuote() — runs reconciliation first, enforces not-lump-sum, no critical exclusions, economic coverage>=0.8 (or approved CommercialException). Transactional.
+- Implemented state machine: draft→enquiry-sent→quotes-received→awarded. Can go abandoned from any state. Cannot go awarded→draft.
+- 16 integration tests (all passing against Neon):
+  Cross-tenant (5): Org A/B cannot read/create/select/attach across orgs
+  Commercial adversarial (11): lump-sum, exclusions, full coverage, invalid weights, negative amounts, coverage thresholds, approved exceptions, illegal state transitions, end-to-end
+- 106 unit tests + 16 integration tests = 122 total, all passing.
+- Lint clean. Build succeeds.
+- Code pushed to GitHub at 9091a7c.
+- Vercel deployment: BLOCKED by free-tier 100 deploy/day limit. Production remains at 5602946.
+
+Stage Summary:
+- SubcontractService is code-complete and fully tested.
+- All 16 integration tests pass against real Neon PostgreSQL.
+- The pure reconciliation engine is reused (not duplicated).
+- Tenant isolation verified with real cross-tenant DB operations.
+- Quote selection is guarded by reconciliation thresholds.
+- State machine prevents illegal transitions.
+- Deployment pending Vercel rate-limit reset.
