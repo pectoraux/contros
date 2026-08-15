@@ -1092,3 +1092,27 @@ Stage Summary:
   * Frozen commercial state is the ONLY source after adjudication
   * 19 real integration tests including the regression test
 - Three frozen application services: EstimateService, SubcontractService, BidService.
+
+---
+Task ID: bid-service-final-p0
+Agent: principal-engineer
+Task: BidService final P0 — remove estimate.status from submitBid, programme deliverable revisionId, TenderDeliverable as programme source
+
+Work Log:
+- P0-1: submitBid() no longer passes mutable Estimate.status to validateBidSubmission().
+  Hardcoded to 'adjudicated' — frozen revision is the commercial truth.
+- P0-2: Added real post-adjudication subcontract mutation test (creates new package+quote, verifies gate ignores it).
+- P0-3: Programme deliverable must have valid revisionId (type='programme', finalized, same opportunity).
+- P0-4: submitBid uses TenderDeliverable(programme).revisionId, not caller-supplied programmeRevisionId.
+  Conflicting caller ID → blocked.
+- 23 integration tests all pass.
+- Code on GitHub at 693fa5d. Vercel deploy limit exceeded — deployment pending.
+
+Stage Summary:
+- BidService satisfies ALL final P0 requirements:
+  * No mutable Estimate.status in submission validation
+  * Real subcontract mutation test (new package/quote ignored)
+  * Programme deliverable revisionId validated (type, finalized, opportunity)
+  * TenderDeliverable is the programme source (not caller-supplied)
+  * 23 real integration tests
+- Three frozen application services: EstimateService, SubcontractService, BidService.
