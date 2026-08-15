@@ -691,3 +691,46 @@ Stage Summary:
 - A foreign key reference from Org A to Org B's quote is no longer trusted.
 - The source-code audit test will catch future regressions automatically.
 - Ready to proceed to the application-service layer.
+
+---
+Task ID: application-service-phase-1
+Agent: principal-engineer
+Task: Application-service layer Phase 1 — EstimateService + tenant-aware repositories + real cross-tenant tests
+
+Work Log:
+- Created src/application/estimate-service.ts with:
+  * recomputeLine(): owns tenant validation, ownership resolution, pricing engine
+    invocation, persistence, commercial exception creation, audit logging — all
+    within a single Prisma transaction (db.$transaction).
+  * finalizeRevision(): owns tenant validation, line completeness validation,
+    snapshot construction, persistence, replay sanity check, audit logging.
+- Created src/repositories/index.ts with tenant-aware repositories:
+  * estimateRepository: getForOrganization, getLineForOrganization, updateLine
+  * subcontractQuoteRepository: getForOrganization (scopes via subcontractPackage →
+    opportunity → organizationId), getSelectedQuoteForLine
+  * commercialExceptionRepository, auditLogRepository
+  * No getById() on org-owned entities — every method requires orgId.
+- Converted price-line route to thin adapter: requireAuth() + estimateService.recomputeLine()
+- Converted finalize-revision route to thin adapter: requireAuth() + estimateService.finalizeRevision()
+- Created REAL cross-tenant integration tests (tests/integration/cross-tenant.test.ts):
+  * Creates Org A + Org B with real DB data on Neon
+  * Test 1: Org A line references Org B quote → quote NOT resolved, pricing incomplete,
+    quote amount (99999) does NOT appear in result
+  * Test 2 (inverse): Org B line references Org A quote → NOT resolved, amount (50000)
+    does NOT appear
+  * Test 3: Org A cannot recompute Org B's estimate line (404)
+  * Test 4: Org A cannot finalize Org B's revision (404)
+  * Test 5 (control): Same-org recompute works, calculation complete
+  * These execute REAL database queries — not expect(true).toBe(true)
+- Updated source-code audit tests to scan application/ and repositories/ dirs.
+- 106 unit tests + 5 integration tests pass. Lint clean. Build succeeds.
+- All four SHAs verified EXACTLY matching: 4bd7b33660bddd76b8a1d3c375d32ff9d2172d58
+
+Stage Summary:
+- Application-service boundary established. API routes are thin adapters.
+- Tenant-aware repositories make unscoped retrieval difficult to express.
+- Real cross-tenant tests prove isolation with actual DB data.
+- Transaction boundaries ensure atomic commercial operations.
+- The pricing engine remains pure — the service orchestrates, not calculates.
+- Pattern established for remaining service extractions (OpportunityService,
+  SubcontractService, BidService, KnowledgeService).
