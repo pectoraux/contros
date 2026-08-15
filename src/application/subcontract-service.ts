@@ -107,6 +107,12 @@ export interface WorkspacePackage {
   selectedQuote: WorkspaceQuote | null
   hasUnselectedQuote: boolean
   hasNoQuotes: boolean
+  // P0-2: Graph inconsistency — a package line references a cross-tenant EstimateLine.
+  graphInconsistent: boolean
+  // P0-2: When graphInconsistent, reconciliation is blocked — the engine is NOT called.
+  reconciliationBlocked: boolean
+  // P0-2: Human-readable blockers explaining why reconciliation was skipped.
+  blockers: string[]
 }
 
 export interface GetPackageWorkspaceResult {
@@ -379,10 +385,10 @@ function buildScopeAtoms(pkg: LoadedPackage): ScopeAtomInput[] {
 }
 
 function buildReconciliationInput(
+  requiredLines: Array<{ id: string; description: string; sellPrice: number }>,
   pkg: LoadedPackage,
   quote: LoadedPackage['quotes'][number] | null,
 ): ReconcileSubcontractInput {
-  const requiredLines = buildRequiredLines(pkg)
   const scopeAtoms = buildScopeAtoms(pkg)
   if (!quote) {
     return { requiredLines, scopeAtoms, quote: null }
@@ -475,6 +481,8 @@ export const subcontractService = {
 
     // 2. Build workspace, running reconciliation per quote.
     // P0-2: Check for inconsistent graph state (cross-tenant estimateLine references).
+    // If inconsistent, DO NOT call reconcileSubcontract() — the engine must not
+    // receive foreign-tenant pricing data.
     const workspacePackages: WorkspacePackage[] = packages.map((sp) => {
       const loadedPkg = sp as unknown as LoadedPackage
       const requiredLines = buildRequiredLines(loadedPkg, ctx.organizationId)
@@ -484,14 +492,53 @@ export const subcontractService = {
       )
 
       // P0-2: If any package line references an estimateLine that was filtered
-      // out as cross-tenant, flag the workspace as inconsistent.
+      // out as cross-tenant, flag the workspace as inconsistent and BLOCK
+      // reconciliation entirely. Do not feed foreign data into the engine.
       const hasInconsistentGraph = requiredLines.some((l) => l.estimateLineMissing)
 
-      const quotes: WorkspaceQuote[] = loadedPkg.quotes.map((q) => {
-        const reconciliationInput = buildReconciliationInput(loadedPkg, q)
-        const result = reconcileSubcontract(reconciliationInput)
-        return toWorkspaceQuote(q, result)
-      })
+      const blockers: string[] = []
+      if (hasInconsistentGraph) {
+        blockers.push(
+          'Required estimate scope contains an invalid cross-organization reference. Reconciliation blocked.',
+        )
+      }
+
+      // P0-2: Only call the reconciliation engine if the graph is consistent.
+      let quotes: WorkspaceQuote[]
+      if (hasInconsistentGraph) {
+        // Blocked — return quotes without reconciliation results.
+        quotes = loadedPkg.quotes.map((q) => ({
+          id: q.id,
+          supplierName: q.supplierName,
+          totalAmount: q.totalAmount,
+          currency: q.currency,
+          status: q.status,
+          receivedAt: q.receivedAt,
+          exclusions: JSON.parse(q.exclusionsJson || '[]'),
+          assumptions: JSON.parse(q.assumptionsJson || '[]'),
+          coveragePct: 0,
+          coverageBasis: 'none' as const,
+          isLumpSum: false,
+          semanticCoveragePct: 0,
+          economicCoveragePct: 0,
+          economicCoverageUnknown: true,
+          atomReconciliations: [],
+          excludedAtoms: [],
+          unstatedAtoms: [],
+          coveredAtoms: [],
+          coveredScopeValue: 0,
+          uncoveredValue: requiredScopeValue,
+          gaps: ['Reconciliation blocked — inconsistent package graph'],
+          warnings: ['Reconciliation blocked due to cross-tenant estimate line reference.'],
+          reconciliationStatus: 'blocker' as const,
+        }))
+      } else {
+        quotes = loadedPkg.quotes.map((q) => {
+          const reconciliationInput = buildReconciliationInput(requiredLines, loadedPkg, q)
+          const result = reconcileSubcontract(reconciliationInput)
+          return toWorkspaceQuote(q, result)
+        })
+      }
 
       const selectedQuote =
         quotes.find((q) => q.id === sp.selectedQuoteId) ?? null
@@ -521,6 +568,8 @@ export const subcontractService = {
         hasNoQuotes: quotes.length === 0,
         // P0-2: Surface inconsistent graph state — do not silently undercount.
         graphInconsistent: hasInconsistentGraph,
+        reconciliationBlocked: hasInconsistentGraph,
+        blockers,
       }
     })
 
@@ -871,7 +920,17 @@ export const subcontractService = {
     }
 
     // 3. Build engine input + invoke pure reconciliation.
-    const reconciliationInput = buildReconciliationInput(loadedPkg, quote)
+    // P0-2: Pass validated requiredLines (with orgId check) to prevent
+    // cross-tenant estimateLine data from entering the engine.
+    const validatedRequiredLines = buildRequiredLines(loadedPkg, ctx.organizationId)
+    if (validatedRequiredLines.some((l) => l.estimateLineMissing)) {
+      return {
+        ok: false,
+        error: 'Cannot reconcile: package graph is inconsistent (cross-tenant estimate line reference).',
+        status: 403,
+      }
+    }
+    const reconciliationInput = buildReconciliationInput(validatedRequiredLines, loadedPkg, quote)
     const result = reconcileSubcontract(reconciliationInput)
 
     // 4. Persist the reconciled coveragePct + write an audit log atomically.
@@ -990,7 +1049,16 @@ export const subcontractService = {
     }
 
     // 4. Run reconciliation (pure engine).
-    const reconciliationInput = buildReconciliationInput(loadedPkg, quote)
+    // P0-2: Pass validated requiredLines to prevent cross-tenant data in engine.
+    const validatedRequiredLines = buildRequiredLines(loadedPkg, ctx.organizationId)
+    if (validatedRequiredLines.some((l) => l.estimateLineMissing)) {
+      return {
+        ok: false,
+        error: 'Cannot select quote: package graph is inconsistent (cross-tenant estimate line reference).',
+        status: 403,
+      }
+    }
+    const reconciliationInput = buildReconciliationInput(validatedRequiredLines, loadedPkg, quote)
     const reconciliation = reconcileSubcontract(reconciliationInput)
 
     // 5. Check blockers. Each blocker can be overridden by an approved

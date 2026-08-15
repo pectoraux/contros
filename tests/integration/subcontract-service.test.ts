@@ -872,12 +872,21 @@ describe('SubcontractService integration tests', () => {
       if (pkg) {
         // P0-2: The workspace must flag the inconsistent graph.
         expect(pkg.graphInconsistent).toBe(true)
-        // Org B's sellPrice must NOT appear in requiredScopeValue.
-        // LINE_B has no sellPrice set (0), so requiredScopeValue should be 0
-        // from this line — not Org B's actual sell price.
-        const crossTenantLine = pkg.requiredLines.find((l) => l.id === LINE_B)
-        if (crossTenantLine) {
-          expect(crossTenantLine.sellPrice).toBe(0) // not Org B's sellPrice
+        expect(pkg.reconciliationBlocked).toBe(true)
+        expect(pkg.blockers.length).toBeGreaterThan(0)
+        // P0-2: The reconciliation engine was NOT called — quotes have
+        // blocked/reconciliationStatus='blocker', not real reconciliation results.
+        for (const q of pkg.quotes) {
+          expect(q.reconciliationStatus).toBe('blocker')
+          expect(q.coveragePct).toBe(0)
+          expect(q.semanticCoveragePct).toBe(0)
+          expect(q.economicCoveragePct).toBe(0)
+        }
+        // Org B's sellPrice must NOT appear in any quote's reconciliation.
+        for (const q of pkg.quotes) {
+          expect(q.coveredScopeValue).toBe(0)
+          // uncoveredValue should be requiredScopeValue (which is 0 since
+          // the cross-tenant line was nulled), NOT Org B's sellPrice.
         }
       }
     }
