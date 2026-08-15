@@ -8,6 +8,17 @@
  * - Required deliverables block submission when missing
  * - Post-submission immutability for commercial fields
  *
+ * Final cleanup:
+ * - TenderDeliverable kinds are explicitly classified as revision-backed vs
+ *   document-backed. Only revision-backed kinds require a domain revisionId
+ *   pointing to a finalized EstimateRevision of the correct revisionType.
+ *   Document-backed kinds require status=ready|finalized only; their
+ *   revisionId semantics are deferred to a future DocumentService.
+ * - submitBid() no longer accepts a caller-supplied programmeRevisionId.
+ *   The programme revision is derived EXCLUSIVELY from
+ *   TenderDeliverable(kind='programme').revisionId. There is no duplicate
+ *   caller-supplied source of programme truth.
+ *
  * FROZEN pattern: RequestContext → Service → Repository → Engine → Transaction → Audit
  */
 
@@ -62,7 +73,6 @@ export interface RecordAdjudicationInput {
 export interface SubmitBidInput {
   ctx: RequestContext
   bidId: string
-  programmeRevisionId?: string
 }
 export interface RecordOutcomeInput {
   ctx: RequestContext; bidId: string; outcome: string
@@ -90,6 +100,53 @@ function isLegalTransition(from: string, to: string): boolean {
 
 const SUBMITTED_STATES = ['submitted', 'clarification', 'won', 'lost']
 const IMMUTABLE_FIELDS = ['finalPrice', 'directorAdjustment', 'adjustmentRationale', 'estimateRevisionId', 'adjudicatedRevisionId', 'programmeRevisionId', 'systemSellPrice', 'submittedAt']
+
+// ─── Tender Deliverable Classification ──────────────────────────────────────
+//
+// TenderDeliverable has a generic (kind, required, status, revisionId) shape.
+// The semantics of `revisionId` depend on the kind:
+//
+//   revision-backed → revisionId MUST point to a finalized EstimateRevision
+//                     whose revisionType matches the kind's required type
+//                     and which belongs to the bid's opportunity.
+//                     Currently only `programme` is revision-backed.
+//
+//   document-backed → revisionId is reserved for a future DocumentService
+//                     artifact reference (document ID, not a domain revision).
+//                     For the MVP, document-backed deliverables satisfy the
+//                     gate when status='ready'|'finalized'. revisionId may
+//                     be null at submission time; its semantics will be
+//                     defined by DocumentService and validated there.
+//
+// This explicit classification is the single source of truth for which kinds
+// require domain revision validation in submitBid(). Adding a new kind means
+// deciding which class it belongs to here — not silently inheriting generic
+// behavior.
+
+export type DeliverableKindClass = 'revision-backed' | 'document-backed'
+
+export const DELIVERABLE_KIND_CLASS: Record<string, DeliverableKindClass> = {
+  // revision-backed — requires a finalized EstimateRevision of revisionType='programme'
+  programme: 'revision-backed',
+  // document-backed — status-based readiness; revisionId semantics deferred to DocumentService
+  boq: 'document-backed',
+  'method-statement': 'document-backed',
+  jha: 'document-backed',
+  'cover-letter': 'document-backed',
+  assumptions: 'document-backed',
+  clarifications: 'document-backed',
+  certificate: 'document-backed',
+}
+
+// For revision-backed kinds, the EstimateRevision.revisionType that the
+// deliverable's revisionId must point to.
+export const REVISION_BACKED_KIND_TYPE: Record<string, string> = {
+  programme: 'programme',
+}
+
+function isRevisionBackedKind(kind: string): boolean {
+  return DELIVERABLE_KIND_CLASS[kind] === 'revision-backed'
+}
 
 // ─── BidService ─────────────────────────────────────────────────────────────
 
@@ -202,6 +259,11 @@ export const bidService = {
 
     // P0-3: Deliverable readiness uses TenderDeliverable records ONLY.
     // P1-4: BOQ readiness must NOT fall back to estimate-lines existence.
+    //
+    // Gate-level readiness is status-based for ALL kinds (both revision-backed
+    // and document-backed). The revisionId semantic distinction is enforced
+    // at submission time in submitBid() — the gate itself only checks that
+    // required deliverables have status='ready'|'finalized'.
     const deliverableRecords = bid
       ? await tenderDeliverableRepository.getForBid(ctx.organizationId, bid.id)
       : []
@@ -412,11 +474,13 @@ export const bidService = {
   /**
    * P0-5: Submit the bid — the critical guarded transaction.
    * The submitted revision MUST match the adjudicated revision.
-   * Programme revision is validated (tenant-safe + finalized).
+   * Programme revision is derived EXCLUSIVELY from
+   * TenderDeliverable(kind='programme').revisionId — there is no
+   * caller-supplied programmeRevisionId in this API.
    * Idempotent.
    */
   async submitBid(input: SubmitBidInput): Promise<{ ok: true; bidId: string; finalPrice: number; submittedAt: string } | Err> {
-    const { ctx, bidId, programmeRevisionId } = input
+    const { ctx, bidId } = input
 
     const bid = await bidRepository.getForOrganization(ctx.organizationId, bidId)
     if (!bid) return { ok: false, error: 'Bid not found', status: 404 }
@@ -437,10 +501,16 @@ export const bidService = {
     }
 
     // P0-3/P0-4: Validate required tender deliverables.
-    // For programme deliverables, require a valid revisionId pointing to a
-    // finalized programme revision (revisionType='programme') belonging to
-    // the same opportunity.
+    //
+    // Deliverable readiness depends on the kind's class (see DELIVERABLE_KIND_CLASS):
+    //   - revision-backed: status='ready'|'finalized' AND revisionId must point
+    //     to a finalized EstimateRevision of the correct revisionType belonging
+    //     to the bid's opportunity. (Currently only 'programme'.)
+    //   - document-backed: status='ready'|'finalized' is sufficient.
+    //     revisionId may be null; its semantics are deferred to DocumentService.
     const deliverables = await tenderDeliverableRepository.getForBid(ctx.organizationId, bidId)
+
+    // Step 1 — status readiness (applies to both classes).
     const missingRequired = deliverables.filter(
       (d) => d.required && d.status !== 'ready' && d.status !== 'finalized',
     )
@@ -449,26 +519,43 @@ export const bidService = {
       return { ok: false, error: `Required deliverables not ready: ${missingNames}`, status: 400 }
     }
 
-    // P0-3: For programme deliverable, validate revisionId if required+ready.
-    const programmeDeliverable = deliverables.find((d) => d.kind === 'programme')
-    let resolvedProgrammeRevisionId: string | null = null
-    if (programmeDeliverable && programmeDeliverable.required) {
-      if (!programmeDeliverable.revisionId) {
-        return { ok: false, error: 'Programme deliverable is ready but has no revisionId — a finalized programme revision is required', status: 400 }
+    // Step 2 — revision-backed kinds must have a valid domain revisionId.
+    // Collects resolved revisionIds per kind for downstream persistence.
+    // NOTE: Today only 'programme' is revision-backed and routed through
+    // programmeRevisionRepository. Adding a new revision-backed kind means
+    // dispatching by REVISION_BACKED_KIND_TYPE[kind] to the appropriate
+    // revision repository.
+    const resolvedRevisionIds: Record<string, string> = {}
+    for (const d of deliverables) {
+      if (!d.required) continue
+      if (!isRevisionBackedKind(d.kind)) continue
+      if (!d.revisionId) {
+        const expectedType = REVISION_BACKED_KIND_TYPE[d.kind] ?? 'domain'
+        return {
+          ok: false,
+          error: `${d.kind} deliverable is ready but has no revisionId — a finalized ${expectedType} revision is required`,
+          status: 400,
+        }
       }
-      const progRev = await programmeRevisionRepository.getFinalizedForOpportunity(
-        ctx.organizationId, bid.opportunityId, programmeDeliverable.revisionId,
+      const rev = await programmeRevisionRepository.getFinalizedForOpportunity(
+        ctx.organizationId, bid.opportunityId, d.revisionId,
       )
-      if (!progRev) {
-        return { ok: false, error: 'Programme deliverable references an invalid programme revision (not finalized, wrong type, or wrong opportunity)', status: 400 }
+      if (!rev) {
+        const expectedType = REVISION_BACKED_KIND_TYPE[d.kind] ?? 'domain'
+        return {
+          ok: false,
+          error: `${d.kind} deliverable references an invalid ${expectedType} revision (not finalized, wrong type, or wrong opportunity)`,
+          status: 400,
+        }
       }
-      resolvedProgrammeRevisionId = programmeDeliverable.revisionId
+      resolvedRevisionIds[d.kind] = d.revisionId
     }
 
-    // P0-4: If caller supplies a programmeRevisionId, it must match the deliverable's.
-    if (programmeRevisionId && resolvedProgrammeRevisionId && programmeRevisionId !== resolvedProgrammeRevisionId) {
-      return { ok: false, error: 'Conflicting programme revision: caller-supplied ID does not match TenderDeliverable revisionId', status: 400 }
-    }
+    // Programme truth is derived EXCLUSIVELY from
+    // TenderDeliverable(kind='programme').revisionId. There is no
+    // caller-supplied programmeRevisionId in the public API — this is the
+    // single source of programme truth for the submitted bid.
+    const resolvedProgrammeRevisionId = resolvedRevisionIds.programme ?? null
 
     // P0-1: Validate the adjudicated revision is still finalized AND belongs to this bid's estimate+opportunity.
     const revision = await estimateRevisionRepositoryExtended.getFinalizedForBid(
@@ -519,7 +606,8 @@ export const bidService = {
         summary: `Bid submitted: finalPrice=${bid.finalPrice ?? 0}, revision=${bid.adjudicatedRevisionId}`,
         afterJson: JSON.stringify({
           finalPrice: bid.finalPrice, estimateRevisionId: bid.adjudicatedRevisionId,
-          programmeRevisionId, gateResult: workspace.gate.overall, submittedAt: submittedAt.toISOString(),
+          programmeRevisionId: resolvedProgrammeRevisionId, // from TenderDeliverable(kind='programme')
+          gateResult: workspace.gate.overall, submittedAt: submittedAt.toISOString(),
         }),
       })
       return updated

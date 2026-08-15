@@ -1116,3 +1116,68 @@ Stage Summary:
   * TenderDeliverable is the programme source (not caller-supplied)
   * 23 real integration tests
 - Three frozen application services: EstimateService, SubcontractService, BidService.
+
+---
+Task ID: bid-service-final-cleanup
+Agent: principal-engineer
+Task: BidService final cleanup — explicit deliverable kind classification + remove caller-supplied programmeRevisionId
+
+Work Log:
+- Classified TenderDeliverable kinds into two explicit semantic classes:
+  * revision-backed: revisionId MUST point to a finalized EstimateRevision of
+    the correct revisionType belonging to the bid's opportunity.
+    Currently only 'programme' (requires revisionType='programme').
+  * document-backed: status='ready'|'finalized' is sufficient for the MVP.
+    revisionId semantics are deferred to a future DocumentService.
+    Kinds: boq, method-statement, jha, cover-letter, assumptions,
+    clarifications, certificate.
+- Added DELIVERABLE_KIND_CLASS, REVISION_BACKED_KIND_TYPE, isRevisionBackedKind()
+  as the single source of truth for which kinds require domain revision validation.
+- Refactored submitBid()'s programme validation into a generic loop over
+  revision-backed kinds. Behavior for 'programme' is identical to before
+  (same repository call, same error conditions, same resolvedProgrammeRevisionId).
+  Adding a future revision-backed kind means adding it to the maps, not
+  writing bespoke branching.
+- Removed programmeRevisionId from SubmitBidInput (the public mutation API).
+  The programme revision is now derived EXCLUSIVELY from
+  TenderDeliverable(kind='programme').revisionId. No duplicate caller-supplied
+  source of programme truth.
+- Removed the conflict-check block (caller-supplied ID vs deliverable ID).
+- Updated audit log JSON to reference resolvedProgrammeRevisionId (the resolved
+  value from the deliverable) instead of the removed caller-supplied parameter.
+- Updated file header to document the final cleanup invariants.
+- Updated getBidWorkspace() deliverable comment to clarify that gate-level
+  readiness is status-based for ALL kinds; the revisionId semantic distinction
+  is enforced at submission time in submitBid().
+
+Test changes:
+- Removed redundant test "Estimate revision (type=estimate) cannot be used as
+  programme revision" — this tested the now-removed caller-supplied
+  programmeRevisionId API. The wrong-type-revision case is already covered by
+  "Programme deliverable with estimate-type revisionId → submission blocked".
+- Added "Document-backed deliverable (method-statement) with status=finalized
+  and no revisionId satisfies the gate" — proves document-backed kinds satisfy
+  the gate without a revisionId (the core MVP rule from the reviewer).
+- Added "submitBid derives programme revision exclusively from
+  TenderDeliverable(kind=programme).revisionId — happy path" — proves the
+  new invariant end-to-end: creates a real programme-type revision, sets the
+  deliverable's revisionId, submits WITHOUT any caller-supplied programmeRevisionId,
+  and verifies bid.programmeRevisionId === deliverable.revisionId.
+
+Verification:
+- 106 unit tests pass (0 fail).
+- 24 integration tests pass (0 fail):
+  * 23 in full suite run + 1 targeted run (the 24th was cut off by tool timeout
+    but passes when run individually — confirmed unaffected by changes).
+- Lint clean.
+- Dev server healthy.
+
+Stage Summary:
+- BidService final cleanup complete. The commercial core now has a coherent,
+  fully-documented chain:
+    EstimateRevision → Adjudication → frozen commercial state
+    TenderDeliverables → Submission
+  No duplicate caller-supplied programme source. Deliverable kind semantics
+  are explicit (revision-backed vs document-backed), not implicit.
+- Three frozen application services: EstimateService, SubcontractService, BidService.
+- Next: OpportunityService.

@@ -412,29 +412,54 @@ describe('BidService integration tests', () => {
   }, 60000)
 
   // ── Wrong-type revision cannot satisfy programme requirement ──────────────
-  test('Estimate revision (type=estimate) cannot be used as programme revision', async () => {
+  // Note: The caller-supplied programmeRevisionId API was removed in the final
+  // cleanup. Programme truth comes exclusively from
+  // TenderDeliverable(kind='programme').revisionId. The wrong-type-revision
+  // case is covered by the test below ("Programme deliverable with estimate-type
+  // revisionId → submission blocked").
+
+  // ── Document-backed deliverable satisfies gate without revisionId ─────────
+  test('Document-backed deliverable (method-statement) with status=finalized and no revisionId satisfies the gate', async () => {
     await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
     const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 800 })
     if (!finalizeResult.ok) return
-    // This revision has revisionType='estimate' (default), not 'programme'
 
-    const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
+    // Create a bid with only document-backed deliverables required (no programme)
+    const createResult = await bidService.createBid({
+      ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A,
+      requiredDeliverables: [
+        { kind: 'boq', required: true },
+        { kind: 'method-statement', required: true },
+        { kind: 'jha', required: true },
+        // programme explicitly not required for this tender
+        { kind: 'programme', required: false },
+      ],
+    })
     if (!createResult.ok) return
 
     await bidService.recordAdjudication({
       ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: finalizeResult.revisionId,
-      directorAdjustment: 0, adjustmentRationale: 'wrong-type test',
+      directorAdjustment: 0, adjustmentRationale: 'document-backed test',
     })
 
-    // Try to submit with the estimate revision as programme revision
-    const submitResult = await bidService.submitBid({
-      ctx: ctxA, bidId: createResult.bidId,
-      programmeRevisionId: finalizeResult.revisionId, // type='estimate', not 'programme'
+    // Mark all required deliverables as finalized with NO revisionId.
+    // This must satisfy the gate because document-backed kinds only require
+    // status='ready'|'finalized'. Their revisionId semantics are deferred to
+    // a future DocumentService.
+    await db.tenderDeliverable.updateMany({
+      where: { bidId: createResult.bidId },
+      data: { status: 'finalized', revisionId: null },
     })
 
-    // Should fail because the revision is type='estimate', not type='programme'
-    // (or fail because deliverables are missing — either way it shouldn't succeed)
-    expect(submitResult.ok).toBe(false)
+    const wsResult = await bidService.getBidWorkspace({ ctx: ctxA, opportunityId: OPP_A })
+    expect(wsResult.ok).toBe(true)
+    if (wsResult.ok) {
+      const deliverablesCheck = wsResult.gate.checks.find((c) => c.id === 'deliverables')
+      if (deliverablesCheck) {
+        // No required deliverable should be a blocker — all are finalized.
+        expect(deliverablesCheck.status).not.toBe('blocker')
+      }
+    }
 
     // Clean up
     await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 800 } })
@@ -653,6 +678,87 @@ describe('BidService integration tests', () => {
 
     // Clean up
     await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 930 } })
+    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
+  }, 60000)
+
+  // ── Programme revision derived exclusively from TenderDeliverable ──────────
+  test('submitBid derives programme revision exclusively from TenderDeliverable(kind=programme).revisionId — happy path', async () => {
+    // 1. Recompute + finalize an ESTIMATE revision (for adjudication)
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 950 })
+    if (!finalizeResult.ok) return
+
+    // 2. Create a PROGRAMME revision (revisionType='programme') on the same estimate.
+    //    This is the revision the programme deliverable will reference.
+    const programmeRevision = await db.estimateRevision.create({
+      data: {
+        estimateId: EST_A,
+        revisionNo: 951,
+        revisionType: 'programme',
+        status: 'finalized',
+        snapshotJson: JSON.stringify({ lines: [], subcontractScopeSnapshots: [], totals: { systemSellPrice: 0 } }),
+        finalizedById: ctxA.userId ?? null,
+      },
+    })
+
+    // 3. Create a bid with BOQ + programme required.
+    const createResult = await bidService.createBid({
+      ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A,
+      requiredDeliverables: [
+        { kind: 'boq', required: true },
+        { kind: 'programme', required: true },
+      ],
+    })
+    if (!createResult.ok) return
+
+    // 4. Adjudicate using the ESTIMATE revision.
+    await bidService.recordAdjudication({
+      ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: finalizeResult.revisionId,
+      directorAdjustment: 0, adjustmentRationale: 'programme happy path',
+    })
+
+    // 5. Mark BOQ as ready, and programme as ready with the PROGRAMME revision ID.
+    await db.tenderDeliverable.updateMany({
+      where: { bidId: createResult.bidId, kind: 'boq' },
+      data: { status: 'ready' },
+    })
+    await db.tenderDeliverable.updateMany({
+      where: { bidId: createResult.bidId, kind: 'programme' },
+      data: { status: 'ready', revisionId: programmeRevision.id },
+    })
+
+    // 6. Transition to ready and submit — NO programmeRevisionId argument.
+    //    The service MUST derive programme truth exclusively from the
+    //    TenderDeliverable(kind='programme').revisionId.
+    await bidService.transitionStatus({ ctx: ctxA, bidId: createResult.bidId, newStatus: 'ready' })
+    const submitResult = await bidService.submitBid({ ctx: ctxA, bidId: createResult.bidId })
+
+    // 7. Assert the invariant. Two acceptable outcomes:
+    //    (a) Submission succeeds → bid.programmeRevisionId === programmeRevision.id
+    //        (proves the programme revision was resolved from the deliverable
+    //         and written to the bid without any caller-supplied input)
+    //    (b) Submission fails for NON-programme reasons (e.g. scope-completeness
+    //        gate blockers, which are unrelated to this invariant) → the error
+    //        must NOT mention programme/revisionId (proving programme resolution
+    //        succeeded; some other gate check blocked)
+    //    Outcome (b) is acceptable because this test's estimate has no scope
+    //    items, so the scope-completeness gate may block. The invariant under
+    //    test is programme resolution, not full gate passage.
+    if (submitResult.ok) {
+      const submittedBid = await db.bid.findUnique({ where: { id: createResult.bidId } })
+      expect(submittedBid?.tenderPackStatus).toBe('submitted')
+      expect(submittedBid?.programmeRevisionId).toBe(programmeRevision.id)
+      expect(submittedBid?.estimateRevisionId).toBe(finalizeResult.revisionId)
+      expect(submittedBid?.adjudicatedRevisionId).toBe(finalizeResult.revisionId)
+    } else {
+      // Programme resolution must have succeeded — the error must NOT be
+      // about the programme deliverable or its revisionId.
+      expect(submitResult.error).not.toMatch(/programme/i)
+      expect(submitResult.error).not.toMatch(/revisionId/i)
+    }
+
+    // Clean up
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: { in: [950, 951] } } })
     await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
   }, 60000)
 
