@@ -315,6 +315,7 @@ model EstimateRevision {
   revisionNo    Int
   snapshotJson  String   // immutable snapshot of lines + pricing inputs (P0-6 reproducibility)
   status        String   @default("finalized") // finalized (immutable) — only finalized revisions can be referenced by a Bid
+  revisionType  String   @default("estimate") // estimate | programme — distinguishes commercial vs programme revisions
   finalizedAt   DateTime @default(now())
   finalizedById String?
 
@@ -513,6 +514,7 @@ model Bid {
   organization        Organization @relation(fields: [organizationId], references: [id])
   opportunity         Opportunity  @relation(fields: [opportunityId], references: [id])
   estimate            Estimate    @relation(fields: [estimateId], references: [id])
+  deliverables        TenderDeliverable[]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -627,4 +629,23 @@ model CalibrationProposal {
   organization           Organization @relation(fields: [organizationId], references: [id])
   workDefinition         WorkDefinition @relation(fields: [workDefinitionId], references: [id])
   projectActual          ProjectActual? @relation(fields: [projectActualId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tender Deliverables — explicit document/revision readiness per bid
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TenderDeliverable {
+  id          String   @id @default(cuid())
+  bidId       String
+  kind        String   // boq | programme | method-statement | jha | cover-letter | assumptions | clarifications | certificate
+  required    Boolean  @default(true)
+  status      String   @default("missing") // missing | draft | ready | finalized
+  revisionId  String?  // references an EstimateRevision (for programme) or future document ID
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  bid         Bid @relation(fields: [bidId], references: [id])
+
+  @@unique([bidId, kind])
 }

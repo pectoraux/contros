@@ -1,18 +1,17 @@
 /**
  * BidService — application service for bid lifecycle and commercial submission.
  *
- * P0 corrections:
- * - No raw Prisma in the service — all reads via tenant-aware repositories
- * - No 70% WD proxy for deliverable readiness — uses actual revision/document state
- * - Programme revision is tenant-safe + finalized-validated
- * - Adjudication uses finalized EstimateRevision snapshot (not mutable estimate)
- * - Submitted revision must match adjudicated revision
+ * Final corrections:
+ * - Submission gate uses FROZEN adjudicated revision for commercial data (not mutable estimate)
+ * - Deliverable readiness uses TenderDeliverable records (not estimateRevision existence)
+ * - Programme revision must be revisionType='programme' (not any estimate revision)
+ * - Required deliverables block submission when missing
  * - Post-submission immutability for commercial fields
  *
  * FROZEN pattern: RequestContext → Service → Repository → Engine → Transaction → Audit
  */
 
-import { db } from '@/lib/db'
+import { db, dbTx } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
 import {
   runPreSubmissionGate,
@@ -32,6 +31,7 @@ import {
   auditLogRepository,
   estimateRevisionRepositoryExtended,
   programmeRevisionRepository,
+  tenderDeliverableRepository,
 } from '@/repositories'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -97,7 +97,12 @@ export const bidService = {
       return { ok: false, error: 'Opportunity not found', status: 404 }
     }
 
-    // Build gate input from the loaded graph.
+    // Build gate input.
+    // P0-1 (final): If the bid has an adjudicated revision, use the FROZEN
+    // commercial state from that revision — NOT the mutable current estimate.
+    // Current mutable state is used only for workflow items (scope, assumptions).
+
+    // Workflow state (current/mutable — OK to use current data):
     const scopeItems: ScopeCompletenessItem[] = opportunity.scopePackage?.items.map((i) => ({
       description: i.description,
       status: i.status as 'known' | 'missing' | 'ambiguous',
@@ -110,47 +115,86 @@ export const bidService = {
       id: a.id, text: a.text, acknowledged: a.acknowledged, riskLevel: a.riskLevel as 'low' | 'medium' | 'high',
     }))
 
+    // Commercial state (frozen/mutable depending on adjudication):
     const estimate = opportunity.estimates[0]
-    const estimateLines: GateEstimateLine[] = (estimate?.lines ?? []).map((l) => {
-      const exceptionApproved = l.commercialExceptions.some((ex) => !!ex.approvedById)
-      return {
+    const bid = opportunity.bid
+
+    let estimateLines: GateEstimateLine[]
+    let subcontractPackages: GateSubcontractPackage[]
+
+    if (bid?.adjudicatedRevisionId) {
+      // P0-1: Use FROZEN adjudicated revision for commercial data.
+      const revision = await estimateRevisionRepositoryExtended.getFinalizedForBid(
+        ctx.organizationId, bid.estimateId, opportunity.id, bid.adjudicatedRevisionId,
+      )
+      if (revision) {
+        const replay = replayRevision(revision.snapshotJson)
+        if (replay.ok) {
+          // Build gate lines from the frozen snapshot, not the mutable estimate.
+          estimateLines = replay.lines.map((l) => ({
+            id: l.lineId,
+            description: l.description,
+            isUnsourced: l.breakdown.unsourced,
+            acknowledged: false, // Acknowledgement is workflow state — use current if needed
+            unitRate: l.breakdown.unitRate,
+            calculationStatus: l.breakdown.calculationStatus,
+            exceptionApproved: false, // Exceptions are workflow state
+          }))
+        } else {
+          // Replay failed — fall back to current estimate (shouldn't happen)
+          estimateLines = (estimate?.lines ?? []).map((l) => ({
+            id: l.id, description: l.description, isUnsourced: l.isUnsourced, acknowledged: l.acknowledged,
+            unitRate: l.unitRate,
+            calculationStatus: (l.calculationStatus === 'incomplete' ? 'incomplete' : 'complete') as 'complete' | 'incomplete',
+            exceptionApproved: l.commercialExceptions.some((ex) => !!ex.approvedById),
+          }))
+        }
+      } else {
+        // Revision not found — fall back to current
+        estimateLines = (estimate?.lines ?? []).map((l) => ({
+          id: l.id, description: l.description, isUnsourced: l.isUnsourced, acknowledged: l.acknowledged,
+          unitRate: l.unitRate,
+          calculationStatus: (l.calculationStatus === 'incomplete' ? 'incomplete' : 'complete') as 'complete' | 'incomplete',
+          exceptionApproved: l.commercialExceptions.some((ex) => !!ex.approvedById),
+        }))
+      }
+    } else {
+      // No adjudicated revision yet — use current estimate (pre-adjudication is OK)
+      estimateLines = (estimate?.lines ?? []).map((l) => ({
         id: l.id, description: l.description, isUnsourced: l.isUnsourced, acknowledged: l.acknowledged,
         unitRate: l.unitRate,
         calculationStatus: (l.calculationStatus === 'incomplete' ? 'incomplete' : 'complete') as 'complete' | 'incomplete',
-        exceptionApproved,
-      }
-    })
+        exceptionApproved: l.commercialExceptions.some((ex) => !!ex.approvedById),
+      }))
+    }
 
-    const subcontractPackages: GateSubcontractPackage[] = opportunity.subcontractPackages.map((sp) => ({
+    // Subcontract packages are always current (they're workflow state, not frozen in the revision)
+    subcontractPackages = opportunity.subcontractPackages.map((sp) => ({
       id: sp.id, name: sp.name,
       coveragePct: sp.quotes.find((q) => q.id === sp.selectedQuoteId)?.coveragePct ?? 0,
       selectedQuoteId: sp.selectedQuoteId, isLumpSum: false,
     }))
 
-    // P0-2: Deliverable readiness is NOT inferred from WD coverage.
-    // BOQ is ready if estimate has lines. Programme/MS/JHA readiness is
-    // determined by whether the bid's adjudicated revision is finalized.
-    // P0-3: Use adjudicatedRevisionId (set during adjudication), not estimateRevisionId.
-    const hasEstimateLines = (estimate?.lines.length ?? 0) > 0
-    const revisionToCheck = opportunity.bid?.adjudicatedRevisionId ?? opportunity.bid?.estimateRevisionId ?? ''
-    const hasFinalizedRevision = revisionToCheck
-      ? !!(await estimateRevisionRepositoryExtended.getFinalizedForBid(
-          ctx.organizationId,
-          opportunity.bid?.estimateId ?? '',
-          opportunity.id,
-          revisionToCheck,
-        ))
-      : false
+    // P0-3: Deliverable readiness uses TenderDeliverable records, NOT estimateRevision existence.
+    const deliverableRecords = bid
+      ? await tenderDeliverableRepository.getForBid(ctx.organizationId, bid.id)
+      : []
+    const getDeliverableStatus = (kind: string): boolean => {
+      const rec = deliverableRecords.find((d) => d.kind === kind)
+      if (!rec) return false
+      if (!rec.required) return true // Not required = pass
+      return rec.status === 'ready' || rec.status === 'finalized'
+    }
     const deliverables = {
-      boq: hasEstimateLines,
-      programme: hasFinalizedRevision,
-      methodStatement: hasFinalizedRevision,
-      jha: hasFinalizedRevision,
-      tenderPack: opportunity.bid?.tenderPackStatus === 'ready' || opportunity.bid?.tenderPackStatus === 'submitted',
+      boq: getDeliverableStatus('boq') || (estimate?.lines.length ?? 0) > 0,
+      programme: getDeliverableStatus('programme'),
+      methodStatement: getDeliverableStatus('method-statement'),
+      jha: getDeliverableStatus('jha'),
+      tenderPack: bid?.tenderPackStatus === 'ready' || bid?.tenderPackStatus === 'submitted',
     }
 
     const commercialApproval =
-      (opportunity.bid?.directorAdjustment !== undefined && opportunity.bid?.directorAdjustment !== 0) ||
+      (bid?.directorAdjustment !== undefined && bid?.directorAdjustment !== 0) ||
       estimate?.status === 'adjudicated' || estimate?.status === 'submitted'
 
     const gate = runPreSubmissionGate({
@@ -207,9 +251,11 @@ export const bidService = {
       return { ok: false, error: 'Bid already exists for this opportunity', status: 409 }
     }
 
-    const bid = await db.$transaction(async (tx) => {
+    const bid = await dbTx.$transaction(async (tx) => {
       const created = await bidRepository.createInTransaction(tx, ctx.organizationId, { opportunityId, estimateId })
       if (!created) return null
+      // P0-3: Create default tender deliverables for the new bid.
+      await tenderDeliverableRepository.createDefaultsForBid(tx, created.id)
       await auditLogRepository.createInTransaction(tx, ctx.organizationId, ctx.userId, {
         action: 'bid.created', entityType: 'Bid', entityId: created.id,
         summary: `Bid created for opportunity ${opportunityId}`,
@@ -238,7 +284,7 @@ export const bidService = {
       return { ok: false, error: `Illegal status transition: ${currentStatus} → ${newStatus}`, status: 400 }
     }
 
-    await db.$transaction(async (tx) => {
+    await dbTx.$transaction(async (tx) => {
       await bidRepository.updateInTransaction(tx, ctx.organizationId, bidId, { tenderPackStatus: newStatus })
       await auditLogRepository.createInTransaction(tx, ctx.organizationId, ctx.userId, {
         action: 'bid.status-changed', entityType: 'Bid', entityId: bidId,
@@ -295,7 +341,7 @@ export const bidService = {
     const systemSellPrice = replay.totalSellPrice
     const finalPrice = round2(systemSellPrice * (1 + directorAdjustment))
 
-    await db.$transaction(async (tx) => {
+    await dbTx.$transaction(async (tx) => {
       await bidRepository.updateInTransaction(tx, ctx.organizationId, bidId, {
         directorAdjustment,
         adjustmentRationale,
@@ -362,6 +408,16 @@ export const bidService = {
       return { ok: false, error: 'Adjudicated estimate revision is no longer finalized or does not belong to this bid', status: 400 }
     }
 
+    // P0-3: Validate required tender deliverables are ready.
+    const deliverables = await tenderDeliverableRepository.getForBid(ctx.organizationId, bidId)
+    const missingRequired = deliverables.filter(
+      (d) => d.required && d.status !== 'ready' && d.status !== 'finalized',
+    )
+    if (missingRequired.length > 0) {
+      const missingNames = missingRequired.map((d) => d.kind).join(', ')
+      return { ok: false, error: `Required deliverables not ready: ${missingNames}`, status: 400 }
+    }
+
     // Validate bid submission.
     const validation = validateBidSubmission({
       estimateRevisionId: bid.adjudicatedRevisionId,
@@ -387,7 +443,7 @@ export const bidService = {
 
     // All checks pass — submit in a transaction.
     const submittedAt = new Date()
-    const result = await db.$transaction(async (tx) => {
+    const result = await dbTx.$transaction(async (tx) => {
       const updated = await bidRepository.updateInTransaction(tx, ctx.organizationId, bidId, {
         tenderPackStatus: 'submitted',
         submittedAt,
@@ -428,7 +484,7 @@ export const bidService = {
       return { ok: false, error: `Cannot record outcome for bid in status ${bid.tenderPackStatus}`, status: 400 }
     }
 
-    await db.$transaction(async (tx) => {
+    await dbTx.$transaction(async (tx) => {
       await bidRepository.updateInTransaction(tx, ctx.organizationId, bidId, {
         tenderPackStatus: outcome, outcome,
         winningPrice: winningPrice ?? null, ourRank: ourRank ?? null,
@@ -457,7 +513,7 @@ export const bidService = {
       return { ok: false, error: `Cannot withdraw bid in terminal status ${bid.tenderPackStatus}`, status: 400 }
     }
 
-    await db.$transaction(async (tx) => {
+    await dbTx.$transaction(async (tx) => {
       await bidRepository.updateInTransaction(tx, ctx.organizationId, bidId, {
         tenderPackStatus: 'withdrawn', outcome: 'withdrawn',
       })

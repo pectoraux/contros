@@ -12,7 +12,7 @@
  *   - Receives `ctx: RequestContext` for tenant scoping.
  *   - All data access via tenant-aware repositories (no raw Prisma in the
  *     service except for the atomic $transaction that touches multiple tables).
- *   - Commercially significant actions are wrapped in `db.$transaction` so
+ *   - Commercially significant actions are wrapped in `dbTx.$transaction` so
  *     package update + quote update + audit log succeed or fail together.
  *
  * API routes become thin adapters that call this service.
@@ -21,7 +21,7 @@
  * INVARIANT 12: Every organization is isolated.
  */
 
-import { db } from '@/lib/db'
+import { db, dbTx } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
 import {
   reconcileSubcontract,
@@ -582,7 +582,7 @@ export const subcontractService = {
    * Tenant-safe: the repository verifies opportunity ownership. If the
    * opportunity doesn't exist OR belongs to another org, returns 404.
    *
-   * P0-1: package creation + audit log are wrapped in `db.$transaction` so
+   * P0-1: package creation + audit log are wrapped in `dbTx.$transaction` so
    * they succeed or fail atomically — a package without an audit trail (or
    * an audit trail without a package) is impossible.
    */
@@ -595,7 +595,7 @@ export const subcontractService = {
       return { ok: false, error: 'Package name is required', status: 400 }
     }
 
-    const pkg = await db.$transaction(async (tx) => {
+    const pkg = await dbTx.$transaction(async (tx) => {
       const created = await subcontractPackageRepository.createForOrganizationInTransaction(
         tx,
         ctx.organizationId,
@@ -671,7 +671,7 @@ export const subcontractService = {
     }
 
     // P0: Transactional — scope atom + audit succeed or fail together.
-    const atom = await db.$transaction(async (tx) => {
+    const atom = await dbTx.$transaction(async (tx) => {
       const created = await scopeAtomRepository.createForPackageInTransaction(
         tx,
         ctx.organizationId,
@@ -724,7 +724,7 @@ export const subcontractService = {
    * Validates `totalAmount` is a non-negative finite number. Tenant-safe: the
    * repository verifies package ownership.
    *
-   * P0-1: quote creation + audit log are wrapped in `db.$transaction` so they
+   * P0-1: quote creation + audit log are wrapped in `dbTx.$transaction` so they
    * succeed or fail atomically — a quote without an audit trail (or vice
    * versa) is impossible.
    */
@@ -760,7 +760,7 @@ export const subcontractService = {
     const exclusionsJson = JSON.stringify(exclusionsArr)
     const assumptionsJson = JSON.stringify(assumptionsArr)
 
-    const quote = await db.$transaction(async (tx) => {
+    const quote = await dbTx.$transaction(async (tx) => {
       const created = await subcontractQuoteRepository.createForPackageInTransaction(
         tx,
         ctx.organizationId,
@@ -887,7 +887,7 @@ export const subcontractService = {
    * duplicate the reconciliation math.
    *
    * P0-1: persistence of the reconciled coveragePct on the quote + the audit
-   * log are wrapped in `db.$transaction` so they succeed or fail atomically.
+   * log are wrapped in `dbTx.$transaction` so they succeed or fail atomically.
    * The quote status is preserved — only `coveragePct` is updated.
    */
   async reconcileQuote(
@@ -936,7 +936,7 @@ export const subcontractService = {
     // 4. Persist the reconciled coveragePct + write an audit log atomically.
     //    The quote.status is preserved — `updateStatusInTransaction` accepts
     //    an optional coveragePct alongside the status.
-    await db.$transaction(async (tx) => {
+    await dbTx.$transaction(async (tx) => {
       await subcontractQuoteRepository.updateStatusInTransaction(
         tx,
         quoteId,
@@ -984,7 +984,7 @@ export const subcontractService = {
    *   - Economic coverage >= 0.8, OR there is an approved exception.
    *
    * If all checks pass, the selection is performed atomically within
-   * `db.$transaction`:
+   * `dbTx.$transaction`:
    *   - package.selectedQuoteId = quoteId
    *   - package.status = 'awarded'
    *   - quote.status = 'selected'
@@ -1104,7 +1104,7 @@ export const subcontractService = {
     }
 
     // 7. Atomic selection — package + quote + audit succeed or fail together.
-    await db.$transaction(async (tx) => {
+    await dbTx.$transaction(async (tx) => {
       await subcontractPackageRepository.updateSelectionInTransaction(
         tx,
         packageId,

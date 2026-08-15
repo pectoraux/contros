@@ -13,7 +13,7 @@
  * verified explicitly — not trusted via the EstimateLine relation.
  */
 
-import { db } from '@/lib/db'
+import { db, dbTx } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
 
 // ─── Estimate Repository ────────────────────────────────────────────────────
@@ -125,7 +125,7 @@ export const estimateRepository = {
 export const estimateRevisionRepository = {
   /** Create a finalized revision within a transaction. */
   async createFinalized(
-    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+    tx: Parameters<Parameters<typeof dbTx.$transaction>[0]>[0],
     data: {
       estimateId: string
       revisionNo: number
@@ -346,7 +346,7 @@ export const subcontractQuoteRepository = {
    * Returns null if the package doesn't exist OR belongs to another org.
    */
   async createForPackageInTransaction(
-    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+    tx: Parameters<Parameters<typeof dbTx.$transaction>[0]>[0],
     orgId: string,
     packageId: string,
     data: {
@@ -410,7 +410,7 @@ export const subcontractQuoteRepository = {
    * Assumes the caller has already verified ownership.
    */
   async updateStatusInTransaction(
-    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+    tx: Parameters<Parameters<typeof dbTx.$transaction>[0]>[0],
     quoteId: string,
     status: string,
     coveragePct?: number,
@@ -524,7 +524,7 @@ export const auditLogRepository = {
 
   /** Create within a transaction. */
   async createInTransaction(
-    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+    tx: Parameters<Parameters<typeof dbTx.$transaction>[0]>[0],
     orgId: string,
     actorId: string,
     entry: {
@@ -640,7 +640,7 @@ export const subcontractPackageRepository = {
    * Returns null if the opportunity doesn't exist OR belongs to another org.
    */
   async createForOrganizationInTransaction(
-    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+    tx: Parameters<Parameters<typeof dbTx.$transaction>[0]>[0],
     orgId: string,
     data: {
       opportunityId: string
@@ -693,7 +693,7 @@ export const subcontractPackageRepository = {
    * Assumes the caller has already verified ownership.
    */
   async updateSelectionInTransaction(
-    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+    tx: Parameters<Parameters<typeof dbTx.$transaction>[0]>[0],
     packageId: string,
     selectedQuoteId: string | null,
     status: string,
@@ -949,7 +949,7 @@ export const subcontractPackageLineRepository = {
 // Every method requires orgId — no unscoped access.
 // INVARIANT 12: Every organization is isolated.
 
-type PrismaTransaction = Parameters<Parameters<typeof db.$transaction>[0]>[0]
+type PrismaTransaction = Parameters<Parameters<typeof dbTx.$transaction>[0]>[0]
 
 export const bidRepository = {
   /**
@@ -1224,6 +1224,7 @@ export const programmeRevisionRepository = {
    * P0-2: Get a finalized programme revision — verifies the FULL chain:
    *   revision → estimate → organization
    *   AND estimate.opportunityId === the bid's opportunityId
+   *   AND revisionType = 'programme' (not just any estimate revision)
    * Returns null if any link is broken.
    */
   async getFinalizedForOpportunity(
@@ -1235,12 +1236,65 @@ export const programmeRevisionRepository = {
       where: {
         id: revisionId,
         status: 'finalized',
+        revisionType: 'programme',
         estimate: {
           organizationId: orgId,
           opportunityId,
         },
       },
-      select: { id: true, status: true, revisionNo: true },
+      select: { id: true, status: true, revisionNo: true, revisionType: true },
     })
+  },
+}
+
+// ─── Tender Deliverable Repository ──────────────────────────────────────────
+
+export const tenderDeliverableRepository = {
+  /** Get all deliverables for a bid, tenant-scoped via bid → org. */
+  async getForBid(orgId: string, bidId: string) {
+    const bid = await db.bid.findFirst({
+      where: { id: bidId, organizationId: orgId },
+      select: { id: true },
+    })
+    if (!bid) return []
+    return db.tenderDeliverable.findMany({
+      where: { bidId },
+      orderBy: { kind: 'asc' },
+    })
+  },
+
+  /** Upsert a deliverable for a bid, tenant-scoped. */
+  async upsertForBid(
+    orgId: string,
+    bidId: string,
+    kind: string,
+    data: { required?: boolean; status?: string; revisionId?: string | null },
+  ) {
+    const bid = await db.bid.findFirst({
+      where: { id: bidId, organizationId: orgId },
+      select: { id: true },
+    })
+    if (!bid) return null
+    return db.tenderDeliverable.upsert({
+      where: { bidId_kind: { bidId, kind } },
+      create: { bidId, kind, ...data },
+      update: { ...data },
+    })
+  },
+
+  /** Create default deliverables for a new bid. */
+  async createDefaultsForBid(tx: PrismaTransaction, bidId: string) {
+    const defaults = [
+      { kind: 'boq', required: true, status: 'missing' },
+      { kind: 'programme', required: true, status: 'missing' },
+      { kind: 'method-statement', required: true, status: 'missing' },
+      { kind: 'jha', required: true, status: 'missing' },
+      { kind: 'cover-letter', required: false, status: 'missing' },
+      { kind: 'assumptions', required: true, status: 'missing' },
+      { kind: 'clarifications', required: false, status: 'missing' },
+    ]
+    for (const d of defaults) {
+      await tx.tenderDeliverable.create({ data: { bidId, ...d } })
+    }
   },
 }

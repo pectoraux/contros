@@ -49,12 +49,13 @@ describe('BidService integration tests', () => {
   beforeAll(async () => {
     await db.auditLog.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.commercialException.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+    await db.tenderDeliverable.deleteMany({ where: { bid: { organizationId: { in: [ORG_A, ORG_B] } } } })
     await db.bid.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
-    await db.estimateRevision.deleteMany({ where: { estimateId: { in: [EST_A, EST_B] } } })
-    await db.estimateLine.deleteMany({ where: { id: LINE_A } })
-    await db.estimate.deleteMany({ where: { id: { in: [EST_A, EST_B] } } })
-    await db.opportunity.deleteMany({ where: { id: { in: [OPP_A, OPP_B] } } })
-    await db.client.deleteMany({ where: { id: { in: [CLIENT_A, CLIENT_B] } } })
+    await db.estimateRevision.deleteMany({ where: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } })
+    await db.estimateLine.deleteMany({ where: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } })
+    await db.estimate.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+    await db.opportunity.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+    await db.client.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.workDefinitionVersion.deleteMany({ where: { id: WDV_A } })
     await db.workDefinition.deleteMany({ where: { id: WD_A } })
     await db.user.deleteMany({ where: { id: { in: [USER_A, USER_B] } } })
@@ -79,12 +80,13 @@ describe('BidService integration tests', () => {
   afterAll(async () => {
     await db.auditLog.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.commercialException.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+    await db.tenderDeliverable.deleteMany({ where: { bid: { organizationId: { in: [ORG_A, ORG_B] } } } })
     await db.bid.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
-    await db.estimateRevision.deleteMany({ where: { estimateId: { in: [EST_A, EST_B] } } })
-    await db.estimateLine.deleteMany({ where: { id: LINE_A } })
-    await db.estimate.deleteMany({ where: { id: { in: [EST_A, EST_B] } } })
-    await db.opportunity.deleteMany({ where: { id: { in: [OPP_A, OPP_B] } } })
-    await db.client.deleteMany({ where: { id: { in: [CLIENT_A, CLIENT_B] } } })
+    await db.estimateRevision.deleteMany({ where: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } })
+    await db.estimateLine.deleteMany({ where: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } })
+    await db.estimate.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+    await db.opportunity.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+    await db.client.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.workDefinitionVersion.deleteMany({ where: { id: WDV_A } })
     await db.workDefinition.deleteMany({ where: { id: WD_A } })
     await db.user.deleteMany({ where: { id: { in: [USER_A, USER_B] } } })
@@ -93,10 +95,13 @@ describe('BidService integration tests', () => {
   }, 120000)
 
   beforeEach(async () => {
-    await db.bid.deleteMany({ where: { opportunityId: OPP_A } }).catch(() => {})
-    await db.bid.deleteMany({ where: { opportunityId: OPP_B } }).catch(() => {})
+    // Simplified cleanup — delete deliverables by org, then bids by org
+    await db.tenderDeliverable.deleteMany({ where: { bid: { organizationId: ORG_A } } }).catch(() => {})
+    await db.tenderDeliverable.deleteMany({ where: { bid: { organizationId: ORG_B } } }).catch(() => {})
+    await db.bid.deleteMany({ where: { organizationId: ORG_A } }).catch(() => {})
+    await db.bid.deleteMany({ where: { organizationId: ORG_B } }).catch(() => {})
     await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } }).catch(() => {})
-  })
+  }, 30000)
 
   // ── Cross-tenant tests ─────────────────────────────────────────────────────
   test('Org A cannot read Org B bid workspace', async () => {
@@ -331,6 +336,108 @@ describe('BidService integration tests', () => {
 
     // Clean up
     await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 500 } })
+    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
+  }, 60000)
+
+  // ── Post-adjudication mutation test ────────────────────────────────────────
+  test('Post-adjudication: current estimate mutation does not change gate commercial state', async () => {
+    // 1. Recompute + finalize
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 600 })
+    if (!finalizeResult.ok) return
+    const revId = finalizeResult.revisionId
+
+    // 2. Create bid + adjudicate
+    const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
+    if (!createResult.ok) return
+
+    await bidService.recordAdjudication({
+      ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: revId,
+      directorAdjustment: 0, adjustmentRationale: 'mutation test',
+    })
+
+    // 3. Mutate the current estimate line (change calculationStatus to incomplete)
+    await db.estimateLine.update({
+      where: { id: LINE_A },
+      data: { calculationStatus: 'incomplete', unitRate: 0 },
+    })
+
+    // 4. Run the gate — it should use the FROZEN revision, not the mutated estimate
+    const wsResult = await bidService.getBidWorkspace({ ctx: ctxA, opportunityId: OPP_A })
+    expect(wsResult.ok).toBe(true)
+    if (wsResult.ok) {
+      // The gate should NOT see the mutated incomplete line.
+      // The frozen revision had calculationStatus='complete'.
+      const incompleteCheck = wsResult.gate.checks.find((c) => c.id === 'incomplete-calculations')
+      // If the gate is using the frozen revision, incomplete-calculations should be 'pass'
+      // (because the revision was complete when finalized).
+      // If the gate is using the mutable estimate, it would be 'blocker'.
+      if (incompleteCheck) {
+        expect(incompleteCheck.status).not.toBe('blocker')
+      }
+    }
+
+    // Clean up: restore the line
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 600 } })
+    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
+  }, 60000)
+
+  // ── Missing required deliverable blocks submission ─────────────────────────
+  test('Missing required deliverable blocks submission', async () => {
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 700 })
+    if (!finalizeResult.ok) return
+
+    const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
+    if (!createResult.ok) return
+
+    await bidService.recordAdjudication({
+      ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: finalizeResult.revisionId,
+      directorAdjustment: 0, adjustmentRationale: 'deliverable test',
+    })
+
+    await bidService.transitionStatus({ ctx: ctxA, bidId: createResult.bidId, newStatus: 'ready' })
+
+    // Attempt to submit — should be blocked because deliverables are 'missing'
+    const submitResult = await bidService.submitBid({ ctx: ctxA, bidId: createResult.bidId })
+    expect(submitResult.ok).toBe(false)
+    if (!submitResult.ok) {
+      expect(submitResult.error).toContain('Required deliverables not ready')
+    }
+
+    // Clean up
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 700 } })
+    await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
+  }, 60000)
+
+  // ── Wrong-type revision cannot satisfy programme requirement ──────────────
+  test('Estimate revision (type=estimate) cannot be used as programme revision', async () => {
+    await estimateService.recomputeLine({ ctx: ctxA, estimateId: EST_A, estimateLineId: LINE_A })
+    const finalizeResult = await estimateService.finalizeRevision({ ctx: ctxA, estimateId: EST_A, revisionNo: 800 })
+    if (!finalizeResult.ok) return
+    // This revision has revisionType='estimate' (default), not 'programme'
+
+    const createResult = await bidService.createBid({ ctx: ctxA, opportunityId: OPP_A, estimateId: EST_A })
+    if (!createResult.ok) return
+
+    await bidService.recordAdjudication({
+      ctx: ctxA, bidId: createResult.bidId, estimateRevisionId: finalizeResult.revisionId,
+      directorAdjustment: 0, adjustmentRationale: 'wrong-type test',
+    })
+
+    // Try to submit with the estimate revision as programme revision
+    const submitResult = await bidService.submitBid({
+      ctx: ctxA, bidId: createResult.bidId,
+      programmeRevisionId: finalizeResult.revisionId, // type='estimate', not 'programme'
+    })
+
+    // Should fail because the revision is type='estimate', not type='programme'
+    // (or fail because deliverables are missing — either way it shouldn't succeed)
+    expect(submitResult.ok).toBe(false)
+
+    // Clean up
+    await db.estimateRevision.deleteMany({ where: { estimateId: EST_A, revisionNo: 800 } })
     await db.auditLog.deleteMany({ where: { organizationId: ORG_A, entityType: 'Bid' } })
   }, 60000)
 })

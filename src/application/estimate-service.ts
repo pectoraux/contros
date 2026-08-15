@@ -10,7 +10,7 @@
  * API routes become thin adapters that call this service.
  */
 
-import { db } from '@/lib/db'
+import { db, dbTx } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
 import {
   priceLine,
@@ -204,7 +204,7 @@ export const estimateService = {
       : baseProvenance
 
     // 8. Persist within a transaction (atomic: line update + exception + audit).
-    const updated = await db.$transaction(async (tx) => {
+    const updated = await dbTx.$transaction(async (tx) => {
       const updatedLine = await tx.estimateLine.update({
         where: { id: line.id },
         data: {
@@ -456,7 +456,7 @@ export const estimateService = {
     }
 
     // 6. P0-1: Atomic transaction — revision + audit succeed or fail together.
-    const revision = await db.$transaction(async (tx) => {
+    const revision = await dbTx.$transaction(async (tx) => {
       // P0-2: Use repository for revision creation.
       const rev = await estimateRevisionRepository.createFinalized(tx, {
         estimateId,

@@ -37,12 +37,38 @@ try {
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
+  prismaTx: PrismaClient | undefined
 }
 
+/**
+ * Main Prisma client — uses the pooled connection (DATABASE_URL).
+ * Good for regular queries. Does NOT support interactive transactions ($transaction with callback)
+ * when using PgBouncer in transaction mode.
+ */
 export const db =
   globalForPrisma.prisma ??
   new PrismaClient({
     log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
   })
 
-if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = db
+/**
+ * Transaction Prisma client — uses the DIRECT connection (DIRECT_DATABASE_URL).
+ * Required for interactive transactions ($transaction with callback) which
+ * don't work through PgBouncer's transaction-mode pooler.
+ * Falls back to the main client if DIRECT_DATABASE_URL is not set.
+ */
+export const dbTx =
+  globalForPrisma.prismaTx ??
+  new PrismaClient({
+    log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
+    datasources: {
+      db: {
+        url: process.env.DIRECT_DATABASE_URL || process.env.DATABASE_URL,
+      },
+    },
+  })
+
+if (process.env.NODE_ENV !== 'production') {
+  globalForPrisma.prisma = db
+  globalForPrisma.prismaTx = dbTx
+}
