@@ -158,6 +158,39 @@ export const estimateRevisionRepository = {
     })
     return estimate?.revisions[0]?.revisionNo ?? 0
   },
+
+  /**
+   * Get a finalized revision scoped to the authenticated organization.
+   * Verifies ownership chain: EstimateRevision → Estimate → Organization.
+   * Returns null if the revision doesn't exist OR belongs to another org.
+   *
+   * Used by BidService.submitBid() to tenant-safely resolve the revision
+   * referenced by a Bid.
+   */
+  async getForOrganization(orgId: string, revisionId: string) {
+    return db.estimateRevision.findFirst({
+      where: {
+        id: revisionId,
+        estimate: { organizationId: orgId },
+      },
+      include: {
+        estimate: {
+          select: {
+            id: true,
+            organizationId: true,
+            status: true,
+            lines: {
+              select: {
+                id: true,
+                calculationStatus: true,
+                sellPrice: true,
+              },
+            },
+          },
+        },
+      },
+    })
+  },
 }
 
 // ─── Subcontract Quote Repository ───────────────────────────────────────────
@@ -907,5 +940,247 @@ export const subcontractPackageLineRepository = {
         requiredScope,
       },
     })
+  },
+}
+
+// ─── Bid Repository ─────────────────────────────────────────────────────────
+//
+// Verifies: Bid → Opportunity → Organization.
+// Every method requires orgId — no unscoped access.
+// INVARIANT 12: Every organization is isolated.
+
+type PrismaTransaction = Parameters<Parameters<typeof db.$transaction>[0]>[0]
+
+export const bidRepository = {
+  /**
+   * Get a bid scoped to the authenticated organization.
+   * Verifies: bid → opportunity → org.
+   * Returns null if the bid doesn't exist OR belongs to another org.
+   */
+  async getForOrganization(orgId: string, bidId: string) {
+    return db.bid.findFirst({
+      where: {
+        id: bidId,
+        organizationId: orgId,
+        opportunity: { organizationId: orgId },
+      },
+      include: {
+        opportunity: {
+          select: {
+            id: true,
+            title: true,
+            status: true,
+            organizationId: true,
+          },
+        },
+        estimate: {
+          select: {
+            id: true,
+            status: true,
+            organizationId: true,
+          },
+        },
+      },
+    })
+  },
+
+  /**
+   * Get the bid for an opportunity (1:1 relation).
+   * Verifies: bid → opportunity → org.
+   * Returns null if the bid doesn't exist OR belongs to another org.
+   */
+  async getForOpportunity(orgId: string, opportunityId: string) {
+    return db.bid.findFirst({
+      where: {
+        opportunityId,
+        organizationId: orgId,
+        opportunity: { organizationId: orgId },
+      },
+    })
+  },
+
+  /**
+   * Create a bid, verifying opportunity + estimate ownership.
+   * Returns null if either the opportunity OR estimate doesn't exist
+   * OR belongs to another org, OR if the estimate doesn't belong to the
+   * given opportunity.
+   */
+  async createForOrganization(
+    orgId: string,
+    data: {
+      opportunityId: string
+      estimateId: string
+      bidId?: string
+    },
+  ) {
+    // Verify opportunity ownership.
+    const opportunity = await db.opportunity.findFirst({
+      where: { id: data.opportunityId, organizationId: orgId },
+      select: { id: true },
+    })
+    if (!opportunity) return null
+
+    // Verify estimate ownership AND that it belongs to this opportunity.
+    const estimate = await db.estimate.findFirst({
+      where: {
+        id: data.estimateId,
+        organizationId: orgId,
+        opportunityId: data.opportunityId,
+      },
+      select: { id: true },
+    })
+    if (!estimate) return null
+
+    return db.bid.create({
+      data: {
+        id: data.bidId,
+        organizationId: orgId,
+        opportunityId: data.opportunityId,
+        estimateId: data.estimateId,
+      },
+    })
+  },
+
+  /**
+   * Create a bid within a transaction, verifying opportunity + estimate ownership.
+   *
+   * Used by BidService.createBid() so that the bid creation and the audit-log
+   * entry succeed or fail atomically (P0-1).
+   *
+   * Returns null if either the opportunity OR estimate doesn't exist OR belongs
+   * to another org, OR if the estimate doesn't belong to the given opportunity.
+   */
+  async createInTransaction(
+    tx: PrismaTransaction,
+    orgId: string,
+    data: {
+      opportunityId: string
+      estimateId: string
+      bidId?: string
+    },
+  ) {
+    // Verify opportunity ownership within the same transaction.
+    const opportunity = await tx.opportunity.findFirst({
+      where: { id: data.opportunityId, organizationId: orgId },
+      select: { id: true },
+    })
+    if (!opportunity) return null
+
+    // Verify estimate ownership AND that it belongs to this opportunity.
+    const estimate = await tx.estimate.findFirst({
+      where: {
+        id: data.estimateId,
+        organizationId: orgId,
+        opportunityId: data.opportunityId,
+      },
+      select: { id: true },
+    })
+    if (!estimate) return null
+
+    return tx.bid.create({
+      data: {
+        id: data.bidId,
+        organizationId: orgId,
+        opportunityId: data.opportunityId,
+        estimateId: data.estimateId,
+      },
+    })
+  },
+
+  /**
+   * Update a bid, verifying ownership before update.
+   * Verifies: bid → opportunity → org.
+   * Returns null if the bid doesn't exist OR belongs to another org.
+   */
+  async updateForOrganization(
+    orgId: string,
+    bidId: string,
+    data: Record<string, unknown>,
+  ) {
+    const bid = await db.bid.findFirst({
+      where: {
+        id: bidId,
+        organizationId: orgId,
+        opportunity: { organizationId: orgId },
+      },
+      select: { id: true },
+    })
+    if (!bid) return null
+    return db.bid.update({ where: { id: bidId }, data })
+  },
+
+  /**
+   * Update a bid within a transaction (used by submitBid, recordAdjudication,
+   * recordOutcome, withdrawBid).
+   * Verifies ownership within the transaction.
+   */
+  async updateInTransaction(
+    tx: PrismaTransaction,
+    orgId: string,
+    bidId: string,
+    data: Record<string, unknown>,
+  ) {
+    const bid = await tx.bid.findFirst({
+      where: { id: bidId, organizationId: orgId },
+      select: { id: true },
+    })
+    if (!bid) return null
+    return tx.bid.update({ where: { id: bidId }, data })
+  },
+
+  /**
+   * Get the full opportunity graph needed to run the pre-submission gate:
+   *   - opportunity (with title + status)
+   *   - scopePackage (items, questions, assumptions)
+   *   - latest estimate (with lines + commercialExceptions)
+   *   - subcontractPackages (with lines.estimateLine, quotes.scopeCoverages,
+   *     scopeAtoms)
+   *   - bid (if any)
+   *
+   * Tenant-safe: opportunity.organizationId === orgId.
+   * Returns null if the opportunity doesn't exist OR belongs to another org.
+   *
+   * Used by BidService.runSubmissionGate() and getBidWorkspace().
+   */
+  async getOpportunityBidWorkspace(orgId: string, opportunityId: string) {
+    return db.opportunity.findFirst({
+      where: { id: opportunityId, organizationId: orgId },
+      include: {
+        scopePackage: {
+          include: {
+            items: true,
+            questions: true,
+            assumptions: true,
+          },
+        },
+        estimates: {
+          include: {
+            lines: {
+              include: {
+                commercialExceptions: true,
+              },
+            },
+          },
+          orderBy: { updatedAt: 'desc' },
+          take: 1,
+        },
+        subcontractPackages: {
+          include: {
+            lines: { include: { estimateLine: true } },
+            quotes: { include: { scopeCoverages: true } },
+            scopeAtoms: true,
+          },
+        },
+        bid: true,
+      },
+    })
+  },
+}
+
+// ─── Estimate Revision Repository (Extended) ────────────────────────────────
+
+export const estimateRevisionRepositoryExtended = {
+  async getForOrganization(orgId: string, revisionId: string) {
+    return db.estimateRevision.findFirst({ where: { id: revisionId, estimate: { organizationId: orgId } }, include: { estimate: true } })
   },
 }

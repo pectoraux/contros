@@ -1,0 +1,1173 @@
+     1→/**
+     2→ * Tenant-aware repository abstractions.
+     3→ *
+     4→ * These repositories make unscoped retrieval difficult to express — every
+     5→ * method that reads or mutates organization-owned data requires the
+     6→ * authenticated organization context.
+     7→ *
+     8→ * INVARIANT 12: Every organization is isolated from every other organization.
+     9→ * A repository must never return an org-owned entity solely from an
+    10→ * attacker-supplied ID.
+    11→ *
+    12→ * P0-3: WorkDefinition / WorkDefinitionVersion / Resource ownership is
+    13→ * verified explicitly — not trusted via the EstimateLine relation.
+    14→ */
+    15→
+    16→import { db } from '@/lib/db'
+    17→import type { RequestContext } from '@/lib/context'
+    18→
+    19→// ─── Estimate Repository ────────────────────────────────────────────────────
+    20→
+    21→export const estimateRepository = {
+    22→  /** Get an estimate scoped to the authenticated organization. */
+    23→  async getForOrganization(orgId: string, estimateId: string) {
+    24→    return db.estimate.findFirst({
+    25→      where: { id: estimateId, organizationId: orgId },
+    26→    })
+    27→  },
+    28→
+    29→  /**
+    30→   * Get the full revision context for an estimate: the estimate, its lines,
+    31→   * work definitions, versions, execution segments, and existing revisions.
+    32→   *
+    33→   * P0-3: WorkDefinition/WDV/Resource ownership is enforced AT THE REPOSITORY
+    34→   * LEVEL — the query only loads WDs/WDVs/priceObservations that belong to the
+    35→   * requesting organization. If a line references a cross-tenant WD, the WD/WDV
+    36→   * will be null in the result. The service checks for this and rejects.
+    37→   */
+    38→  async getRevisionContext(orgId: string, estimateId: string) {
+    39→    return db.estimate.findFirst({
+    40→      where: { id: estimateId, organizationId: orgId },
+    41→      include: {
+    42→        lines: {
+    43→          include: {
+    44→            // Only load WD if it belongs to the same org (1:1 relation with where filter)
+    45→            workDefinition: {
+    46→              where: { organizationId: orgId },
+    47→            },
+    48→            // Only load WDV if its parent WD belongs to the same org
+    49→            workDefinitionVersion: {
+    50→              where: {
+    51→                workDefinition: { organizationId: orgId },
+    52→              },
+    53→              include: {
+    54→                // Only load price observations for resources in the same org
+    55→                priceObservations: {
+    56→                  where: {
+    57→                    resource: { organizationId: orgId },
+    58→                  },
+    59→                },
+    60→              },
+    61→            },
+    62→            executionSegments: true,
+    63→          },
+    64→        },
+    65→        revisions: { orderBy: { revisionNo: 'desc' }, take: 1 },
+    66→      },
+    67→    })
+    68→  },
+    69→
+    70→  /**
+    71→   * Get an estimate line with full pricing graph, tenant-scoped.
+    72→   * P0-3: WD/WDV/Resource ownership enforced at the repository level.
+    73→   */
+    74→  async getLineForOrganization(
+    75→    orgId: string,
+    76→    estimateId: string,
+    77→    lineId: string,
+    78→  ) {
+    79→    return db.estimateLine.findFirst({
+    80→      where: {
+    81→        id: lineId,
+    82→        estimateId,
+    83→        estimate: { organizationId: orgId },
+    84→      },
+    85→      include: {
+    86→        workDefinition: {
+    87→          where: { organizationId: orgId },
+    88→        },
+    89→        workDefinitionVersion: {
+    90→          where: {
+    91→            workDefinition: { organizationId: orgId },
+    92→          },
+    93→          include: {
+    94→            priceObservations: {
+    95→              where: {
+    96→                resource: { organizationId: orgId },
+    97→              },
+    98→            },
+    99→          },
+   100→        },
+   101→        estimate: true,
+   102→        scopeItem: true,
+   103→        executionSegments: true,
+   104→      },
+   105→    })
+   106→  },
+   107→
+   108→  /** Update an estimate line — tenant-scoped via the estimate relation. */
+   109→  async updateLine(
+   110→    orgId: string,
+   111→    lineId: string,
+   112→    data: Record<string, unknown>,
+   113→  ) {
+   114→    const line = await db.estimateLine.findFirst({
+   115→      where: { id: lineId, estimate: { organizationId: orgId } },
+   116→      select: { id: true },
+   117→    })
+   118→    if (!line) return null
+   119→    return db.estimateLine.update({ where: { id: lineId }, data })
+   120→  },
+   121→}
+   122→
+   123→// ─── Estimate Revision Repository ───────────────────────────────────────────
+   124→
+   125→export const estimateRevisionRepository = {
+   126→  /** Create a finalized revision within a transaction. */
+   127→  async createFinalized(
+   128→    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+   129→    data: {
+   130→      estimateId: string
+   131→      revisionNo: number
+   132→      snapshotJson: string
+   133→      finalizedById: string
+   134→    },
+   135→  ) {
+   136→    return tx.estimateRevision.create({
+   137→      data: {
+   138→        estimateId: data.estimateId,
+   139→        revisionNo: data.revisionNo,
+   140→        snapshotJson: data.snapshotJson,
+   141→        status: 'finalized',
+   142→        finalizedById: data.finalizedById,
+   143→      },
+   144→    })
+   145→  },
+   146→
+   147→  /** Get the latest revision number for an estimate. */
+   148→  async getLatestRevisionNo(orgId: string, estimateId: string): Promise<number> {
+   149→    const estimate = await db.estimate.findFirst({
+   150→      where: { id: estimateId, organizationId: orgId },
+   151→      select: {
+   152→        revisions: {
+   153→          orderBy: { revisionNo: 'desc' },
+   154→          take: 1,
+   155→          select: { revisionNo: true },
+   156→        },
+   157→      },
+   158→    })
+   159→    return estimate?.revisions[0]?.revisionNo ?? 0
+   160→  },
+   161→
+   162→  /**
+   163→   * Get a finalized revision scoped to the authenticated organization.
+   164→   * Verifies ownership chain: EstimateRevision → Estimate → Organization.
+   165→   * Returns null if the revision doesn't exist OR belongs to another org.
+   166→   *
+   167→   * Used by BidService.submitBid() to tenant-safely resolve the revision
+   168→   * referenced by a Bid.
+   169→   */
+   170→  async getForOrganization(orgId: string, revisionId: string) {
+   171→    return db.estimateRevision.findFirst({
+   172→      where: {
+   173→        id: revisionId,
+   174→        estimate: { organizationId: orgId },
+   175→      },
+   176→      include: {
+   177→        estimate: {
+   178→          select: {
+   179→            id: true,
+   180→            organizationId: true,
+   181→            status: true,
+   182→            lines: {
+   183→              select: {
+   184→                id: true,
+   185→                calculationStatus: true,
+   186→                sellPrice: true,
+   187→              },
+   188→            },
+   189→          },
+   190→        },
+   191→      },
+   192→    })
+   193→  },
+   194→}
+   195→
+   196→// ─── Subcontract Quote Repository ───────────────────────────────────────────
+   197→
+   198→export const subcontractQuoteRepository = {
+   199→  /**
+   200→   * Get a subcontract quote scoped to the authenticated organization.
+   201→   * Verifies: quote → package → opportunity → org.
+   202→   * Returns null if the quote doesn't exist OR belongs to another org.
+   203→   */
+   204→  async getForOrganization(orgId: string, quoteId: string) {
+   205→    return db.subcontractQuote.findFirst({
+   206→      where: {
+   207→        id: quoteId,
+   208→        subcontractPackage: {
+   209→          opportunity: { organizationId: orgId },
+   210→        },
+   211→      },
+   212→      select: { id: true, totalAmount: true, coveragePct: true },
+   213→    })
+   214→  },
+   215→
+   216→  /**
+   217→   * Get the selected quote for a package line, tenant-scoped.
+   218→   */
+   219→  async getSelectedQuoteForLine(orgId: string, estimateLineId: string) {
+   220→    const pkgLine = await db.subcontractPackageLine.findFirst({
+   221→      where: {
+   222→        estimateLineId,
+   223→        subcontractPackage: {
+   224→          opportunity: { organizationId: orgId },
+   225→        },
+   226→      },
+   227→      include: {
+   228→        subcontractPackage: {
+   229→          include: {
+   230→            quotes: { select: { id: true, totalAmount: true, coveragePct: true } },
+   231→          },
+   232→        },
+   233→      },
+   234→    })
+   235→    if (!pkgLine) return null
+   236→    const selectedQuoteId = pkgLine.subcontractPackage.selectedQuoteId
+   237→    if (!selectedQuoteId) return null
+   238→    return (
+   239→      pkgLine.subcontractPackage.quotes.find((q) => q.id === selectedQuoteId) ?? null
+   240→    )
+   241→  },
+   242→
+   243→  /**
+   244→   * Get the package line + selected quote for an estimate line, tenant-scoped.
+   245→   * Used by finalizeRevision.
+   246→   */
+   247→  async getPackageLineForOrganization(orgId: string, estimateLineId: string) {
+   248→    return db.subcontractPackageLine.findFirst({
+   249→      where: {
+   250→        estimateLineId,
+   251→        subcontractPackage: {
+   252→          opportunity: { organizationId: orgId },
+   253→        },
+   254→      },
+   255→      include: {
+   256→        subcontractPackage: {
+   257→          include: {
+   258→            quotes: { select: { id: true, totalAmount: true, coveragePct: true } },
+   259→          },
+   260→        },
+   261→      },
+   262→    })
+   263→  },
+   264→
+   265→  /**
+   266→   * Get a quote with its full scope coverage graph + parent package, tenant-scoped.
+   267→   * Verifies: quote → package → opportunity → org.
+   268→   * Returns null if the quote doesn't exist OR belongs to another org.
+   269→   *
+   270→   * Used by SubcontractService.reconcileQuote() and selectQuote().
+   271→   */
+   272→  async getWithCoveragesForOrganization(orgId: string, quoteId: string) {
+   273→    return db.subcontractQuote.findFirst({
+   274→      where: {
+   275→        id: quoteId,
+   276→        subcontractPackage: {
+   277→          opportunity: { organizationId: orgId },
+   278→        },
+   279→      },
+   280→      include: {
+   281→        scopeCoverages: true,
+   282→        subcontractPackage: {
+   283→          include: {
+   284→            scopeAtoms: true,
+   285→            // P0-2: estimateLine ownership verified in service after loading.
+   286→            lines: {
+   287→              include: {
+   288→                estimateLine: { include: { estimate: { select: { organizationId: true } } } },
+   289→              },
+   290→            },
+   291→          },
+   292→        },
+   293→      },
+   294→    })
+   295→  },
+   296→
+   297→  /**
+   298→   * Create a quote, verifying package ownership.
+   299→   * Verifies: package → opportunity → org.
+   300→   * Returns null if the package doesn't exist OR belongs to another org.
+   301→   */
+   302→  async createForPackage(
+   303→    orgId: string,
+   304→    packageId: string,
+   305→    data: {
+   306→      supplierName: string
+   307→      totalAmount: number
+   308→      currency: string
+   309→      exclusionsJson: string
+   310→      assumptionsJson: string
+   311→      coveragePct?: number
+   312→      quoteId?: string
+   313→    },
+   314→  ) {
+   315→    // Verify the package belongs to the org.
+   316→    const pkg = await db.subcontractPackage.findFirst({
+   317→      where: {
+   318→        id: packageId,
+   319→        organizationId: orgId,
+   320→        opportunity: { organizationId: orgId },
+   321→      },
+   322→      select: { id: true },
+   323→    })
+   324→    if (!pkg) return null
+   325→    return db.subcontractQuote.create({
+   326→      data: {
+   327→        id: data.quoteId,
+   328→        subcontractPackageId: packageId,
+   329→        supplierName: data.supplierName,
+   330→        totalAmount: data.totalAmount,
+   331→        currency: data.currency,
+   332→        exclusionsJson: data.exclusionsJson,
+   333→        assumptionsJson: data.assumptionsJson,
+   334→        coveragePct: data.coveragePct ?? 0,
+   335→      },
+   336→    })
+   337→  },
+   338→
+   339→  /**
+   340→   * Create a quote within a transaction, verifying package ownership.
+   341→   *
+   342→   * Used by SubcontractService.recordQuote() so that the quote creation and
+   343→   * the audit-log entry succeed or fail atomically (P0-1).
+   344→   *
+   345→   * Verifies: package → opportunity → org.
+   346→   * Returns null if the package doesn't exist OR belongs to another org.
+   347→   */
+   348→  async createForPackageInTransaction(
+   349→    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+   350→    orgId: string,
+   351→    packageId: string,
+   352→    data: {
+   353→      supplierName: string
+   354→      totalAmount: number
+   355→      currency: string
+   356→      exclusionsJson: string
+   357→      assumptionsJson: string
+   358→      coveragePct?: number
+   359→      quoteId?: string
+   360→    },
+   361→  ) {
+   362→    // Verify the package belongs to the org within the same transaction.
+   363→    const pkg = await tx.subcontractPackage.findFirst({
+   364→      where: {
+   365→        id: packageId,
+   366→        organizationId: orgId,
+   367→        opportunity: { organizationId: orgId },
+   368→      },
+   369→      select: { id: true },
+   370→    })
+   371→    if (!pkg) return null
+   372→    return tx.subcontractQuote.create({
+   373→      data: {
+   374→        id: data.quoteId,
+   375→        subcontractPackageId: packageId,
+   376→        supplierName: data.supplierName,
+   377→        totalAmount: data.totalAmount,
+   378→        currency: data.currency,
+   379→        exclusionsJson: data.exclusionsJson,
+   380→        assumptionsJson: data.assumptionsJson,
+   381→        coveragePct: data.coveragePct ?? 0,
+   382→      },
+   383→    })
+   384→  },
+   385→
+   386→  /**
+   387→   * Update quote status (selected/rejected), tenant-scoped.
+   388→   * Verifies: quote → package → opportunity → org.
+   389→   * Returns null if the quote doesn't exist OR belongs to another org.
+   390→   */
+   391→  async updateStatus(orgId: string, quoteId: string, status: string) {
+   392→    const quote = await db.subcontractQuote.findFirst({
+   393→      where: {
+   394→        id: quoteId,
+   395→        subcontractPackage: {
+   396→          opportunity: { organizationId: orgId },
+   397→        },
+   398→      },
+   399→      select: { id: true },
+   400→    })
+   401→    if (!quote) return null
+   402→    return db.subcontractQuote.update({
+   403→      where: { id: quoteId },
+   404→      data: { status },
+   405→    })
+   406→  },
+   407→
+   408→  /**
+   409→   * Update quote status within a transaction (used by selectQuote).
+   410→   * Assumes the caller has already verified ownership.
+   411→   */
+   412→  async updateStatusInTransaction(
+   413→    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+   414→    quoteId: string,
+   415→    status: string,
+   416→    coveragePct?: number,
+   417→  ) {
+   418→    return tx.subcontractQuote.update({
+   419→      where: { id: quoteId },
+   420→      data: {
+   421→        status,
+   422→        ...(coveragePct !== undefined ? { coveragePct } : {}),
+   423→      },
+   424→    })
+   425→  },
+   426→}
+   427→
+   428→// ─── Commercial Exception Repository ────────────────────────────────────────
+   429→
+   430→export const commercialExceptionRepository = {
+   431→  async findOpenForLine(orgId: string, lineId: string, type: string) {
+   432→    return db.commercialException.findFirst({
+   433→      where: {
+   434→        estimateLineId: lineId,
+   435→        type,
+   436→        organizationId: orgId,
+   437→      },
+   438→    })
+   439→  },
+   440→
+   441→  async createForLine(
+   442→    orgId: string,
+   443→    lineId: string,
+   444→    data: { type: string; reason: string; exposure: number; approvalRequired: boolean },
+   445→  ) {
+   446→    return db.commercialException.create({
+   447→      data: {
+   448→        organizationId: orgId,
+   449→        estimateLineId: lineId,
+   450→        entityType: 'estimate-line',
+   451→        entityId: lineId,
+   452→        ...data,
+   453→      },
+   454→    })
+   455→  },
+   456→
+   457→  /**
+   458→   * Find an APPROVED commercial exception for a subcontract quote.
+   459→   * Verifies: exception.organizationId === orgId AND entityId === quoteId.
+   460→   * Used by selectQuote() to allow override of blockers (lump-sum, exclusions,
+   461→   * low coverage) when a director has explicitly approved the exception.
+   462→   */
+   463→  async findApprovedForQuote(orgId: string, quoteId: string) {
+   464→    return db.commercialException.findFirst({
+   465→      where: {
+   466→        organizationId: orgId,
+   467→        entityType: 'subcontract-quote',
+   468→        entityId: quoteId,
+   469→        approvedById: { not: null },
+   470→        approvedAt: { not: null },
+   471→      },
+   472→    })
+   473→  },
+   474→
+   475→  /**
+   476→   * Create a commercial exception for a subcontract quote (entityType='subcontract-quote').
+   477→   * Used to record lump-sum / excluded-scope / low-coverage exceptions.
+   478→   */
+   479→  async createForQuote(
+   480→    orgId: string,
+   481→    quoteId: string,
+   482→    data: {
+   483→      type: string
+   484→      reason: string
+   485→      exposure: number
+   486→      approvalRequired: boolean
+   487→      approvedById?: string
+   488→      approvedAt?: Date
+   489→    },
+   490→  ) {
+   491→    return db.commercialException.create({
+   492→      data: {
+   493→        organizationId: orgId,
+   494→        entityType: 'subcontract-quote',
+   495→        entityId: quoteId,
+   496→        ...data,
+   497→      },
+   498→    })
+   499→  },
+   500→}
+   501→
+   502→// ─── Audit Log Repository ───────────────────────────────────────────────────
+   503→
+   504→export const auditLogRepository = {
+   505→  async create(
+   506→    orgId: string,
+   507→    actorId: string,
+   508→    entry: {
+   509→      action: string
+   510→      entityType: string
+   511→      entityId: string
+   512→      summary: string
+   513→      afterJson?: string
+   514→    },
+   515→  ) {
+   516→    return db.auditLog.create({
+   517→      data: {
+   518→        organizationId: orgId,
+   519→        actorId,
+   520→        ...entry,
+   521→      },
+   522→    })
+   523→  },
+   524→
+   525→  /** Create within a transaction. */
+   526→  async createInTransaction(
+   527→    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+   528→    orgId: string,
+   529→    actorId: string,
+   530→    entry: {
+   531→      action: string
+   532→      entityType: string
+   533→      entityId: string
+   534→      summary: string
+   535→      afterJson?: string
+   536→    },
+   537→  ) {
+   538→    return tx.auditLog.create({
+   539→      data: {
+   540→        organizationId: orgId,
+   541→        actorId,
+   542→        ...entry,
+   543→      },
+   544→    })
+   545→  },
+   546→}
+   547→
+   548→// ─── Subcontract Package Repository ─────────────────────────────────────────
+   549→//
+   550→// Verifies: SubcontractPackage → Opportunity → Organization.
+   551→// Every method requires orgId — no unscoped access.
+   552→
+   553→export const subcontractPackageRepository = {
+   554→  /** Get all packages for an opportunity, tenant-scoped. */
+   555→  async getForOpportunity(orgId: string, opportunityId: string) {
+   556→    return db.subcontractPackage.findMany({
+   557→      where: {
+   558→        organizationId: orgId,
+   559→        opportunityId,
+   560→        opportunity: { organizationId: orgId },
+   561→      },
+   562→      include: {
+   563→        // P0-2: estimateLine ownership is verified in the service after loading.
+   564→        // Prisma does not support `where` on 1:1 relation includes.
+   565→        lines: {
+   566→          include: {
+   567→            estimateLine: { include: { estimate: { select: { organizationId: true } } } },
+   568→          },
+   569→        },
+   570→        quotes: { include: { scopeCoverages: true } },
+   571→        scopeAtoms: true,
+   572→      },
+   573→      orderBy: { createdAt: 'asc' },
+   574→    })
+   575→  },
+   576→
+   577→  /**
+   578→   * Get a single package with full graph (lines, quotes, scopeAtoms, coverages),
+   579→   * tenant-scoped. Returns null if the package doesn't exist OR belongs to
+   580→   * another org.
+   581→   */
+   582→  async getForOrganization(orgId: string, packageId: string) {
+   583→    return db.subcontractPackage.findFirst({
+   584→      where: {
+   585→        id: packageId,
+   586→        organizationId: orgId,
+   587→        opportunity: { organizationId: orgId },
+   588→      },
+   589→      include: {
+   590→        // P0-2: estimateLine ownership is verified in the service after loading.
+   591→        lines: {
+   592→          include: {
+   593→            estimateLine: { include: { estimate: { select: { organizationId: true } } } },
+   594→          },
+   595→        },
+   596→        quotes: { include: { scopeCoverages: true } },
+   597→        scopeAtoms: true,
+   598→      },
+   599→    })
+   600→  },
+   601→
+   602→  /**
+   603→   * Create a package, verifying opportunity ownership.
+   604→   * Returns null if the opportunity doesn't exist OR belongs to another org.
+   605→   */
+   606→  async createForOrganization(
+   607→    orgId: string,
+   608→    data: {
+   609→      opportunityId: string
+   610→      name: string
+   611→      scope?: string
+   612→      executionStrategy: string
+   613→      packageId?: string
+   614→    },
+   615→  ) {
+   616→    // Verify opportunity ownership first.
+   617→    const opportunity = await db.opportunity.findFirst({
+   618→      where: { id: data.opportunityId, organizationId: orgId },
+   619→      select: { id: true },
+   620→    })
+   621→    if (!opportunity) return null
+   622→    return db.subcontractPackage.create({
+   623→      data: {
+   624→        id: data.packageId,
+   625→        organizationId: orgId,
+   626→        opportunityId: data.opportunityId,
+   627→        name: data.name,
+   628→        scope: data.scope,
+   629→        executionStrategy: data.executionStrategy,
+   630→      },
+   631→    })
+   632→  },
+   633→
+   634→  /**
+   635→   * Create a package within a transaction, verifying opportunity ownership.
+   636→   *
+   637→   * Used by SubcontractService.createPackage() so that the package creation
+   638→   * and the audit-log entry succeed or fail atomically (P0-1).
+   639→   *
+   640→   * Returns null if the opportunity doesn't exist OR belongs to another org.
+   641→   */
+   642→  async createForOrganizationInTransaction(
+   643→    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+   644→    orgId: string,
+   645→    data: {
+   646→      opportunityId: string
+   647→      name: string
+   648→      scope?: string | null
+   649→      executionStrategy: string
+   650→      packageId?: string
+   651→    },
+   652→  ) {
+   653→    // Verify opportunity ownership within the same transaction.
+   654→    const opportunity = await tx.opportunity.findFirst({
+   655→      where: { id: data.opportunityId, organizationId: orgId },
+   656→      select: { id: true },
+   657→    })
+   658→    if (!opportunity) return null
+   659→    return tx.subcontractPackage.create({
+   660→      data: {
+   661→        id: data.packageId,
+   662→        organizationId: orgId,
+   663→        opportunityId: data.opportunityId,
+   664→        name: data.name,
+   665→        scope: data.scope ?? null,
+   666→        executionStrategy: data.executionStrategy,
+   667→      },
+   668→    })
+   669→  },
+   670→
+   671→  /**
+   672→   * Update package status (for state machine), tenant-scoped.
+   673→   * Returns null if the package doesn't exist OR belongs to another org.
+   674→   */
+   675→  async updateStatus(orgId: string, packageId: string, status: string) {
+   676→    const pkg = await db.subcontractPackage.findFirst({
+   677→      where: {
+   678→        id: packageId,
+   679→        organizationId: orgId,
+   680→        opportunity: { organizationId: orgId },
+   681→      },
+   682→      select: { id: true, status: true, selectedQuoteId: true },
+   683→    })
+   684→    if (!pkg) return null
+   685→    return db.subcontractPackage.update({
+   686→      where: { id: packageId },
+   687→      data: { status },
+   688→    })
+   689→  },
+   690→
+   691→  /**
+   692→   * Update package selectedQuoteId + status within a transaction (used by selectQuote).
+   693→   * Assumes the caller has already verified ownership.
+   694→   */
+   695→  async updateSelectionInTransaction(
+   696→    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+   697→    packageId: string,
+   698→    selectedQuoteId: string | null,
+   699→    status: string,
+   700→  ) {
+   701→    return tx.subcontractPackage.update({
+   702→      where: { id: packageId },
+   703→      data: { selectedQuoteId, status },
+   704→    })
+   705→  },
+   706→}
+   707→
+   708→// ─── Scope Atom Repository ───────────────────────────────────────────────────
+   709→//
+   710→// Verifies: ScopeAtom → SubcontractPackage → Opportunity → Organization.
+   711→
+   712→export const scopeAtomRepository = {
+   713→  /** Get all scope atoms for a package, tenant-scoped. */
+   714→  async getForPackage(orgId: string, packageId: string) {
+   715→    return db.scopeAtom.findMany({
+   716→      where: {
+   717→        subcontractPackageId: packageId,
+   718→        subcontractPackage: {
+   719→          organizationId: orgId,
+   720→          opportunity: { organizationId: orgId },
+   721→        },
+   722→      },
+   723→      orderBy: { createdAt: 'asc' },
+   724→    })
+   725→  },
+   726→
+   727→  /**
+   728→   * Create a scope atom, verifying package ownership.
+   729→   * Returns null if the package doesn't exist OR belongs to another org.
+   730→   */
+   731→  async createForPackage(
+   732→    orgId: string,
+   733→    packageId: string,
+   734→    data: {
+   735→      name: string
+   736→      description?: string
+   737→      valueWeight: number
+   738→      scopeAtomId?: string
+   739→    },
+   740→  ) {
+   741→    const pkg = await db.subcontractPackage.findFirst({
+   742→      where: {
+   743→        id: packageId,
+   744→        organizationId: orgId,
+   745→        opportunity: { organizationId: orgId },
+   746→      },
+   747→      select: { id: true },
+   748→    })
+   749→    if (!pkg) return null
+   750→    return db.scopeAtom.create({
+   751→      data: {
+   752→        id: data.scopeAtomId,
+   753→        subcontractPackageId: packageId,
+   754→        name: data.name,
+   755→        description: data.description,
+   756→        valueWeight: data.valueWeight,
+   757→      },
+   758→    })
+   759→  },
+   760→
+   761→  /**
+   762→   * Create a scope atom inside a transaction, verifying package ownership.
+   763→   * P0: Used by createScopeAtom() for atomic scope-atom + audit creation.
+   764→   * Returns null if the package doesn't exist OR belongs to another org.
+   765→   */
+   766→  async createForPackageInTransaction(
+   767→    tx: PrismaTransaction,
+   768→    orgId: string,
+   769→    packageId: string,
+   770→    data: {
+   771→      name: string
+   772→      description?: string | null
+   773→      valueWeight: number
+   774→      scopeAtomId?: string
+   775→    },
+   776→  ) {
+   777→    const pkg = await tx.subcontractPackage.findFirst({
+   778→      where: {
+   779→        id: packageId,
+   780→        organizationId: orgId,
+   781→        opportunity: { organizationId: orgId },
+   782→      },
+   783→      select: { id: true },
+   784→    })
+   785→    if (!pkg) return null
+   786→    return tx.scopeAtom.create({
+   787→      data: {
+   788→        id: data.scopeAtomId,
+   789→        subcontractPackageId: packageId,
+   790→        name: data.name,
+   791→        description: data.description,
+   792→        valueWeight: data.valueWeight,
+   793→      },
+   794→    })
+   795→  },
+   796→}
+   797→
+   798→// ─── Quote Scope Coverage Repository ─────────────────────────────────────────
+   799→//
+   800→// Verifies: QuoteScopeCoverage → SubcontractQuote → SubcontractPackage →
+   801→// Opportunity → Organization.
+   802→// Also verifies the scopeAtom belongs to the same package as the quote.
+   803→
+   804→export const quoteScopeCoverageRepository = {
+   805→  /** Get all coverages for a quote, tenant-scoped. */
+   806→  async getForQuote(orgId: string, quoteId: string) {
+   807→    return db.quoteScopeCoverage.findMany({
+   808→      where: {
+   809→        quoteId,
+   810→        quote: {
+   811→          subcontractPackage: {
+   812→            opportunity: { organizationId: orgId },
+   813→          },
+   814→        },
+   815→      },
+   816→      orderBy: { createdAt: 'asc' },
+   817→    })
+   818→  },
+   819→
+   820→  /**
+   821→   * Upsert a coverage (create or update), verifying quote + scopeAtom belong
+   822→   * to the same package+org.
+   823→   *
+   824→   * Returns null if either:
+   825→   *   - the quote doesn't exist OR belongs to another org
+   826→   *   - the scopeAtom doesn't exist OR belongs to another org
+   827→   *   - the scopeAtom belongs to a different package than the quote
+   828→   */
+   829→  async upsertForQuote(
+   830→    orgId: string,
+   831→    quoteId: string,
+   832→    scopeAtomId: string,
+   833→    status: string,
+   834→    note?: string,
+   835→  ) {
+   836→    // Verify quote ownership AND get its packageId.
+   837→    const quote = await db.subcontractQuote.findFirst({
+   838→      where: {
+   839→        id: quoteId,
+   840→        subcontractPackage: {
+   841→          opportunity: { organizationId: orgId },
+   842→        },
+   843→      },
+   844→      select: { id: true, subcontractPackageId: true },
+   845→    })
+   846→    if (!quote) return null
+   847→
+   848→    // Verify the scopeAtom belongs to the same package+org.
+   849→    const atom = await db.scopeAtom.findFirst({
+   850→      where: {
+   851→        id: scopeAtomId,
+   852→        subcontractPackageId: quote.subcontractPackageId,
+   853→        subcontractPackage: {
+   854→          organizationId: orgId,
+   855→          opportunity: { organizationId: orgId },
+   856→        },
+   857→      },
+   858→      select: { id: true },
+   859→    })
+   860→    if (!atom) return null
+   861→
+   862→    // Find existing coverage (quoteId + scopeAtomId is effectively unique).
+   863→    const existing = await db.quoteScopeCoverage.findFirst({
+   864→      where: { quoteId, scopeAtomId },
+   865→      select: { id: true },
+   866→    })
+   867→    if (existing) {
+   868→      return db.quoteScopeCoverage.update({
+   869→        where: { id: existing.id },
+   870→        data: { status, note: note ?? null },
+   871→      })
+   872→    }
+   873→    return db.quoteScopeCoverage.create({
+   874→      data: { quoteId, scopeAtomId, status, note: note ?? null },
+   875→    })
+   876→  },
+   877→}
+   878→
+   879→// ─── Subcontract Package Line Repository ─────────────────────────────────────
+   880→//
+   881→// Verifies BOTH:
+   882→//   - SubcontractPackage → Opportunity → Organization
+   883→//   - EstimateLine → Estimate → Organization
+   884→// (the two must belong to the same org before a line can be linked to a package)
+   885→
+   886→export const subcontractPackageLineRepository = {
+   887→  /** Get lines for a package, tenant-scoped. */
+   888→  async getForPackage(orgId: string, packageId: string) {
+   889→    return db.subcontractPackageLine.findMany({
+   890→      where: {
+   891→        subcontractPackageId: packageId,
+   892→        subcontractPackage: {
+   893→          organizationId: orgId,
+   894→          opportunity: { organizationId: orgId },
+   895→        },
+   896→      },
+   897→      include: {
+   898→        // P0-2: estimateLine ownership verified in service after loading.
+   899→        estimateLine: { include: { estimate: { select: { organizationId: true } } } },
+   900→      },
+   901→      orderBy: { createdAt: 'asc' },
+   902→    })
+   903→  },
+   904→
+   905→  /**
+   906→   * Create a package line, verifying both estimateLine and package belong to
+   907→   * the same org. Returns null if either is cross-tenant.
+   908→   */
+   909→  async createForPackage(
+   910→    orgId: string,
+   911→    packageId: string,
+   912→    estimateLineId: string,
+   913→    requiredScope: string,
+   914→  ) {
+   915→    // Verify package ownership.
+   916→    const pkg = await db.subcontractPackage.findFirst({
+   917→      where: {
+   918→        id: packageId,
+   919→        organizationId: orgId,
+   920→        opportunity: { organizationId: orgId },
+   921→      },
+   922→      select: { id: true },
+   923→    })
+   924→    if (!pkg) return null
+   925→
+   926→    // Verify estimateLine ownership (estimateLine → estimate → org).
+   927→    const line = await db.estimateLine.findFirst({
+   928→      where: {
+   929→        id: estimateLineId,
+   930→        estimate: { organizationId: orgId },
+   931→      },
+   932→      select: { id: true },
+   933→    })
+   934→    if (!line) return null
+   935→
+   936→    return db.subcontractPackageLine.create({
+   937→      data: {
+   938→        subcontractPackageId: packageId,
+   939→        estimateLineId,
+   940→        requiredScope,
+   941→      },
+   942→    })
+   943→  },
+   944→}
+   945→
+   946→// ─── Bid Repository ─────────────────────────────────────────────────────────
+   947→//
+   948→// Verifies: Bid → Opportunity → Organization.
+   949→// Every method requires orgId — no unscoped access.
+   950→// INVARIANT 12: Every organization is isolated.
+   951→
+   952→type PrismaTransaction = Parameters<Parameters<typeof db.$transaction>[0]>[0]
+   953→
+   954→export const bidRepository = {
+   955→  /**
+   956→   * Get a bid scoped to the authenticated organization.
+   957→   * Verifies: bid → opportunity → org.
+   958→   * Returns null if the bid doesn't exist OR belongs to another org.
+   959→   */
+   960→  async getForOrganization(orgId: string, bidId: string) {
+   961→    return db.bid.findFirst({
+   962→      where: {
+   963→        id: bidId,
+   964→        organizationId: orgId,
+   965→        opportunity: { organizationId: orgId },
+   966→      },
+   967→      include: {
+   968→        opportunity: {
+   969→          select: {
+   970→            id: true,
+   971→            title: true,
+   972→            status: true,
+   973→            organizationId: true,
+   974→          },
+   975→        },
+   976→        estimate: {
+   977→          select: {
+   978→            id: true,
+   979→            status: true,
+   980→            organizationId: true,
+   981→          },
+   982→        },
+   983→      },
+   984→    })
+   985→  },
+   986→
+   987→  /**
+   988→   * Get the bid for an opportunity (1:1 relation).
+   989→   * Verifies: bid → opportunity → org.
+   990→   * Returns null if the bid doesn't exist OR belongs to another org.
+   991→   */
+   992→  async getForOpportunity(orgId: string, opportunityId: string) {
+   993→    return db.bid.findFirst({
+   994→      where: {
+   995→        opportunityId,
+   996→        organizationId: orgId,
+   997→        opportunity: { organizationId: orgId },
+   998→      },
+   999→    })
+  1000→  },
+  1001→
+  1002→  /**
+  1003→   * Create a bid, verifying opportunity + estimate ownership.
+  1004→   * Returns null if either the opportunity OR estimate doesn't exist
+  1005→   * OR belongs to another org, OR if the estimate doesn't belong to the
+  1006→   * given opportunity.
+  1007→   */
+  1008→  async createForOrganization(
+  1009→    orgId: string,
+  1010→    data: {
+  1011→      opportunityId: string
+  1012→      estimateId: string
+  1013→      bidId?: string
+  1014→    },
+  1015→  ) {
+  1016→    // Verify opportunity ownership.
+  1017→    const opportunity = await db.opportunity.findFirst({
+  1018→      where: { id: data.opportunityId, organizationId: orgId },
+  1019→      select: { id: true },
+  1020→    })
+  1021→    if (!opportunity) return null
+  1022→
+  1023→    // Verify estimate ownership AND that it belongs to this opportunity.
+  1024→    const estimate = await db.estimate.findFirst({
+  1025→      where: {
+  1026→        id: data.estimateId,
+  1027→        organizationId: orgId,
+  1028→        opportunityId: data.opportunityId,
+  1029→      },
+  1030→      select: { id: true },
+  1031→    })
+  1032→    if (!estimate) return null
+  1033→
+  1034→    return db.bid.create({
+  1035→      data: {
+  1036→        id: data.bidId,
+  1037→        organizationId: orgId,
+  1038→        opportunityId: data.opportunityId,
+  1039→        estimateId: data.estimateId,
+  1040→      },
+  1041→    })
+  1042→  },
+  1043→
+  1044→  /**
+  1045→   * Create a bid within a transaction, verifying opportunity + estimate ownership.
+  1046→   *
+  1047→   * Used by BidService.createBid() so that the bid creation and the audit-log
+  1048→   * entry succeed or fail atomically (P0-1).
+  1049→   *
+  1050→   * Returns null if either the opportunity OR estimate doesn't exist OR belongs
+  1051→   * to another org, OR if the estimate doesn't belong to the given opportunity.
+  1052→   */
+  1053→  async createInTransaction(
+  1054→    tx: PrismaTransaction,
+  1055→    orgId: string,
+  1056→    data: {
+  1057→      opportunityId: string
+  1058→      estimateId: string
+  1059→      bidId?: string
+  1060→    },
+  1061→  ) {
+  1062→    // Verify opportunity ownership within the same transaction.
+  1063→    const opportunity = await tx.opportunity.findFirst({
+  1064→      where: { id: data.opportunityId, organizationId: orgId },
+  1065→      select: { id: true },
+  1066→    })
+  1067→    if (!opportunity) return null
+  1068→
+  1069→    // Verify estimate ownership AND that it belongs to this opportunity.
+  1070→    const estimate = await tx.estimate.findFirst({
+  1071→      where: {
+  1072→        id: data.estimateId,
+  1073→        organizationId: orgId,
+  1074→        opportunityId: data.opportunityId,
+  1075→      },
+  1076→      select: { id: true },
+  1077→    })
+  1078→    if (!estimate) return null
+  1079→
+  1080→    return tx.bid.create({
+  1081→      data: {
+  1082→        id: data.bidId,
+  1083→        organizationId: orgId,
+  1084→        opportunityId: data.opportunityId,
+  1085→        estimateId: data.estimateId,
+  1086→      },
+  1087→    })
+  1088→  },
+  1089→
+  1090→  /**
+  1091→   * Update a bid, verifying ownership before update.
+  1092→   * Verifies: bid → opportunity → org.
+  1093→   * Returns null if the bid doesn't exist OR belongs to another org.
+  1094→   */
+  1095→  async updateForOrganization(
+  1096→    orgId: string,
+  1097→    bidId: string,
+  1098→    data: Record<string, unknown>,
+  1099→  ) {
+  1100→    const bid = await db.bid.findFirst({
+  1101→      where: {
+  1102→        id: bidId,
+  1103→        organizationId: orgId,
+  1104→        opportunity: { organizationId: orgId },
+  1105→      },
+  1106→      select: { id: true },
+  1107→    })
+  1108→    if (!bid) return null
+  1109→    return db.bid.update({ where: { id: bidId }, data })
+  1110→  },
+  1111→
+  1112→  /**
+  1113→   * Update a bid within a transaction (used by submitBid, recordAdjudication,
+  1114→   * recordOutcome, withdrawBid).
+  1115→   * Assumes the caller has already verified ownership.
+  1116→   */
+  1117→  async updateInTransaction(
+  1118→    tx: PrismaTransaction,
+  1119→    bidId: string,
+  1120→    data: Record<string, unknown>,
+  1121→  ) {
+  1122→    return tx.bid.update({ where: { id: bidId }, data })
+  1123→  },
+  1124→
+  1125→  /**
+  1126→   * Get the full opportunity graph needed to run the pre-submission gate:
+  1127→   *   - opportunity (with title + status)
+  1128→   *   - scopePackage (items, questions, assumptions)
+  1129→   *   - latest estimate (with lines + commercialExceptions)
+  1130→   *   - subcontractPackages (with lines.estimateLine, quotes.scopeCoverages,
+  1131→   *     scopeAtoms)
+  1132→   *   - bid (if any)
+  1133→   *
+  1134→   * Tenant-safe: opportunity.organizationId === orgId.
+  1135→   * Returns null if the opportunity doesn't exist OR belongs to another org.
+  1136→   *
+  1137→   * Used by BidService.runSubmissionGate() and getBidWorkspace().
+  1138→   */
+  1139→  async getOpportunityBidWorkspace(orgId: string, opportunityId: string) {
+  1140→    return db.opportunity.findFirst({
+  1141→      where: { id: opportunityId, organizationId: orgId },
+  1142→      include: {
+  1143→        scopePackage: {
+  1144→          include: {
+  1145→            items: true,
+  1146→            questions: true,
+  1147→            assumptions: true,
+  1148→          },
+  1149→        },
+  1150→        estimates: {
+  1151→          include: {
+  1152→            lines: {
+  1153→              include: {
+  1154→                commercialExceptions: true,
+  1155→              },
+  1156→            },
+  1157→          },
+  1158→          orderBy: { updatedAt: 'desc' },
+  1159→          take: 1,
+  1160→        },
+  1161→        subcontractPackages: {
+  1162→          include: {
+  1163→            lines: { include: { estimateLine: true } },
+  1164→            quotes: { include: { scopeCoverages: true } },
+  1165→            scopeAtoms: true,
+  1166→          },
+  1167→        },
+  1168→        bid: true,
+  1169→      },
+  1170→    })
+  1171→  },
+  1172→}
+  1173→

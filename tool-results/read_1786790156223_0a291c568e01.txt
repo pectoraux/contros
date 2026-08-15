@@ -1,0 +1,1310 @@
+     1→/**
+     2→ * SubcontractService — application service for subcontract package operations.
+     3→ *
+     4→ * Owns: tenant validation, ownership resolution, reconciliation-engine
+     5→ * invocation, persistence, commercial exception creation/lookup, audit logging,
+     6→ * and transaction boundaries.
+     7→ *
+     8→ * Does NOT own: reconciliation math (that stays in the pure
+     9→ * `reconcileSubcontract` engine).
+    10→ *
+    11→ * Architecture mirrors the frozen EstimateService pattern exactly:
+    12→ *   - Receives `ctx: RequestContext` for tenant scoping.
+    13→ *   - All data access via tenant-aware repositories (no raw Prisma in the
+    14→ *     service except for the atomic $transaction that touches multiple tables).
+    15→ *   - Commercially significant actions are wrapped in `db.$transaction` so
+    16→ *     package update + quote update + audit log succeed or fail together.
+    17→ *
+    18→ * API routes become thin adapters that call this service.
+    19→ *
+    20→ * INVARIANT 7: Subcontract scope must be reconciled against required scope.
+    21→ * INVARIANT 12: Every organization is isolated.
+    22→ */
+    23→
+    24→import { db } from '@/lib/db'
+    25→import type { RequestContext } from '@/lib/context'
+    26→import {
+    27→  reconcileSubcontract,
+    28→  type ReconcileSubcontractInput,
+    29→  type ReconciliationResult,
+    30→  type ScopeAtomInput,
+    31→  type QuoteScopeCoverageInput,
+    32→} from '@/lib/engines'
+    33→import { round2 } from '@/lib/engines/money'
+    34→import {
+    35→  subcontractPackageRepository,
+    36→  subcontractQuoteRepository,
+    37→  scopeAtomRepository,
+    38→  quoteScopeCoverageRepository,
+    39→  commercialExceptionRepository,
+    40→  auditLogRepository,
+    41→} from '@/repositories'
+    42→
+    43→// ─── Types ──────────────────────────────────────────────────────────────────
+    44→
+    45→export type PackageStatus =
+    46→  | 'draft'
+    47→  | 'enquiry-sent'
+    48→  | 'quotes-received'
+    49→  | 'awarded'
+    50→  | 'abandoned'
+    51→
+    52→export type QuoteStatus = 'received' | 'selected' | 'rejected'
+    53→
+    54→export type CoverageStatus = 'covered' | 'excluded' | 'unstated'
+    55→
+    56→export interface GetPackageWorkspaceInput {
+    57→  ctx: RequestContext
+    58→  opportunityId: string
+    59→}
+    60→
+    61→export interface WorkspaceQuote {
+    62→  id: string
+    63→  supplierName: string
+    64→  totalAmount: number
+    65→  currency: string
+    66→  status: string
+    67→  receivedAt: Date
+    68→  exclusions: string[]
+    69→  assumptions: string[]
+    70→  coveragePct: number
+    71→  coverageBasis: 'atoms' | 'lump-sum' | 'none'
+    72→  isLumpSum: boolean
+    73→  semanticCoveragePct: number
+    74→  economicCoveragePct: number
+    75→  economicCoverageUnknown: boolean
+    76→  atomReconciliations: ReconciliationResult['atomReconciliations']
+    77→  excludedAtoms: string[]
+    78→  unstatedAtoms: string[]
+    79→  coveredAtoms: string[]
+    80→  coveredScopeValue: number
+    81→  uncoveredValue: number
+    82→  gaps: string[]
+    83→  warnings: string[]
+    84→  reconciliationStatus: ReconciliationResult['status']
+    85→}
+    86→
+    87→export interface WorkspacePackage {
+    88→  id: string
+    89→  name: string
+    90→  scope: string | null
+    91→  executionStrategy: string
+    92→  status: string
+    93→  selectedQuoteId: string | null
+    94→  scopeAtoms: Array<{
+    95→    id: string
+    96→    name: string
+    97→    description: string | null
+    98→    valueWeight: number
+    99→  }>
+   100→  requiredLines: Array<{
+   101→    id: string
+   102→    description: string
+   103→    sellPrice: number
+   104→  }>
+   105→  requiredScopeValue: number
+   106→  quotes: WorkspaceQuote[]
+   107→  selectedQuote: WorkspaceQuote | null
+   108→  hasUnselectedQuote: boolean
+   109→  hasNoQuotes: boolean
+   110→  // P0-2: Graph inconsistency — a package line references a cross-tenant EstimateLine.
+   111→  graphInconsistent: boolean
+   112→  // P0-2: When graphInconsistent, reconciliation is blocked — the engine is NOT called.
+   113→  reconciliationBlocked: boolean
+   114→  // P0-2: Human-readable blockers explaining why reconciliation was skipped.
+   115→  blockers: string[]
+   116→}
+   117→
+   118→export interface GetPackageWorkspaceResult {
+   119→  ok: true
+   120→  packages: WorkspacePackage[]
+   121→}
+   122→
+   123→export interface CreatePackageInput {
+   124→  ctx: RequestContext
+   125→  opportunityId: string
+   126→  name: string
+   127→  scope?: string
+   128→  executionStrategy: 'self-perform' | 'subcontract' | 'hybrid' | 'undecided'
+   129→}
+   130→
+   131→export interface CreatePackageResult {
+   132→  ok: true
+   133→  package: {
+   134→    id: string
+   135→    opportunityId: string
+   136→    name: string
+   137→    scope: string | null
+   138→    executionStrategy: string
+   139→    status: string
+   140→  }
+   141→}
+   142→
+   143→export interface CreateScopeAtomInput {
+   144→  ctx: RequestContext
+   145→  packageId: string
+   146→  name: string
+   147→  description?: string
+   148→  valueWeight: number
+   149→}
+   150→
+   151→export interface CreateScopeAtomResult {
+   152→  ok: true
+   153→  scopeAtom: {
+   154→    id: string
+   155→    packageId: string
+   156→    name: string
+   157→    description: string | null
+   158→    valueWeight: number
+   159→  }
+   160→}
+   161→
+   162→export interface RecordQuoteInput {
+   163→  ctx: RequestContext
+   164→  packageId: string
+   165→  supplierName: string
+   166→  totalAmount: number
+   167→  currency: string
+   168→  exclusions?: string[]
+   169→  assumptions?: string[]
+   170→}
+   171→
+   172→export interface RecordQuoteResult {
+   173→  ok: true
+   174→  quote: {
+   175→    id: string
+   176→    packageId: string
+   177→    supplierName: string
+   178→    totalAmount: number
+   179→    currency: string
+   180→    exclusions: string[]
+   181→    assumptions: string[]
+   182→    status: string
+   183→  }
+   184→}
+   185→
+   186→export interface RecordQuoteScopeCoverageInput {
+   187→  ctx: RequestContext
+   188→  quoteId: string
+   189→  scopeAtomId: string
+   190→  status: CoverageStatus
+   191→  note?: string
+   192→}
+   193→
+   194→export interface RecordQuoteScopeCoverageResult {
+   195→  ok: true
+   196→  coverage: {
+   197→    id: string
+   198→    quoteId: string
+   199→    scopeAtomId: string
+   200→    status: string
+   201→    note: string | null
+   202→  }
+   203→}
+   204→
+   205→export interface ReconcileQuoteInput {
+   206→  ctx: RequestContext
+   207→  packageId: string
+   208→  quoteId: string
+   209→}
+   210→
+   211→export interface ReconcileQuoteResult {
+   212→  ok: true
+   213→  reconciliation: ReconciliationResult
+   214→}
+   215→
+   216→export interface SelectQuoteInput {
+   217→  ctx: RequestContext
+   218→  packageId: string
+   219→  quoteId: string
+   220→}
+   221→
+   222→export interface SelectQuoteResult {
+   223→  ok: true
+   224→  packageId: string
+   225→  selectedQuoteId: string
+   226→  packageStatus: string
+   227→  reconciliation: ReconciliationResult
+   228→}
+   229→
+   230→export interface RejectQuoteInput {
+   231→  ctx: RequestContext
+   232→  quoteId: string
+   233→}
+   234→
+   235→export interface RejectQuoteResult {
+   236→  ok: true
+   237→  quoteId: string
+   238→  status: string
+   239→}
+   240→
+   241→export interface TransitionPackageStatusInput {
+   242→  ctx: RequestContext
+   243→  packageId: string
+   244→  status: PackageStatus
+   245→}
+   246→
+   247→export interface TransitionPackageStatusResult {
+   248→  ok: true
+   249→  packageId: string
+   250→  status: string
+   251→}
+   252→
+   253→type Err = { ok: false; error: string; status: number }
+   254→
+   255→// ─── State machine helpers ───────────────────────────────────────────────────
+   256→
+   257→/**
+   258→ * Allowed forward transitions for a SubcontractPackage.
+   259→ *
+   260→ *   draft → enquiry-sent → quotes-received → awarded
+   261→ *   any state → abandoned
+   262→ *   abandoned → draft (restart cycle)
+   263→ *
+   264→ * Selecting a quote (selectQuote) can move the package to `awarded` from any
+   265→ * pre-award state (draft / enquiry-sent / quotes-received) — a single-source
+   266→ * supplier or an early award is a valid business action.
+   267→ *
+   268→ * Cannot go from `awarded` back to any pre-award state without first
+   269→ * abandoning. Re-awarding (awarded → awarded) is rejected — the caller must
+   270→ * abandon first to start a new selection cycle.
+   271→ */
+   272→const STATE_TRANSITIONS: Record<string, PackageStatus[]> = {
+   273→  draft: ['enquiry-sent', 'quotes-received', 'awarded', 'abandoned'],
+   274→  'enquiry-sent': ['draft', 'quotes-received', 'awarded', 'abandoned'],
+   275→  'quotes-received': ['draft', 'enquiry-sent', 'awarded', 'abandoned'],
+   276→  awarded: ['abandoned'],
+   277→  abandoned: ['draft'],
+   278→}
+   279→
+   280→function isAllowedTransition(from: string, to: string): boolean {
+   281→  const allowed = STATE_TRANSITIONS[from]
+   282→  if (!allowed) return false
+   283→  return (allowed as string[]).includes(to)
+   284→}
+   285→
+   286→// ─── Input validation helpers ────────────────────────────────────────────────
+   287→
+   288→function isValidValueWeight(w: unknown): w is number {
+   289→  return (
+   290→    typeof w === 'number' &&
+   291→    Number.isFinite(w) &&
+   292→    !Number.isNaN(w) &&
+   293→    w >= 0 &&
+   294→    w <= 1
+   295→  )
+   296→}
+   297→
+   298→function isValidAmount(a: unknown): a is number {
+   299→  return (
+   300→    typeof a === 'number' &&
+   301→    Number.isFinite(a) &&
+   302→    !Number.isNaN(a) &&
+   303→    a >= 0
+   304→  )
+   305→}
+   306→
+   307→function isCoverageStatus(s: unknown): s is CoverageStatus {
+   308→  return s === 'covered' || s === 'excluded' || s === 'unstated'
+   309→}
+   310→
+   311→function isPackageStatus(s: unknown): s is PackageStatus {
+   312→  return (
+   313→    s === 'draft' ||
+   314→    s === 'enquiry-sent' ||
+   315→    s === 'quotes-received' ||
+   316→    s === 'awarded' ||
+   317→    s === 'abandoned'
+   318→  )
+   319→}
+   320→
+   321→// ─── Internal: build the reconciliation input from a loaded package ──────────
+   322→
+   323→interface LoadedPackage {
+   324→  id: string
+   325→  name: string
+   326→  scope: string | null
+   327→  executionStrategy: string
+   328→  status: string
+   329→  selectedQuoteId: string | null
+   330→  scopeAtoms: Array<{
+   331→    id: string
+   332→    name: string
+   333→    description: string | null
+   334→    valueWeight: number
+   335→  }>
+   336→  lines: Array<{
+   337→    estimateLineId: string
+   338→    requiredScope: string
+   339→    estimateLine: { sellPrice: number; description: string } | null
+   340→  }>
+   341→  quotes: Array<{
+   342→    id: string
+   343→    supplierName: string
+   344→    totalAmount: number
+   345→    currency: string
+   346→    status: string
+   347→    receivedAt: Date
+   348→    exclusionsJson: string
+   349→    assumptionsJson: string
+   350→    coveragePct: number
+   351→    scopeCoverages: Array<{
+   352→      scopeAtomId: string
+   353→      status: string
+   354→      note: string | null
+   355→    }>
+   356→  }>
+   357→}
+   358→
+   359→function buildRequiredLines(pkg: LoadedPackage, orgId?: string) {
+   360→  return pkg.lines.map((l) => {
+   361→    // P0-2: Verify estimateLine ownership. If the estimateLine's estimate
+   362→    // belongs to a different org, treat it as unavailable (null).
+   363→    const estimateOrgId = (l.estimateLine as unknown as { estimate?: { organizationId?: string } })?.estimate?.organizationId
+   364→    const isCrossTenant = !!l.estimateLine && orgId && estimateOrgId !== orgId
+   365→    const effectiveEstimateLine = isCrossTenant ? null : l.estimateLine
+   366→
+   367→    return {
+   368→      id: l.estimateLineId,
+   369→      description: l.requiredScope || effectiveEstimateLine?.description || '',
+   370→      sellPrice: effectiveEstimateLine?.sellPrice ?? 0,
+   371→      // P0-2: Flag inconsistent graph state — estimateLine was filtered out as
+   372→      // cross-tenant. The service should not silently undercount required scope.
+   373→      estimateLineMissing: (!!l.estimateLineId && !l.estimateLine) || isCrossTenant,
+   374→    }
+   375→  })
+   376→}
+   377→
+   378→function buildScopeAtoms(pkg: LoadedPackage): ScopeAtomInput[] {
+   379→  return pkg.scopeAtoms.map((a) => ({
+   380→    id: a.id,
+   381→    name: a.name,
+   382→    description: a.description ?? undefined,
+   383→    valueWeight: a.valueWeight,
+   384→  }))
+   385→}
+   386→
+   387→function buildReconciliationInput(
+   388→  requiredLines: Array<{ id: string; description: string; sellPrice: number }>,
+   389→  pkg: LoadedPackage,
+   390→  quote: LoadedPackage['quotes'][number] | null,
+   391→): ReconcileSubcontractInput {
+   392→  const scopeAtoms = buildScopeAtoms(pkg)
+   393→  if (!quote) {
+   394→    return { requiredLines, scopeAtoms, quote: null }
+   395→  }
+   396→  const scopeCoverages: QuoteScopeCoverageInput[] = quote.scopeCoverages.map((c) => ({
+   397→    scopeAtomId: c.scopeAtomId,
+   398→    status: c.status as 'covered' | 'excluded' | 'unstated',
+   399→    note: c.note ?? undefined,
+   400→  }))
+   401→  return {
+   402→    requiredLines,
+   403→    scopeAtoms,
+   404→    quote: {
+   405→      id: quote.id,
+   406→      totalAmount: quote.totalAmount,
+   407→      scopeCoverages,
+   408→      exclusionsJson: quote.exclusionsJson,
+   409→      assumptionsJson: quote.assumptionsJson,
+   410→    },
+   411→  }
+   412→}
+   413→
+   414→function toWorkspaceQuote(
+   415→  q: LoadedPackage['quotes'][number],
+   416→  reconciliation: ReconciliationResult,
+   417→): WorkspaceQuote {
+   418→  return {
+   419→    id: q.id,
+   420→    supplierName: q.supplierName,
+   421→    totalAmount: q.totalAmount,
+   422→    currency: q.currency,
+   423→    status: q.status,
+   424→    receivedAt: q.receivedAt,
+   425→    exclusions: parseStringArray(q.exclusionsJson),
+   426→    assumptions: parseStringArray(q.assumptionsJson),
+   427→    coveragePct: reconciliation.coveragePct,
+   428→    coverageBasis: reconciliation.coverageBasis,
+   429→    isLumpSum: reconciliation.isLumpSum,
+   430→    semanticCoveragePct: reconciliation.semanticCoveragePct,
+   431→    economicCoveragePct: reconciliation.economicCoveragePct,
+   432→    economicCoverageUnknown: reconciliation.economicCoverageUnknown,
+   433→    atomReconciliations: reconciliation.atomReconciliations,
+   434→    excludedAtoms: reconciliation.excludedAtoms,
+   435→    unstatedAtoms: reconciliation.unstatedAtoms,
+   436→    coveredAtoms: reconciliation.coveredAtoms,
+   437→    coveredScopeValue: reconciliation.coveredScopeValue,
+   438→    uncoveredValue: reconciliation.uncoveredValue,
+   439→    gaps: reconciliation.gaps,
+   440→    warnings: reconciliation.warnings,
+   441→    reconciliationStatus: reconciliation.status,
+   442→  }
+   443→}
+   444→
+   445→function parseStringArray(json: string | null | undefined): string[] {
+   446→  if (!json) return []
+   447→  try {
+   448→    const parsed: unknown = JSON.parse(json)
+   449→    if (Array.isArray(parsed)) {
+   450→      return parsed.filter((x): x is string => typeof x === 'string')
+   451→    }
+   452→  } catch {
+   453→    /* ignore */
+   454→  }
+   455→  return []
+   456→}
+   457→
+   458→// ─── SubcontractService ─────────────────────────────────────────────────────
+   459→
+   460→export const subcontractService = {
+   461→  /**
+   462→   * Get the full package workspace for an opportunity.
+   463→   *
+   464→   * Replaces the previous GET /api/subcontract/[opportunityId] logic.
+   465→   * The service:
+   466→   *   1. Verifies opportunity ownership (tenant-safe).
+   467→   *   2. Loads all packages for the opportunity with full graph.
+   468→   *   3. For each quote, runs the pure reconciliation engine.
+   469→   *   4. Returns the structured workspace.
+   470→   */
+   471→  async getPackageWorkspace(
+   472→    input: GetPackageWorkspaceInput,
+   473→  ): Promise<GetPackageWorkspaceResult | Err> {
+   474→    const { ctx, opportunityId } = input
+   475→
+   476→    // 1. Tenant-safe load via repository (verifies opportunity ownership too).
+   477→    const packages = await subcontractPackageRepository.getForOpportunity(
+   478→      ctx.organizationId,
+   479→      opportunityId,
+   480→    )
+   481→
+   482→    // 2. Build workspace, running reconciliation per quote.
+   483→    // P0-2: Check for inconsistent graph state (cross-tenant estimateLine references).
+   484→    // If inconsistent, DO NOT call reconcileSubcontract() — the engine must not
+   485→    // receive foreign-tenant pricing data.
+   486→    const workspacePackages: WorkspacePackage[] = packages.map((sp) => {
+   487→      const loadedPkg = sp as unknown as LoadedPackage
+   488→      const requiredLines = buildRequiredLines(loadedPkg, ctx.organizationId)
+   489→      const scopeAtoms = buildScopeAtoms(loadedPkg)
+   490→      const requiredScopeValue = round2(
+   491→        requiredLines.reduce((s, l) => s + l.sellPrice, 0),
+   492→      )
+   493→
+   494→      // P0-2: If any package line references an estimateLine that was filtered
+   495→      // out as cross-tenant, flag the workspace as inconsistent and BLOCK
+   496→      // reconciliation entirely. Do not feed foreign data into the engine.
+   497→      const hasInconsistentGraph = requiredLines.some((l) => l.estimateLineMissing)
+   498→
+   499→      const blockers: string[] = []
+   500→      if (hasInconsistentGraph) {
+   501→        blockers.push(
+   502→          'Required estimate scope contains an invalid cross-organization reference. Reconciliation blocked.',
+   503→        )
+   504→      }
+   505→
+   506→      // P0-2: Only call the reconciliation engine if the graph is consistent.
+   507→      let quotes: WorkspaceQuote[]
+   508→      if (hasInconsistentGraph) {
+   509→        // Blocked — return quotes without reconciliation results.
+   510→        quotes = loadedPkg.quotes.map((q) => ({
+   511→          id: q.id,
+   512→          supplierName: q.supplierName,
+   513→          totalAmount: q.totalAmount,
+   514→          currency: q.currency,
+   515→          status: q.status,
+   516→          receivedAt: q.receivedAt,
+   517→          exclusions: JSON.parse(q.exclusionsJson || '[]'),
+   518→          assumptions: JSON.parse(q.assumptionsJson || '[]'),
+   519→          coveragePct: 0,
+   520→          coverageBasis: 'none' as const,
+   521→          isLumpSum: false,
+   522→          semanticCoveragePct: 0,
+   523→          economicCoveragePct: 0,
+   524→          economicCoverageUnknown: true,
+   525→          atomReconciliations: [],
+   526→          excludedAtoms: [],
+   527→          unstatedAtoms: [],
+   528→          coveredAtoms: [],
+   529→          coveredScopeValue: 0,
+   530→          uncoveredValue: requiredScopeValue,
+   531→          gaps: ['Reconciliation blocked — inconsistent package graph'],
+   532→          warnings: ['Reconciliation blocked due to cross-tenant estimate line reference.'],
+   533→          reconciliationStatus: 'blocker' as const,
+   534→        }))
+   535→      } else {
+   536→        quotes = loadedPkg.quotes.map((q) => {
+   537→          const reconciliationInput = buildReconciliationInput(requiredLines, loadedPkg, q)
+   538→          const result = reconcileSubcontract(reconciliationInput)
+   539→          return toWorkspaceQuote(q, result)
+   540→        })
+   541→      }
+   542→
+   543→      const selectedQuote =
+   544→        quotes.find((q) => q.id === sp.selectedQuoteId) ?? null
+   545→
+   546→      return {
+   547→        id: sp.id,
+   548→        name: sp.name,
+   549→        scope: sp.scope,
+   550→        executionStrategy: sp.executionStrategy,
+   551→        status: sp.status,
+   552→        selectedQuoteId: sp.selectedQuoteId,
+   553→        scopeAtoms: scopeAtoms.map((a) => ({
+   554→          id: a.id,
+   555→          name: a.name,
+   556→          description: a.description ?? null,
+   557→          valueWeight: a.valueWeight ?? 0,
+   558→        })),
+   559→        requiredLines: requiredLines.map((l) => ({
+   560→          id: l.id,
+   561→          description: l.description,
+   562→          sellPrice: l.sellPrice,
+   563→        })),
+   564→        requiredScopeValue,
+   565→        quotes,
+   566→        selectedQuote,
+   567→        hasUnselectedQuote: !sp.selectedQuoteId && quotes.length > 0,
+   568→        hasNoQuotes: quotes.length === 0,
+   569→        // P0-2: Surface inconsistent graph state — do not silently undercount.
+   570→        graphInconsistent: hasInconsistentGraph,
+   571→        reconciliationBlocked: hasInconsistentGraph,
+   572→        blockers,
+   573→      }
+   574→    })
+   575→
+   576→    return { ok: true, packages: workspacePackages }
+   577→  },
+   578→
+   579→  /**
+   580→   * Create a subcontract package.
+   581→   *
+   582→   * Tenant-safe: the repository verifies opportunity ownership. If the
+   583→   * opportunity doesn't exist OR belongs to another org, returns 404.
+   584→   *
+   585→   * P0-1: package creation + audit log are wrapped in `db.$transaction` so
+   586→   * they succeed or fail atomically — a package without an audit trail (or
+   587→   * an audit trail without a package) is impossible.
+   588→   */
+   589→  async createPackage(
+   590→    input: CreatePackageInput,
+   591→  ): Promise<CreatePackageResult | Err> {
+   592→    const { ctx, opportunityId, name, scope, executionStrategy } = input
+   593→
+   594→    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+   595→      return { ok: false, error: 'Package name is required', status: 400 }
+   596→    }
+   597→
+   598→    const pkg = await db.$transaction(async (tx) => {
+   599→      const created = await subcontractPackageRepository.createForOrganizationInTransaction(
+   600→        tx,
+   601→        ctx.organizationId,
+   602→        {
+   603→          opportunityId,
+   604→          name: name.trim(),
+   605→          scope: scope ?? null,
+   606→          executionStrategy,
+   607→        },
+   608→      )
+   609→      if (!created) return null
+   610→      await auditLogRepository.createInTransaction(
+   611→        tx,
+   612→        ctx.organizationId,
+   613→        ctx.userId,
+   614→        {
+   615→          action: 'subcontract.package-created',
+   616→          entityType: 'SubcontractPackage',
+   617→          entityId: created.id,
+   618→          summary: `Subcontract package "${created.name}" created for opportunity ${opportunityId} (strategy: ${executionStrategy})`,
+   619→          afterJson: JSON.stringify({
+   620→            packageId: created.id,
+   621→            opportunityId,
+   622→            name: created.name,
+   623→            executionStrategy: created.executionStrategy,
+   624→            status: created.status,
+   625→          }),
+   626→        },
+   627→      )
+   628→      return created
+   629→    })
+   630→    if (!pkg) {
+   631→      return {
+   632→        ok: false,
+   633→        error: 'Opportunity not found in this organization',
+   634→        status: 404,
+   635→      }
+   636→    }
+   637→
+   638→    return {
+   639→      ok: true,
+   640→      package: {
+   641→        id: pkg.id,
+   642→        opportunityId: pkg.opportunityId,
+   643→        name: pkg.name,
+   644→        scope: pkg.scope,
+   645→        executionStrategy: pkg.executionStrategy,
+   646→        status: pkg.status,
+   647→      },
+   648→    }
+   649→  },
+   650→
+   651→  /**
+   652→   * Add a required scope atom to a package.
+   653→   *
+   654→   * Validates `valueWeight` is in [0, 1]. Tenant-safe: the repository verifies
+   655→   * package ownership. If the package belongs to another org, returns 404.
+   656→   */
+   657→  async createScopeAtom(
+   658→    input: CreateScopeAtomInput,
+   659→  ): Promise<CreateScopeAtomResult | Err> {
+   660→    const { ctx, packageId, name, description, valueWeight } = input
+   661→
+   662→    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+   663→      return { ok: false, error: 'Scope atom name is required', status: 400 }
+   664→    }
+   665→    if (!isValidValueWeight(valueWeight)) {
+   666→      return {
+   667→        ok: false,
+   668→        error: `valueWeight must be a finite number in [0, 1] — got ${valueWeight}`,
+   669→        status: 400,
+   670→      }
+   671→    }
+   672→
+   673→    // P0: Transactional — scope atom + audit succeed or fail together.
+   674→    const atom = await db.$transaction(async (tx) => {
+   675→      const created = await scopeAtomRepository.createForPackageInTransaction(
+   676→        tx,
+   677→        ctx.organizationId,
+   678→        packageId,
+   679→        {
+   680→          name: name.trim(),
+   681→          description: description ?? null,
+   682→          valueWeight,
+   683→        },
+   684→      )
+   685→      if (!created) return null
+   686→
+   687→      await auditLogRepository.createInTransaction(
+   688→        tx,
+   689→        ctx.organizationId,
+   690→        ctx.userId,
+   691→        {
+   692→          action: 'subcontract.scope-atom-created',
+   693→          entityType: 'ScopeAtom',
+   694→          entityId: created.id,
+   695→          summary: `Scope atom "${created.name}" (weight ${created.valueWeight}) added to package ${packageId}`,
+   696→        },
+   697→      )
+   698→
+   699→      return created
+   700→    })
+   701→    if (!atom) {
+   702→      return {
+   703→        ok: false,
+   704→        error: 'Package not found in this organization',
+   705→        status: 404,
+   706→      }
+   707→    }
+   708→
+   709→    return {
+   710→      ok: true,
+   711→      scopeAtom: {
+   712→        id: atom.id,
+   713→        packageId: atom.subcontractPackageId,
+   714→        name: atom.name,
+   715→        description: atom.description,
+   716→        valueWeight: atom.valueWeight,
+   717→      },
+   718→    }
+   719→  },
+   720→
+   721→  /**
+   722→   * Record a subcontract quote.
+   723→   *
+   724→   * Validates `totalAmount` is a non-negative finite number. Tenant-safe: the
+   725→   * repository verifies package ownership.
+   726→   *
+   727→   * P0-1: quote creation + audit log are wrapped in `db.$transaction` so they
+   728→   * succeed or fail atomically — a quote without an audit trail (or vice
+   729→   * versa) is impossible.
+   730→   */
+   731→  async recordQuote(
+   732→    input: RecordQuoteInput,
+   733→  ): Promise<RecordQuoteResult | Err> {
+   734→    const {
+   735→      ctx,
+   736→      packageId,
+   737→      supplierName,
+   738→      totalAmount,
+   739→      currency,
+   740→      exclusions,
+   741→      assumptions,
+   742→    } = input
+   743→
+   744→    if (!supplierName || typeof supplierName !== 'string' || supplierName.trim().length === 0) {
+   745→      return { ok: false, error: 'supplierName is required', status: 400 }
+   746→    }
+   747→    if (!isValidAmount(totalAmount)) {
+   748→      return {
+   749→        ok: false,
+   750→        error: `totalAmount must be a finite non-negative number — got ${totalAmount}`,
+   751→        status: 400,
+   752→      }
+   753→    }
+   754→    if (!currency || typeof currency !== 'string' || currency.trim().length === 0) {
+   755→      return { ok: false, error: 'currency is required', status: 400 }
+   756→    }
+   757→
+   758→    const exclusionsArr = exclusions ?? []
+   759→    const assumptionsArr = assumptions ?? []
+   760→    const exclusionsJson = JSON.stringify(exclusionsArr)
+   761→    const assumptionsJson = JSON.stringify(assumptionsArr)
+   762→
+   763→    const quote = await db.$transaction(async (tx) => {
+   764→      const created = await subcontractQuoteRepository.createForPackageInTransaction(
+   765→        tx,
+   766→        ctx.organizationId,
+   767→        packageId,
+   768→        {
+   769→          supplierName: supplierName.trim(),
+   770→          totalAmount,
+   771→          currency: currency.trim(),
+   772→          exclusionsJson,
+   773→          assumptionsJson,
+   774→        },
+   775→      )
+   776→      if (!created) return null
+   777→      await auditLogRepository.createInTransaction(
+   778→        tx,
+   779→        ctx.organizationId,
+   780→        ctx.userId,
+   781→        {
+   782→          action: 'subcontract.quote-recorded',
+   783→          entityType: 'SubcontractQuote',
+   784→          entityId: created.id,
+   785→          summary: `Quote from "${created.supplierName}" recorded for package ${packageId}: ${currency} ${totalAmount.toFixed(2)}`,
+   786→          afterJson: JSON.stringify({
+   787→            quoteId: created.id,
+   788→            packageId,
+   789→            supplierName: created.supplierName,
+   790→            totalAmount: created.totalAmount,
+   791→            currency: created.currency,
+   792→            exclusionsCount: exclusionsArr.length,
+   793→            assumptionsCount: assumptionsArr.length,
+   794→          }),
+   795→        },
+   796→      )
+   797→      return created
+   798→    })
+   799→    if (!quote) {
+   800→      return {
+   801→        ok: false,
+   802→        error: 'Package not found in this organization',
+   803→        status: 404,
+   804→      }
+   805→    }
+   806→
+   807→    return {
+   808→      ok: true,
+   809→      quote: {
+   810→        id: quote.id,
+   811→        packageId: quote.subcontractPackageId,
+   812→        supplierName: quote.supplierName,
+   813→        totalAmount: quote.totalAmount,
+   814→        currency: quote.currency,
+   815→        exclusions: exclusionsArr,
+   816→        assumptions: assumptionsArr,
+   817→        status: quote.status,
+   818→      },
+   819→    }
+   820→  },
+   821→
+   822→  /**
+   823→   * Record or update quote scope coverage for a specific atom.
+   824→   *
+   825→   * Tenant-safe: the repository verifies quote + scopeAtom belong to the same
+   826→   * package+org. If either is cross-tenant OR they belong to different
+   827→   * packages, returns 404.
+   828→   */
+   829→  async recordQuoteScopeCoverage(
+   830→    input: RecordQuoteScopeCoverageInput,
+   831→  ): Promise<RecordQuoteScopeCoverageResult | Err> {
+   832→    const { ctx, quoteId, scopeAtomId, status, note } = input
+   833→
+   834→    if (!isCoverageStatus(status)) {
+   835→      return {
+   836→        ok: false,
+   837→        error: `status must be one of: covered, excluded, unstated — got ${status}`,
+   838→        status: 400,
+   839→      }
+   840→    }
+   841→
+   842→    const coverage = await quoteScopeCoverageRepository.upsertForQuote(
+   843→      ctx.organizationId,
+   844→      quoteId,
+   845→      scopeAtomId,
+   846→      status,
+   847→      note,
+   848→    )
+   849→    if (!coverage) {
+   850→      return {
+   851→        ok: false,
+   852→        error:
+   853→          'Quote or scope atom not found, or they belong to different packages / organizations',
+   854→        status: 404,
+   855→      }
+   856→    }
+   857→
+   858→    // Audit.
+   859→    await auditLogRepository.create(
+   860→      ctx.organizationId,
+   861→      ctx.userId,
+   862→      {
+   863→        action: 'subcontract.coverage-recorded',
+   864→        entityType: 'QuoteScopeCoverage',
+   865→        entityId: coverage.id,
+   866→        summary: `Coverage for atom ${scopeAtomId} on quote ${quoteId} set to "${status}"`,
+   867→      },
+   868→    )
+   869→
+   870→    return {
+   871→      ok: true,
+   872→      coverage: {
+   873→        id: coverage.id,
+   874→        quoteId: coverage.quoteId,
+   875→        scopeAtomId: coverage.scopeAtomId,
+   876→        status: coverage.status,
+   877→        note: coverage.note,
+   878→      },
+   879→    }
+   880→  },
+   881→
+   882→  /**
+   883→   * Reconcile a quote against the package's required scope atoms.
+   884→   *
+   885→   * Pure delegation: this method loads the tenant-safe package+quote graph,
+   886→   * builds the engine input, and calls `reconcileSubcontract()`. It does NOT
+   887→   * duplicate the reconciliation math.
+   888→   *
+   889→   * P0-1: persistence of the reconciled coveragePct on the quote + the audit
+   890→   * log are wrapped in `db.$transaction` so they succeed or fail atomically.
+   891→   * The quote status is preserved — only `coveragePct` is updated.
+   892→   */
+   893→  async reconcileQuote(
+   894→    input: ReconcileQuoteInput,
+   895→  ): Promise<ReconcileQuoteResult | Err> {
+   896→    const { ctx, packageId, quoteId } = input
+   897→
+   898→    // 1. Tenant-safe package load (full graph).
+   899→    const pkg = await subcontractPackageRepository.getForOrganization(
+   900→      ctx.organizationId,
+   901→      packageId,
+   902→    )
+   903→    if (!pkg) {
+   904→      return {
+   905→        ok: false,
+   906→        error: 'Package not found in this organization',
+   907→        status: 404,
+   908→      }
+   909→    }
+   910→
+   911→    // 2. Find the quote within the package (verifies quote belongs to package).
+   912→    const loadedPkg = pkg as unknown as LoadedPackage
+   913→    const quote = loadedPkg.quotes.find((q) => q.id === quoteId)
+   914→    if (!quote) {
+   915→      return {
+   916→        ok: false,
+   917→        error: 'Quote not found in this package',
+   918→        status: 404,
+   919→      }
+   920→    }
+   921→
+   922→    // 3. Build engine input + invoke pure reconciliation.
+   923→    // P0-2: Pass validated requiredLines (with orgId check) to prevent
+   924→    // cross-tenant estimateLine data from entering the engine.
+   925→    const validatedRequiredLines = buildRequiredLines(loadedPkg, ctx.organizationId)
+   926→    if (validatedRequiredLines.some((l) => l.estimateLineMissing)) {
+   927→      return {
+   928→        ok: false,
+   929→        error: 'Cannot reconcile: package graph is inconsistent (cross-tenant estimate line reference).',
+   930→        status: 403,
+   931→      }
+   932→    }
+   933→    const reconciliationInput = buildReconciliationInput(validatedRequiredLines, loadedPkg, quote)
+   934→    const result = reconcileSubcontract(reconciliationInput)
+   935→
+   936→    // 4. Persist the reconciled coveragePct + write an audit log atomically.
+   937→    //    The quote.status is preserved — `updateStatusInTransaction` accepts
+   938→    //    an optional coveragePct alongside the status.
+   939→    await db.$transaction(async (tx) => {
+   940→      await subcontractQuoteRepository.updateStatusInTransaction(
+   941→        tx,
+   942→        quoteId,
+   943→        quote.status,
+   944→        round2(result.coveragePct),
+   945→      )
+   946→      await auditLogRepository.createInTransaction(
+   947→        tx,
+   948→        ctx.organizationId,
+   949→        ctx.userId,
+   950→        {
+   951→          action: 'subcontract.quote-reconciled',
+   952→          entityType: 'SubcontractQuote',
+   953→          entityId: quoteId,
+   954→          summary: `Quote ${quoteId} ("${quote.supplierName}") reconciled — coverage ${Math.round(result.coveragePct * 100)}% (${result.coverageBasis}, ${result.status})`,
+   955→          afterJson: JSON.stringify({
+   956→            packageId,
+   957→            quoteId,
+   958→            coveragePct: result.coveragePct,
+   959→            economicCoveragePct: result.economicCoveragePct,
+   960→            semanticCoveragePct: result.semanticCoveragePct,
+   961→            economicCoverageUnknown: result.economicCoverageUnknown,
+   962→            coverageBasis: result.coverageBasis,
+   963→            status: result.status,
+   964→            isLumpSum: result.isLumpSum,
+   965→            excludedAtoms: result.excludedAtoms,
+   966→            unstatedAtoms: result.unstatedAtoms,
+   967→            coveredAtoms: result.coveredAtoms,
+   968→            uncoveredValue: result.uncoveredValue,
+   969→          }),
+   970→        },
+   971→      )
+   972→    })
+   973→
+   974→    return { ok: true, reconciliation: result }
+   975→  },
+   976→
+   977→  /**
+   978→   * Select a quote — guarded by reconciliation thresholds.
+   979→   *
+   980→   * Selection is REJECTED unless ALL of the following hold:
+   981→   *   - The quote is NOT lump-sum (isLumpSum === false), OR there is an
+   982→   *     approved CommercialException for this quote.
+   983→   *   - There are NO excluded scope atoms, OR there is an approved exception.
+   984→   *   - Economic coverage >= 0.8, OR there is an approved exception.
+   985→   *
+   986→   * If all checks pass, the selection is performed atomically within
+   987→   * `db.$transaction`:
+   988→   *   - package.selectedQuoteId = quoteId
+   989→   *   - package.status = 'awarded'
+   990→   *   - quote.status = 'selected'
+   991→   *   - quote.coveragePct = reconciliation.coveragePct (persisted for downstream use)
+   992→   *   - An audit log entry is created.
+   993→   *
+   994→   * State machine: the package must NOT already be in `awarded` state (cannot
+   995→   * re-award without first abandoning). Going from any non-awarded state to
+   996→   * `awarded` is allowed.
+   997→   */
+   998→  async selectQuote(
+   999→    input: SelectQuoteInput,
+  1000→  ): Promise<SelectQuoteResult | Err> {
+  1001→    const { ctx, packageId, quoteId } = input
+  1002→
+  1003→    // 1. Tenant-safe package load.
+  1004→    const pkg = await subcontractPackageRepository.getForOrganization(
+  1005→      ctx.organizationId,
+  1006→      packageId,
+  1007→    )
+  1008→    if (!pkg) {
+  1009→      return {
+  1010→        ok: false,
+  1011→        error: 'Package not found in this organization',
+  1012→        status: 404,
+  1013→      }
+  1014→    }
+  1015→
+  1016→    // 2. State machine: cannot select if already awarded.
+  1017→    if (pkg.status === 'awarded') {
+  1018→      return {
+  1019→        ok: false,
+  1020→        error:
+  1021→          'Package is already awarded — abandon it first to re-select a quote',
+  1022→        status: 400,
+  1023→      }
+  1024→    }
+  1025→    if (pkg.status === 'abandoned') {
+  1026→      return {
+  1027→        ok: false,
+  1028→        error: 'Cannot select a quote on an abandoned package',
+  1029→        status: 400,
+  1030→      }
+  1031→    }
+  1032→
+  1033→    // 3. Verify the quote belongs to this package.
+  1034→    const loadedPkg = pkg as unknown as LoadedPackage
+  1035→    const quote = loadedPkg.quotes.find((q) => q.id === quoteId)
+  1036→    if (!quote) {
+  1037→      return {
+  1038→        ok: false,
+  1039→        error: 'Quote not found in this package',
+  1040→        status: 404,
+  1041→      }
+  1042→    }
+  1043→    if (quote.status === 'rejected') {
+  1044→      return {
+  1045→        ok: false,
+  1046→        error: 'Cannot select a rejected quote',
+  1047→        status: 400,
+  1048→      }
+  1049→    }
+  1050→
+  1051→    // 4. Run reconciliation (pure engine).
+  1052→    // P0-2: Pass validated requiredLines to prevent cross-tenant data in engine.
+  1053→    const validatedRequiredLines = buildRequiredLines(loadedPkg, ctx.organizationId)
+  1054→    if (validatedRequiredLines.some((l) => l.estimateLineMissing)) {
+  1055→      return {
+  1056→        ok: false,
+  1057→        error: 'Cannot select quote: package graph is inconsistent (cross-tenant estimate line reference).',
+  1058→        status: 403,
+  1059→      }
+  1060→    }
+  1061→    const reconciliationInput = buildReconciliationInput(validatedRequiredLines, loadedPkg, quote)
+  1062→    const reconciliation = reconcileSubcontract(reconciliationInput)
+  1063→
+  1064→    // 5. Check blockers. Each blocker can be overridden by an approved
+  1065→    //    CommercialException for this quote.
+  1066→    const approvedException =
+  1067→      await commercialExceptionRepository.findApprovedForQuote(
+  1068→        ctx.organizationId,
+  1069→        quoteId,
+  1070→      )
+  1071→
+  1072→    const blockers: string[] = []
+  1073→    if (reconciliation.isLumpSum) {
+  1074→      blockers.push(
+  1075→        'Quote is lump-sum (no scope-atom coverage). Lump-sum quotes are not accepted without an approved exception.',
+  1076→      )
+  1077→    }
+  1078→    if (reconciliation.excludedAtoms.length > 0) {
+  1079→      blockers.push(
+  1080→        `Quote explicitly excludes ${reconciliation.excludedAtoms.length} critical scope atom(s): ${reconciliation.excludedAtoms.join(', ')}`,
+  1081→      )
+  1082→    }
+  1083→    if (reconciliation.coveragePct < 0.8) {
+  1084→      blockers.push(
+  1085→        `Economic coverage ${Math.round(reconciliation.coveragePct * 100)}% is below the 80% threshold required for selection.`,
+  1086→      )
+  1087→    }
+  1088→
+  1089→    if (blockers.length > 0 && !approvedException) {
+  1090→      return {
+  1091→        ok: false,
+  1092→        error: `Cannot select quote — reconciliation blockers:\n  - ${blockers.join('\n  - ')}\nAn approved CommercialException is required to override.`,
+  1093→        status: 400,
+  1094→      }
+  1095→    }
+  1096→
+  1097→    // 6. Validate the state transition (any non-awarded → awarded).
+  1098→    if (!isAllowedTransition(pkg.status, 'awarded')) {
+  1099→      return {
+  1100→        ok: false,
+  1101→        error: `Illegal state transition: cannot move package from "${pkg.status}" to "awarded"`,
+  1102→        status: 400,
+  1103→      }
+  1104→    }
+  1105→
+  1106→    // 7. Atomic selection — package + quote + audit succeed or fail together.
+  1107→    await db.$transaction(async (tx) => {
+  1108→      await subcontractPackageRepository.updateSelectionInTransaction(
+  1109→        tx,
+  1110→        packageId,
+  1111→        quoteId,
+  1112→        'awarded',
+  1113→      )
+  1114→      await subcontractQuoteRepository.updateStatusInTransaction(
+  1115→        tx,
+  1116→        quoteId,
+  1117→        'selected',
+  1118→        reconciliation.coveragePct,
+  1119→      )
+  1120→      await auditLogRepository.createInTransaction(
+  1121→        tx,
+  1122→        ctx.organizationId,
+  1123→        ctx.userId,
+  1124→        {
+  1125→          action: 'subcontract.quote-selected',
+  1126→          entityType: 'SubcontractPackage',
+  1127→          entityId: packageId,
+  1128→          summary: `Quote ${quoteId} ("${quote.supplierName}") selected for package ${packageId} — coverage ${Math.round(reconciliation.coveragePct * 100)}%, status ${reconciliation.status}${approvedException ? ' [approved exception override]' : ''}`,
+  1129→          afterJson: JSON.stringify({
+  1130→            packageId,
+  1131→            quoteId,
+  1132→            coveragePct: reconciliation.coveragePct,
+  1133→            economicCoveragePct: reconciliation.economicCoveragePct,
+  1134→            semanticCoveragePct: reconciliation.semanticCoveragePct,
+  1135→            isLumpSum: reconciliation.isLumpSum,
+  1136→            excludedAtoms: reconciliation.excludedAtoms,
+  1137→            hadApprovedException: !!approvedException,
+  1138→          }),
+  1139→        },
+  1140→      )
+  1141→    })
+  1142→
+  1143→    return {
+  1144→      ok: true,
+  1145→      packageId,
+  1146→      selectedQuoteId: quoteId,
+  1147→      packageStatus: 'awarded',
+  1148→      reconciliation,
+  1149→    }
+  1150→  },
+  1151→
+  1152→  /**
+  1153→   * Reject a quote — sets quote.status = 'rejected'.
+  1154→   *
+  1155→   * Tenant-safe: the repository verifies quote ownership. If the quote is the
+  1156→   * currently selected quote on its package, the package is also moved back
+  1157→   * to `quotes-received` (state machine: awarded → quotes-received is allowed
+  1158→   * via abandon → re-collect cycle, but rejecting a non-selected quote is a
+  1159→   * no-op on the package).
+  1160→   *
+  1161→   * Rejecting the SELECTED quote is rejected with 400 — the caller must first
+  1162→   * abandon the package to undo an awarded selection.
+  1163→   */
+  1164→  async rejectQuote(
+  1165→    input: RejectQuoteInput,
+  1166→  ): Promise<RejectQuoteResult | Err> {
+  1167→    const { ctx, quoteId } = input
+  1168→
+  1169→    // 1. Tenant-safe quote load (with parent package to check selection).
+  1170→    const quote = await subcontractQuoteRepository.getWithCoveragesForOrganization(
+  1171→      ctx.organizationId,
+  1172→      quoteId,
+  1173→    )
+  1174→    if (!quote) {
+  1175→      return {
+  1176→        ok: false,
+  1177→        error: 'Quote not found in this organization',
+  1178→        status: 404,
+  1179→      }
+  1180→    }
+  1181→
+  1182→    // 2. Cannot reject an already-selected quote (must abandon package first).
+  1183→    if (quote.status === 'selected') {
+  1184→      return {
+  1185→        ok: false,
+  1186→        error:
+  1187→          'Cannot reject a selected quote — abandon the package first to undo the award',
+  1188→        status: 400,
+  1189→      }
+  1190→    }
+  1191→    if (quote.status === 'rejected') {
+  1192→      // Idempotent — return success.
+  1193→      return { ok: true, quoteId, status: 'rejected' }
+  1194→    }
+  1195→
+  1196→    // 3. Update + audit.
+  1197→    const updated = await subcontractQuoteRepository.updateStatus(
+  1198→      ctx.organizationId,
+  1199→      quoteId,
+  1200→      'rejected',
+  1201→    )
+  1202→    if (!updated) {
+  1203→      return {
+  1204→        ok: false,
+  1205→        error: 'Quote not found in this organization',
+  1206→        status: 404,
+  1207→      }
+  1208→    }
+  1209→
+  1210→    await auditLogRepository.create(
+  1211→      ctx.organizationId,
+  1212→      ctx.userId,
+  1213→      {
+  1214→        action: 'subcontract.quote-rejected',
+  1215→        entityType: 'SubcontractQuote',
+  1216→        entityId: quoteId,
+  1217→        summary: `Quote ${quoteId} ("${quote.supplierName}") rejected for package ${quote.subcontractPackageId}`,
+  1218→      },
+  1219→    )
+  1220→
+  1221→    return { ok: true, quoteId, status: 'rejected' }
+  1222→  },
+  1223→
+  1224→  /**
+  1225→   * Transition a package's status with state-machine validation.
+  1226→   *
+  1227→   * Used to move packages between draft / enquiry-sent / quotes-received /
+  1228→   * awarded / abandoned. The `selectQuote()` method handles the
+  1229→   * award transition atomically — this method handles all other transitions.
+  1230→   *
+  1231→   * State machine:
+  1232→   *   draft → enquiry-sent → quotes-received → awarded
+  1233→   *   any state → abandoned
+  1234→   *   abandoned → draft (restart)
+  1235→   *   awarded → abandoned (cancel award)
+  1236→   *
+  1237→   * NOT allowed:
+  1238→   *   awarded → draft (must abandon first)
+  1239→   *   awarded → enquiry-sent (must abandon first)
+  1240→   *   awarded → quotes-received (must abandon first)
+  1241→   */
+  1242→  async transitionPackageStatus(
+  1243→    input: TransitionPackageStatusInput,
+  1244→  ): Promise<TransitionPackageStatusResult | Err> {
+  1245→    const { ctx, packageId, status } = input
+  1246→
+  1247→    if (!isPackageStatus(status)) {
+  1248→      return {
+  1249→        ok: false,
+  1250→        error: `Invalid package status: ${status}. Must be one of: draft, enquiry-sent, quotes-received, awarded, abandoned`,
+  1251→        status: 400,
+  1252→      }
+  1253→    }
+  1254→
+  1255→    // 1. Tenant-safe package load.
+  1256→    const pkg = await subcontractPackageRepository.getForOrganization(
+  1257→      ctx.organizationId,
+  1258→      packageId,
+  1259→    )
+  1260→    if (!pkg) {
+  1261→      return {
+  1262→        ok: false,
+  1263→        error: 'Package not found in this organization',
+  1264→        status: 404,
+  1265→      }
+  1266→    }
+  1267→
+  1268→    // 2. Validate state transition.
+  1269→    if (pkg.status === status) {
+  1270→      // Idempotent — no transition needed.
+  1271→      return { ok: true, packageId, status: pkg.status }
+  1272→    }
+  1273→    if (!isAllowedTransition(pkg.status, status)) {
+  1274→      return {
+  1275→        ok: false,
+  1276→        error: `Illegal state transition: cannot move package from "${pkg.status}" to "${status}"`,
+  1277→        status: 400,
+  1278→      }
+  1279→    }
+  1280→
+  1281→    // 3. Update + audit.
+  1282→    const updated = await subcontractPackageRepository.updateStatus(
+  1283→      ctx.organizationId,
+  1284→      packageId,
+  1285→      status,
+  1286→    )
+  1287→    if (!updated) {
+  1288→      return {
+  1289→        ok: false,
+  1290→        error: 'Package not found in this organization',
+  1291→        status: 404,
+  1292→      }
+  1293→    }
+  1294→
+  1295→    await auditLogRepository.create(
+  1296→      ctx.organizationId,
+  1297→      ctx.userId,
+  1298→      {
+  1299→        action: 'subcontract.package-status-changed',
+  1300→        entityType: 'SubcontractPackage',
+  1301→        entityId: packageId,
+  1302→        summary: `Package ${packageId} status transitioned: "${pkg.status}" → "${status}"`,
+  1303→        afterJson: JSON.stringify({ from: pkg.status, to: status }),
+  1304→      },
+  1305→    )
+  1306→
+  1307→    return { ok: true, packageId, status: updated.status }
+  1308→  },
+  1309→}
+  1310→
