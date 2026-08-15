@@ -943,3 +943,25 @@ Stage Summary:
   * graphInconsistent + reconciliationBlocked + blockers explicitly typed
   * 18 real integration tests including rollback + cross-tenant EstimateLine
   * GitHub SHA = Vercel SHA = /api/version SHA
+
+---
+Task ID: bid-service
+Agent: principal-engineer
+Task: BidService — application-service Phase 3
+
+Work Log:
+- Created src/application/bid-service.ts with 8 service methods following the frozen EstimateService/SubcontractService pattern.
+- State machine: draft→adjudication→ready→submitted→clarification→won/lost/withdrawn. Illegal transitions rejected.
+- submitBid: GUARDED — validates finalized revision via validateBidSubmission(), runs gate via runPreSubmissionGate(),
+  enforces no blockers, idempotent. Transactional (bid update + audit in db.$transaction).
+- recordAdjudication: preserves system sell price + director adjustment + rationale + final price separately.
+- Converted GET /api/pre-submission/[opportunityId] to thin adapter calling bidService.runSubmissionGate().
+- 9 integration tests (all passing against Neon):
+  Cross-tenant (2), state machine (2), submission adversarial (2), adjudication (1), rollback (1), outcome (1)
+- 106 unit + 9 integration = 115 total, all passing. Lint clean. Build succeeds.
+- Deployed to Vercel at bc84b1c. All three SHAs match.
+
+Stage Summary:
+- BidService is code-complete and deployed.
+- Three frozen application services: EstimateService, SubcontractService, BidService.
+- Next: OpportunityService, KnowledgeService, DocumentService.
