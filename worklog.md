@@ -965,3 +965,29 @@ Stage Summary:
 - BidService is code-complete and deployed.
 - Three frozen application services: EstimateService, SubcontractService, BidService.
 - Next: OpportunityService, KnowledgeService, DocumentService.
+
+---
+Task ID: bid-service-correction
+Agent: principal-engineer
+Task: BidService P0 correction — no raw Prisma, revision-based adjudication, programme validation, immutability
+
+Work Log:
+- P0-1: Removed all raw db.find*/findMany calls from BidService. Uses bidRepository.getOpportunityBidWorkspace().
+- P0-2: Removed 70% WD proxy for deliverable readiness. Programme/MS/JHA now based on finalized revision existence.
+- P0-3: Programme revision tenant-safe + finalized-validated via programmeRevisionRepository.
+- P0-4: Adjudication uses finalized EstimateRevision snapshot (replayRevision) for systemSellPrice.
+  Added Bid.systemSellPrice + Bid.adjudicatedRevisionId to schema.
+- P0-5: Submitted revision MUST match adjudicated revision (submitBid uses bid.adjudicatedRevisionId).
+- P0-6: Post-submission immutability — recordAdjudication rejected if bid is submitted.
+- 11 integration tests all pass (including cross-tenant revision, post-submission immutability, rollback).
+- Deployed to Vercel at c7506ec. All three SHAs match.
+
+Stage Summary:
+- BidService now satisfies all P0 requirements:
+  * Zero direct Prisma in the service
+  * Adjudication uses immutable revision snapshot
+  * Programme revision validated (tenant-safe + finalized)
+  * Submitted revision = adjudicated revision
+  * Post-submission immutability enforced
+  * 11 real integration tests including cross-tenant revision + immutability + rollback
+- Three frozen application services: EstimateService, SubcontractService, BidService.
