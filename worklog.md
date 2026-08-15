@@ -600,3 +600,29 @@ Stage Summary:
   * Invalid roles fail closed (no access, not normalized)
   * Percentages bounded to 0..1 (no 400% profit rates)
 - Ready to proceed to the application-service layer.
+
+---
+Task ID: pricing-basis
+Agent: principal-engineer
+Task: Explicit hybrid subcontract pricing basis
+
+Work Log:
+- Added pricingBasis to ExecutionSegmentInput: 'direct-segment-quote' | 'proportional-from-package'.
+- 'direct-segment-quote': the quote totalAmount IS the segment cost (no × quantityPct).
+  Use when the subcontractor quoted specifically for this segment's scope.
+- 'proportional-from-package': cost = totalAmount × quantityPct. Use when the quote
+  covers a larger package and quantityPct is the portion being subcontracted.
+- Missing pricingBasis → blocker ('missing-pricing-basis'). The engine never guesses.
+- New blocking kind: 'missing-pricing-basis'.
+- Cleaned up stale comment in context.ts (was "normalized to estimator", now "rejected with 403").
+- 5 new adversarial tests in pricing-basis.test.ts: missing basis, direct vs proportional,
+  mixed bases, different costs for same quote.
+- Updated existing tests and seed to include pricingBasis.
+- 99 tests pass. Lint clean. Build succeeds.
+- Pushed to GitHub (commit 75f1b00). Vercel deployed (READY).
+- All four SHAs verified: 75f1b00771b7fd8c5ec03908e9c726bb18483e0b.
+
+Stage Summary:
+- The hybrid subcontract calculation is now commercially explicit — no guessing
+  whether the quote is for the segment or for a larger package.
+- The commercial foundation is complete. Ready for the application-service layer.
