@@ -815,3 +815,40 @@ Stage Summary:
   * Real transaction rollback test (failure inside transaction → rollback)
   * 11 real cross-tenant integration tests with actual Neon DB data
 - EstimateService is frozen as the canonical pattern for remaining services.
+
+---
+Task ID: final-estimateservice-gate
+Agent: principal-engineer
+Task: Real post-insert rollback test + Vercel deployment sync
+
+Work Log:
+- Replaced the duplicate-revisionNo rollback test with a REAL post-insert rollback test:
+  * Test 12 uses a non-existent userId in the RequestContext
+  * The revision INSERT succeeds inside db.$transaction
+  * The audit INSERT fails (FK constraint: AuditLog.actorId → User.id)
+  * The transaction rolls back — the revision does NOT persist (count = 0)
+  * This proves: failure AFTER revision creation → rollback (not just failure ON creation)
+- Kept the duplicate-revisionNo test (Test 11) as a separate unique-constraint validation.
+- 12 integration tests + 106 unit tests = 118 total, all passing.
+- Lint clean. Build succeeds.
+- Code pushed to GitHub at 2368feb.
+- Vercel deployment: BLOCKED by free-tier daily deploy limit (100 deploys/day exceeded).
+  The latest DEPLOYED commit is c29aa60 (verified via /api/version).
+  The code at 2368feb is on GitHub main but not yet deployed to Vercel.
+  The deploy limit will reset in ~24 hours, at which point the Vercel GitHub
+  webhook should auto-deploy the latest commit, or a manual deploy can be triggered.
+  The /api/version endpoint transparently reports the actual deployed SHA.
+
+Stage Summary:
+- EstimateService vertical slice is code-complete and fully tested:
+  * Repository-level WD/WDV/Resource scoping ✓
+  * Cross-tenant recompute tests ✓
+  * Cross-tenant finalize tests ✓
+  * Cross-tenant WD finalization rejection ✓
+  * Resource/price observation isolation ✓
+  * Duplicate revisionNo unique constraint test ✓
+  * Real post-insert rollback test (audit FK failure → revision rolled back) ✓
+  * recomputeLine atomicity ✓
+  * finalizeRevision atomicity ✓
+- Remaining gate: Vercel deployment must sync to GitHub SHA (blocked by rate limit).
+- Once deployed, EstimateService is FROZEN as the canonical pattern.
