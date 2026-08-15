@@ -991,3 +991,27 @@ Stage Summary:
   * Post-submission immutability enforced
   * 11 real integration tests including cross-tenant revision + immutability + rollback
 - Three frozen application services: EstimateService, SubcontractService, BidService.
+
+---
+Task ID: bid-service-domain-correction
+Agent: principal-engineer
+Task: BidService domain-correctness — revision must belong to bid's estimate+opportunity
+
+Work Log:
+- P0-1: Adjudication revision must belong to Bid's Estimate AND Opportunity.
+  Changed getFinalizedForOrganization → getFinalizedForBid(orgId, estimateId, opportunityId, revisionId).
+- P0-2: Programme revision must belong to Bid's Opportunity.
+  Changed getFinalizedForOrganization → getFinalizedForOpportunity(orgId, opportunityId, revisionId).
+- P0-3: Fixed submission gate to use adjudicatedRevisionId (not null estimateRevisionId).
+- P0-4: recordAdjudication() sets estimateRevisionId = adjudicatedRevisionId.
+- 13 integration tests all pass (including wrong-same-org revision + end-to-end submission).
+- Deployed to Vercel at 604da54. All three SHAs match.
+
+Stage Summary:
+- BidService now satisfies ALL domain-correctness requirements:
+  * Adjudication revision verified against bid's estimate + opportunity
+  * Programme revision verified against bid's opportunity
+  * estimateRevisionId = adjudicatedRevisionId after adjudication
+  * Gate uses adjudicatedRevisionId for deliverable readiness
+  * 13 real integration tests including wrong-same-org + end-to-end
+- Three frozen application services: EstimateService, SubcontractService, BidService.
