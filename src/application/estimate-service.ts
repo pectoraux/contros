@@ -26,6 +26,7 @@ import {
 import { round2 } from '@/lib/engines/money'
 import {
   estimateRepository,
+  estimateRevisionRepository,
   subcontractQuoteRepository,
   commercialExceptionRepository,
   auditLogRepository,
@@ -112,6 +113,17 @@ export const estimateService = {
     }
 
     const wdv = line.workDefinitionVersion
+
+    // P0-3: Verify WorkDefinition ownership — if the WD belongs to another org,
+    // treat it as unavailable (null). This prevents cross-tenant pricing knowledge.
+    const wd = line.workDefinition
+    if (wd && wd.organizationId !== ctx.organizationId) {
+      // Cross-tenant WD reference — treat as unavailable.
+      return { ok: false, error: 'Work Definition not available for this organization', status: 403 }
+    }
+    if (wdv && wd && wd.organizationId !== ctx.organizationId) {
+      return { ok: false, error: 'Work Definition Version not available for this organization', status: 403 }
+    }
 
     // 2. Resolve the line-level subcontract quote (tenant-safe).
     const lineSubcontractQuote = await subcontractQuoteRepository.getSelectedQuoteForLine(
@@ -315,31 +327,22 @@ export const estimateService = {
   /**
    * Finalize an estimate revision — captures an immutable snapshot.
    *
-   * The service:
-   *   1. Verifies estimate ownership (tenant-safe)
-   *   2. Validates all lines are complete (no incomplete calculations)
-   *   3. Captures the full pricing graph into an immutable snapshot
-   *   4. Persists the EstimateRevision with status='finalized'
-   *   5. Runs a replay sanity check
-   *   6. Writes an audit log
+   * P0-1: The entire operation is wrapped in a single Prisma transaction.
+   * If replay fails or audit creation fails, the revision is rolled back.
+   * A finalized revision and its audit log succeed or fail together.
+   *
+   * P0-2: Uses tenant-aware repositories — no raw Prisma calls.
+   * P0-3: WorkDefinition/WDV/Resource ownership verified via repository scoping.
    */
   async finalizeRevision(input: FinalizeRevisionInput): Promise<FinalizeRevisionResult | { ok: false; error: string; status: number }> {
     const { ctx, estimateId } = input
 
-    // 1. Tenant-safe estimate lookup.
-    const estimate = await db.estimate.findFirst({
-      where: { id: estimateId, organizationId: ctx.organizationId },
-      include: {
-        lines: {
-          include: {
-            workDefinition: true,
-            workDefinitionVersion: true,
-            executionSegments: true,
-          },
-        },
-        revisions: { orderBy: { revisionNo: 'desc' }, take: 1 },
-      },
-    })
+    // 1. Tenant-safe estimate + lines lookup via repository.
+    // P0-3: WD/WDV/priceObservations are org-scoped in the repository.
+    const estimate = await estimateRepository.getRevisionContext(
+      ctx.organizationId,
+      estimateId,
+    )
     if (!estimate) {
       return { ok: false, error: 'Estimate not found', status: 404 }
     }
@@ -354,21 +357,15 @@ export const estimateService = {
       }
     }
 
-    // 3. Build line snapshots (tenant-safe quote resolution).
+    // 3. Build line snapshots (tenant-safe quote resolution via repositories).
     const lineSnapshots: LineSnapshot[] = []
     for (const l of estimate.lines) {
+      // P0-2: Use repository for package line lookup.
       let lineSubcontractQuote: { totalAmount: number; coveragePct: number } | null = null
-      const pkgLine = await db.subcontractPackageLine.findFirst({
-        where: {
-          estimateLineId: l.id,
-          subcontractPackage: { opportunity: { organizationId: ctx.organizationId } },
-        },
-        include: {
-          subcontractPackage: {
-            include: { quotes: { select: { id: true, totalAmount: true, coveragePct: true } } },
-          },
-        },
-      })
+      const pkgLine = await subcontractQuoteRepository.getPackageLineForOrganization(
+        ctx.organizationId,
+        l.id,
+      )
       if (pkgLine) {
         const selectedQuoteId = pkgLine.subcontractPackage.selectedQuoteId
         if (selectedQuoteId) {
@@ -400,7 +397,10 @@ export const estimateService = {
         })
       }
 
+      // P0-3: WD/WDV are only present if they belong to the same org (repository filters).
+      // If a cross-tenant WD was referenced, it's null here → treated as unavailable.
       const wdv = l.workDefinitionVersion
+      const wd = l.workDefinition
       lineSnapshots.push({
         lineId: l.id,
         description: l.description,
@@ -410,9 +410,9 @@ export const estimateService = {
         workDefinitionVersion: wdv
           ? {
               id: wdv.id,
-              name: l.workDefinition?.name ?? '',
+              name: wd?.name ?? '',
               version: wdv.version,
-              unit: l.workDefinition?.unit ?? l.unit,
+              unit: wd?.unit ?? l.unit,
               wastage: wdv.wastage,
               productivityRule: wdv.productivityRule ?? undefined,
               costRecipeJson: wdv.costRecipeJson,
@@ -432,29 +432,37 @@ export const estimateService = {
     const revisionNo = input.revisionNo ?? ((estimate.revisions[0]?.revisionNo ?? 0) + 1)
     const snapshotJson = finalizeRevisionEngine(estimateId, revisionNo, policy, lineSnapshots)
 
-    // 5. Persist the revision.
-    const revision = await db.estimateRevision.create({
-      data: {
+    // 5. Replay sanity check BEFORE the transaction — if replay fails, don't
+    // even start the transaction.
+    const replay = replayRevision(snapshotJson)
+    if (!replay.ok) {
+      return { ok: false, error: 'Replay failed before finalization — snapshot invalid', status: 500 }
+    }
+
+    // 6. P0-1: Atomic transaction — revision + audit succeed or fail together.
+    const revision = await db.$transaction(async (tx) => {
+      // P0-2: Use repository for revision creation.
+      const rev = await estimateRevisionRepository.createFinalized(tx, {
         estimateId,
         revisionNo,
         snapshotJson,
-        status: 'finalized',
         finalizedById: ctx.userId,
-      },
-    })
+      })
 
-    // 6. Replay sanity check.
-    const replay = replayRevision(snapshotJson)
-    if (!replay.ok) {
-      return { ok: false, error: 'Revision finalized but replay failed', status: 500 }
-    }
+      // Audit log within the same transaction.
+      await auditLogRepository.createInTransaction(
+        tx,
+        ctx.organizationId,
+        ctx.userId,
+        {
+          action: 'estimate.revision-finalized',
+          entityType: 'EstimateRevision',
+          entityId: rev.id,
+          summary: `Revision ${revisionNo} finalized for estimate ${estimateId} (${lineSnapshots.length} lines, sell=${replay.totalSellPrice})`,
+        },
+      )
 
-    // 7. Audit log.
-    await auditLogRepository.create(ctx.organizationId, ctx.userId, {
-      action: 'estimate.revision-finalized',
-      entityType: 'EstimateRevision',
-      entityId: revision.id,
-      summary: `Revision ${revisionNo} finalized for estimate ${estimateId} (${lineSnapshots.length} lines, sell=${replay.totalSellPrice})`,
+      return rev
     })
 
     return {

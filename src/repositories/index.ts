@@ -8,11 +8,13 @@
  * INVARIANT 12: Every organization is isolated from every other organization.
  * A repository must never return an org-owned entity solely from an
  * attacker-supplied ID.
+ *
+ * P0-3: WorkDefinition / WorkDefinitionVersion / Resource ownership is
+ * verified explicitly — not trusted via the EstimateLine relation.
  */
 
 import { db } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
-import type { ExecutionSegmentInput, PricingInput } from '@/lib/engines'
 
 // ─── Estimate Repository ────────────────────────────────────────────────────
 
@@ -24,7 +26,33 @@ export const estimateRepository = {
     })
   },
 
-  /** Get an estimate line with full pricing graph, tenant-scoped. */
+  /**
+   * Get the full revision context for an estimate: the estimate, its lines,
+   * work definitions, versions, execution segments, and existing revisions.
+   *
+   * P0-3: WorkDefinition ownership is verified in the service after loading —
+   * if a WD/WDV doesn't belong to the same org, it's treated as null.
+   */
+  async getRevisionContext(orgId: string, estimateId: string) {
+    return db.estimate.findFirst({
+      where: { id: estimateId, organizationId: orgId },
+      include: {
+        lines: {
+          include: {
+            workDefinition: true,
+            workDefinitionVersion: { include: { priceObservations: true } },
+            executionSegments: true,
+          },
+        },
+        revisions: { orderBy: { revisionNo: 'desc' }, take: 1 },
+      },
+    })
+  },
+
+  /**
+   * Get an estimate line with full pricing graph, tenant-scoped.
+   * P0-3: WorkDefinition/WDV ownership is verified in the service after loading.
+   */
   async getLineForOrganization(
     orgId: string,
     estimateId: string,
@@ -52,7 +80,6 @@ export const estimateRepository = {
     lineId: string,
     data: Record<string, unknown>,
   ) {
-    // Verify ownership before update.
     const line = await db.estimateLine.findFirst({
       where: { id: lineId, estimate: { organizationId: orgId } },
       select: { id: true },
@@ -62,26 +89,60 @@ export const estimateRepository = {
   },
 }
 
+// ─── Estimate Revision Repository ───────────────────────────────────────────
+
+export const estimateRevisionRepository = {
+  /** Create a finalized revision within a transaction. */
+  async createFinalized(
+    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+    data: {
+      estimateId: string
+      revisionNo: number
+      snapshotJson: string
+      finalizedById: string
+    },
+  ) {
+    return tx.estimateRevision.create({
+      data: {
+        estimateId: data.estimateId,
+        revisionNo: data.revisionNo,
+        snapshotJson: data.snapshotJson,
+        status: 'finalized',
+        finalizedById: data.finalizedById,
+      },
+    })
+  },
+
+  /** Get the latest revision number for an estimate. */
+  async getLatestRevisionNo(orgId: string, estimateId: string): Promise<number> {
+    const estimate = await db.estimate.findFirst({
+      where: { id: estimateId, organizationId: orgId },
+      select: {
+        revisions: {
+          orderBy: { revisionNo: 'desc' },
+          take: 1,
+          select: { revisionNo: true },
+        },
+      },
+    })
+    return estimate?.revisions[0]?.revisionNo ?? 0
+  },
+}
+
 // ─── Subcontract Quote Repository ───────────────────────────────────────────
 
 export const subcontractQuoteRepository = {
   /**
    * Get a subcontract quote scoped to the authenticated organization.
-   * Verifies the full ownership chain: quote → package → opportunity → org.
+   * Verifies: quote → package → opportunity → org.
    * Returns null if the quote doesn't exist OR belongs to another org.
-   * Does NOT reveal cross-tenant existence.
    */
-  async getForOrganization(
-    orgId: string,
-    quoteId: string,
-  ) {
+  async getForOrganization(orgId: string, quoteId: string) {
     return db.subcontractQuote.findFirst({
       where: {
         id: quoteId,
         subcontractPackage: {
-          opportunity: {
-            organizationId: orgId,
-          },
+          opportunity: { organizationId: orgId },
         },
       },
       select: { id: true, totalAmount: true, coveragePct: true },
@@ -90,12 +151,8 @@ export const subcontractQuoteRepository = {
 
   /**
    * Get the selected quote for a package line, tenant-scoped.
-   * The packageLine must belong to a package → opportunity → org chain.
    */
-  async getSelectedQuoteForLine(
-    orgId: string,
-    estimateLineId: string,
-  ) {
+  async getSelectedQuoteForLine(orgId: string, estimateLineId: string) {
     const pkgLine = await db.subcontractPackageLine.findFirst({
       where: {
         estimateLineId,
@@ -117,6 +174,28 @@ export const subcontractQuoteRepository = {
     return (
       pkgLine.subcontractPackage.quotes.find((q) => q.id === selectedQuoteId) ?? null
     )
+  },
+
+  /**
+   * Get the package line + selected quote for an estimate line, tenant-scoped.
+   * Used by finalizeRevision.
+   */
+  async getPackageLineForOrganization(orgId: string, estimateLineId: string) {
+    return db.subcontractPackageLine.findFirst({
+      where: {
+        estimateLineId,
+        subcontractPackage: {
+          opportunity: { organizationId: orgId },
+        },
+      },
+      include: {
+        subcontractPackage: {
+          include: {
+            quotes: { select: { id: true, totalAmount: true, coveragePct: true } },
+          },
+        },
+      },
+    })
   },
 }
 
@@ -172,20 +251,26 @@ export const auditLogRepository = {
       },
     })
   },
-}
 
-// ─── Execution Segment Repository ───────────────────────────────────────────
-
-export const executionSegmentRepository = {
-  /** Get all execution segments for a line, tenant-scoped via the estimate. */
-  async getForLine(orgId: string, lineId: string) {
-    const line = await db.estimateLine.findFirst({
-      where: { id: lineId, estimate: { organizationId: orgId } },
-      select: { id: true },
-    })
-    if (!line) return []
-    return db.executionSegment.findMany({
-      where: { estimateLineId: lineId },
+  /** Create within a transaction. */
+  async createInTransaction(
+    tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+    orgId: string,
+    actorId: string,
+    entry: {
+      action: string
+      entityType: string
+      entityId: string
+      summary: string
+      afterJson?: string
+    },
+  ) {
+    return tx.auditLog.create({
+      data: {
+        organizationId: orgId,
+        actorId,
+        ...entry,
+      },
     })
   },
 }

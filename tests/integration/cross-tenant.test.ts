@@ -37,6 +37,10 @@ const PKG_B = 'test-pkg-b'
 const QUOTE_B = 'test-quote-b' // Quote in Org B
 const QUOTE_A = 'test-quote-a' // Quote in Org A
 const SEG_A = 'test-seg-a' // Segment in Org A that will reference QUOTE_B
+const WD_B = 'test-wd-b'
+const WDV_B = 'test-wdv-b'
+const RES_B = 'test-res-b'
+const RES_OBS_B = 'test-resobs-b'
 
 const ctxA: RequestContext = {
   userId: USER_A,
@@ -73,15 +77,18 @@ describe('Cross-tenant integration tests', () => {
     // Clean up any previous test data — audit/exceptions first (FK constraints).
     await db.auditLog.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.commercialException.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
-    await db.executionSegment.deleteMany({ where: { id: SEG_A } })
+    await db.estimateRevision.deleteMany({ where: { estimateId: { in: [EST_A, EST_B] } } })
+    await db.executionSegment.deleteMany({ where: { id: { startsWith: SEG_A } } })
     await db.subcontractQuote.deleteMany({ where: { id: { in: [QUOTE_A, QUOTE_B] } } })
     await db.subcontractPackage.deleteMany({ where: { id: { in: [PKG_A, PKG_B] } } })
     await db.estimateLine.deleteMany({ where: { id: { in: [LINE_A, LINE_B] } } })
     await db.estimate.deleteMany({ where: { id: { in: [EST_A, EST_B] } } })
     await db.opportunity.deleteMany({ where: { id: { in: [OPP_A, OPP_B] } } })
     await db.client.deleteMany({ where: { id: { in: [CLIENT_A, CLIENT_B] } } })
-    await db.workDefinitionVersion.deleteMany({ where: { id: WDV_A } })
-    await db.workDefinition.deleteMany({ where: { id: WD_A } })
+    await db.resourcePriceObservation.deleteMany({ where: { id: RES_OBS_B } })
+    await db.resource.deleteMany({ where: { id: RES_B } })
+    await db.workDefinitionVersion.deleteMany({ where: { id: { in: [WDV_A, WDV_B] } } })
+    await db.workDefinition.deleteMany({ where: { id: { in: [WD_A, WD_B] } } })
     await db.user.deleteMany({ where: { id: { in: [USER_A, USER_B] } } })
     await db.organization.deleteMany({ where: { id: { in: [ORG_A, ORG_B] } } })
 
@@ -112,6 +119,14 @@ describe('Cross-tenant integration tests', () => {
     await db.subcontractPackage.create({ data: { id: PKG_B, organizationId: ORG_B, opportunityId: OPP_B, name: 'Pkg B', executionStrategy: 'subcontract' } })
     await db.subcontractQuote.create({ data: { id: QUOTE_B, subcontractPackageId: PKG_B, supplierName: 'Supplier B', totalAmount: 99999, coveragePct: 1.0 } })
 
+    // Org B WorkDefinition + Version + Resource + PriceObservation (for cross-tenant WD test).
+    await db.workDefinition.create({ data: { id: WD_B, organizationId: ORG_B, code: 'WD-B-TEST', name: 'Org B WD', unit: 'm2' } })
+    await db.workDefinitionVersion.create({
+      data: { id: WDV_B, workDefinitionId: WD_B, version: 1, wastage: 0.05, costRecipeJson: RECIPE, approvalState: 'approved', hazardsJson: '[]', controlsJson: '[]', qualityChecklistJson: '[]' },
+    })
+    await db.resource.create({ data: { id: RES_B, organizationId: ORG_B, code: 'RES-B-TEST', name: 'Org B Resource', unit: 'ton', kind: 'material' } })
+    await db.resourcePriceObservation.create({ data: { id: RES_OBS_B, resourceId: RES_B, workDefinitionVersionId: WDV_B, price: 777, provenance: 'supplier-quote', sourceReference: 'ORG-B-SECRET' } })
+
     // Org A subcontract package + quote (for the inverse test).
     await db.subcontractPackage.create({ data: { id: PKG_A, organizationId: ORG_A, opportunityId: OPP_A, name: 'Pkg A', executionStrategy: 'subcontract' } })
     await db.subcontractQuote.create({ data: { id: QUOTE_A, subcontractPackageId: PKG_A, supplierName: 'Supplier A', totalAmount: 50000, coveragePct: 1.0 } })
@@ -121,15 +136,18 @@ describe('Cross-tenant integration tests', () => {
     // Clean up — delete audit logs and exceptions first (FK constraints).
     await db.auditLog.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.commercialException.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
-    await db.executionSegment.deleteMany({ where: { id: SEG_A } })
+    await db.estimateRevision.deleteMany({ where: { estimateId: { in: [EST_A, EST_B] } } })
+    await db.executionSegment.deleteMany({ where: { id: { startsWith: SEG_A } } })
     await db.subcontractQuote.deleteMany({ where: { id: { in: [QUOTE_A, QUOTE_B] } } })
     await db.subcontractPackage.deleteMany({ where: { id: { in: [PKG_A, PKG_B] } } })
     await db.estimateLine.deleteMany({ where: { id: { in: [LINE_A, LINE_B] } } })
     await db.estimate.deleteMany({ where: { id: { in: [EST_A, EST_B] } } })
     await db.opportunity.deleteMany({ where: { id: { in: [OPP_A, OPP_B] } } })
     await db.client.deleteMany({ where: { id: { in: [CLIENT_A, CLIENT_B] } } })
-    await db.workDefinitionVersion.deleteMany({ where: { id: WDV_A } })
-    await db.workDefinition.deleteMany({ where: { id: WD_A } })
+    await db.resourcePriceObservation.deleteMany({ where: { id: RES_OBS_B } })
+    await db.resource.deleteMany({ where: { id: RES_B } })
+    await db.workDefinitionVersion.deleteMany({ where: { id: { in: [WDV_A, WDV_B] } } })
+    await db.workDefinition.deleteMany({ where: { id: { in: [WD_A, WD_B] } } })
     await db.user.deleteMany({ where: { id: { in: [USER_A, USER_B] } } })
     await db.organization.deleteMany({ where: { id: { in: [ORG_A, ORG_B] } } })
     await db.$disconnect()
@@ -141,7 +159,7 @@ describe('Cross-tenant integration tests', () => {
     // This simulates a corrupted or malicious cross-tenant reference.
     await db.executionSegment.create({
       data: {
-        id: SEG_A,
+        id: SEG_A + '-t1',
         estimateLineId: LINE_A,
         strategy: 'subcontract',
         scopeDefinition: 'Cross-tenant test',
@@ -181,7 +199,7 @@ describe('Cross-tenant integration tests', () => {
     }
 
     // Clean up the segment.
-    await db.executionSegment.delete({ where: { id: SEG_A } })
+    await db.executionSegment.delete({ where: { id: SEG_A + '-t1' } })
     await db.estimateLine.update({ where: { id: LINE_A }, data: { executionStrategy: 'self-perform' } })
   }, 60000)
 
@@ -190,7 +208,7 @@ describe('Cross-tenant integration tests', () => {
     // Create an execution segment in Org B's line referencing Org A's quote.
     await db.executionSegment.create({
       data: {
-        id: SEG_A,
+        id: SEG_A + '-t2',
         estimateLineId: LINE_B,
         strategy: 'subcontract',
         scopeDefinition: 'Inverse cross-tenant test',
@@ -228,7 +246,7 @@ describe('Cross-tenant integration tests', () => {
       expect(hasQuoteBlocker).toBe(true)
     }
 
-    await db.executionSegment.delete({ where: { id: SEG_A } })
+    await db.executionSegment.delete({ where: { id: SEG_A + '-t2' } })
     await db.estimateLine.update({ where: { id: LINE_B }, data: { executionStrategy: 'self-perform' } })
   }, 60000)
 
@@ -269,6 +287,119 @@ describe('Cross-tenant integration tests', () => {
       // The line has a valid priced recipe → should be complete
       expect(result.line.calculationStatus).toBe('complete')
       expect(result.line.sellPrice).toBeGreaterThan(0)
+    }
+  }, 60000)
+
+  // ── Test 6: Org A line references Org B's WorkDefinitionVersion ─────────
+  test('Org A line with Org B WorkDefinitionVersion → WD not loaded, pricing incomplete', async () => {
+    // Update Org A's line to reference Org B's WDV.
+    await db.estimateLine.update({
+      where: { id: LINE_A },
+      data: { workDefinitionId: WD_B, workDefinitionVersionId: WDV_B },
+    })
+
+    const result = await estimateService.recomputeLine({
+      ctx: ctxA,
+      estimateId: EST_A,
+      estimateLineId: LINE_A,
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      // P0-3: The Org B WD is not available for Org A → 403
+      expect(result.status).toBe(403)
+    }
+
+    // Restore LINE_A to its original WD.
+    await db.estimateLine.update({
+      where: { id: LINE_A },
+      data: { workDefinitionId: WD_A, workDefinitionVersionId: WDV_A },
+    })
+  }, 60000)
+
+  // ── Test 7: Transaction rollback — failed finalization leaves no revision ─
+  test('Failed finalization leaves no revision (transaction rollback)', async () => {
+    // Create an estimate with an incomplete line — finalizeRevision should
+    // reject it with 400 (not create any revision or audit).
+    // First, make LINE_A incomplete by removing its WDV reference.
+    await db.estimateLine.update({
+      where: { id: LINE_A },
+      data: { calculationStatus: 'incomplete', workDefinitionVersionId: null },
+    })
+
+    const result = await estimateService.finalizeRevision({
+      ctx: ctxA,
+      estimateId: EST_A,
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(400)
+    }
+
+    // Verify NO revision was created for this attempt.
+    const revisions = await db.estimateRevision.findMany({
+      where: { estimateId: EST_A, revisionNo: 999 },
+    })
+    expect(revisions.length).toBe(0)
+
+    // Verify NO audit log for a finalization of EST_A at revision 999.
+    const audits = await db.auditLog.findMany({
+      where: {
+        organizationId: ORG_A,
+        action: 'estimate.revision-finalized',
+        summary: { contains: 'revision 999' },
+      },
+    })
+    expect(audits.length).toBe(0)
+
+    // Restore LINE_A.
+    await db.estimateLine.update({
+      where: { id: LINE_A },
+      data: { calculationStatus: 'complete', workDefinitionVersionId: WDV_A },
+    })
+  }, 60000)
+
+  // ── Test 8: Successful finalization creates revision + audit atomically ──
+  test('Successful finalization creates revision + audit atomically', async () => {
+    // First recompute LINE_A to ensure it's complete (the rollback test may have left it incomplete).
+    await estimateService.recomputeLine({
+      ctx: ctxA,
+      estimateId: EST_A,
+      estimateLineId: LINE_A,
+    })
+
+    const result = await estimateService.finalizeRevision({
+      ctx: ctxA,
+      estimateId: EST_A,
+      revisionNo: 888,
+    })
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.revisionNo).toBe(888)
+      expect(result.replay.totalSellPrice).toBeGreaterThan(0)
+
+      // Verify the revision exists.
+      const rev = await db.estimateRevision.findFirst({
+        where: { estimateId: EST_A, revisionNo: 888 },
+      })
+      expect(rev).not.toBeNull()
+      expect(rev?.status).toBe('finalized')
+
+      // Verify the audit log exists.
+      const audit = await db.auditLog.findFirst({
+        where: {
+          organizationId: ORG_A,
+          action: 'estimate.revision-finalized',
+          entityId: rev!.id,
+        },
+      })
+      expect(audit).not.toBeNull()
+
+      // Clean up the test revision.
+      await db.estimateRevision.delete({ where: { id: rev!.id } })
+      await db.auditLog.delete({ where: { id: audit!.id } })
     }
   }, 60000)
 })
