@@ -880,3 +880,33 @@ Stage Summary:
 - Quote selection is guarded by reconciliation thresholds.
 - State machine prevents illegal transitions.
 - Deployment pending Vercel rate-limit reset.
+
+---
+Task ID: subcontract-service-hardening
+Agent: principal-engineer
+Task: SubcontractService P0 hardening — transactional createScopeAtom + EstimateLine tenant ownership
+
+Work Log:
+- P0-1: createScopeAtom() is now transactional. Scope atom + audit wrapped in db.$transaction.
+  Added scopeAtomRepository.createForPackageInTransaction(). If audit INSERT fails,
+  scope atom INSERT is rolled back.
+- P0-2: EstimateLine tenant ownership enforced in package reads.
+  - Repository: estimateLine includes now load estimate.organizationId (Prisma doesn't
+    support `where` on 1:1 includes, so ownership check is in the service).
+  - Service: buildRequiredLines() checks estimate.organizationId === ctx.organizationId.
+    Cross-tenant estimateLines are treated as null; package flagged graphInconsistent=true.
+  - Workspace does NOT silently undercount required scope.
+- 18 integration tests (all passing):
+  Test 17: Cross-tenant EstimateLine → graphInconsistent=true, Org B sellPrice not used
+  Test 18: Scope atom transaction rollback → audit FK failure rolls back scope atom
+- 106 unit + 18 integration = 124 total, all passing.
+- Lint clean. Build succeeds.
+- Code pushed to GitHub at 83745ea.
+- Vercel deployment: BLOCKED by free-tier 100 deploy/day limit. Production at 5602946.
+
+Stage Summary:
+- SubcontractService now satisfies all P0 requirements:
+  * Transactional createScopeAtom (atomic with audit)
+  * EstimateLine tenant ownership in package reads (graphInconsistent flag)
+  * 18 real integration tests including rollback + cross-tenant EstimateLine
+- Ready to freeze SubcontractService once deployed.
