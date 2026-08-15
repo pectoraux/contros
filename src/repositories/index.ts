@@ -949,7 +949,7 @@ export const subcontractPackageLineRepository = {
 // Every method requires orgId — no unscoped access.
 // INVARIANT 12: Every organization is isolated.
 
-type PrismaTransaction = Parameters<Parameters<typeof dbTx.$transaction>[0]>[0]
+export type PrismaTransaction = Parameters<Parameters<typeof dbTx.$transaction>[0]>[0]
 
 export const bidRepository = {
   /**
@@ -1298,3 +1298,16 @@ export const tenderDeliverableRepository = {
     }
   },
 }
+
+// ─── Opportunity / Client / Scope Repositories ──────────────────────────────
+// Re-exported from a dedicated module to keep this barrel manageable.
+// All methods follow the same tenant-scoping convention (orgId first param).
+export {
+  clientRepository,
+  opportunityRepository,
+  scopePackageRepository,
+  scopeItemRepository,
+  scopeQuestionRepository,
+  scopeAssumptionRepository,
+  scopeEvidenceRepository,
+} from './opportunity-repositories'

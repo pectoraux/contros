@@ -1181,3 +1181,53 @@ Stage Summary:
   are explicit (revision-backed vs document-backed), not implicit.
 - Three frozen application services: EstimateService, SubcontractService, BidService.
 - Next: OpportunityService.
+
+---
+Task ID: opportunity-service-1
+Agent: principal-engineer
+Task: OpportunityService — application service for opportunity lifecycle, client management, and scope package operations
+
+Work Log:
+- Created src/repositories/opportunity-repositories.ts with 7 tenant-scoped repositories:
+  * clientRepository (list, get, create, createInTransaction)
+  * opportunityRepository (list, getDetail, get, create+auto-scope-package, update, updateStatus — all inTransaction)
+  * scopePackageRepository (getForOpportunity, recomputeCompletenessInTransaction)
+  * scopeItemRepository (create, update, delete — all inTransaction, verified via scopePackage→opportunity→org chain)
+  * scopeQuestionRepository (create, update — all inTransaction)
+  * scopeAssumptionRepository (create, acknowledge — all inTransaction)
+  * scopeEvidenceRepository (create — inTransaction)
+- Exported PrismaTransaction type from repositories/index.ts (was previously local).
+- Re-exported all 7 new repositories from repositories/index.ts (barrel pattern preserved).
+- Created src/application/opportunity-service.ts with 15 service methods:
+  * Clients: listClients, createClient
+  * Opportunities: listOpportunities, getOpportunityDetail, createOpportunity, updateOpportunity, transitionStatus
+  * Scope Items: addScopeItem, updateScopeItem, removeScopeItem
+  * Scope Questions: addScopeQuestion, clarifyScopeQuestion
+  * Assumptions: addAssumption, acknowledgeAssumption
+  * Evidence: addEvidence
+- Every scope item/question mutation recomputes scopePackage.completeness via the
+  pure computeScopeCompleteness engine and persists the float. This keeps the
+  cached completeness field in sync with reality — no existing service did this.
+- createOpportunity auto-creates a 1:1 ScopePackage (enforced by the repository).
+- Opportunity.status has a 13-state legal-transitions state machine
+  (received → qualifying → scope-development → estimating → ... → won/lost/withdrawn/lapsed).
+- Business rule: transitioning to 'estimating' requires at least one scope item
+  (don't start estimating an empty scope).
+- All mutations are transactional (dbTx.$transaction) with audit log entries.
+- No raw Prisma in the service — all access through tenant-scoped repositories.
+- Refactored /api/opportunities/route.ts and /api/opportunities/[id]/route.ts
+  to be thin adapters calling the service (removed 269 lines of inline Prisma).
+- 20 integration tests pass (cross-tenant, lifecycle, state machine, completeness
+  recompute, scope mutations, assumptions, evidence, detail retrieval).
+- 106 unit tests pass (including tenant-safety source-code audit).
+- Lint clean.
+
+Stage Summary:
+- OpportunityService is code-complete and tested. It establishes the canonical
+  representation of the initial problem:
+    RFQ received → client / project → scope package → scope completeness
+    → ready for estimating
+- The front half of the commercial workflow is now service-backed:
+    OpportunityService → Scope → EstimateService → SubcontractService → BidService
+- Four application services: EstimateService (FROZEN), SubcontractService (FROZEN),
+  BidService (FROZEN), OpportunityService (code-complete).
