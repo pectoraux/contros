@@ -1863,3 +1863,48 @@ Stage Summary:
 - All 35 fields are classified EXACT or EXPLAINABLE with 0 RECONSTRUCTION_ERROR.
 - The EXPLAINABLE classification proves the observed variance matches the expected
   wastage-correction diff within monetary tolerance.
+
+---
+Task ID: app-boundary-reconstruction
+Agent: principal-engineur
+Task: Layer 2 — application-boundary historical bid reconstruction
+
+What was built:
+- tests/integration/app-boundary-reconstruction.test.ts — NEW: 9 tests that
+  reconstruct a historical bid through the FULL application-service boundary.
+
+The test proves the frozen services can reconstruct a historical bid without
+bypassing them:
+  OpportunityService.createOpportunity()
+  → EstimateService.recomputeLine() (for each line)
+  → EstimateService.finalizeRevision()
+  → BidService.createBid()
+  → BidService.recordAdjudication()
+  → replayRevision(snapshot)
+  → compare DB state vs replay (EXACT match)
+
+Key result:
+- Step 7 proves DB state matches replay EXACTLY — 0 variance.
+  Both the service and the replay use the same (current, corrected) engine,
+  so there is no wastage-fix discrepancy. Every field matches:
+    sellPrice, unitRate, directCost, materialCost, labourCost,
+    plantCost, subcontractCost, feeCost.
+
+- Step 8 proves Bid.systemSellPrice matches replay.totalSellPrice,
+  and finalPrice = systemSellPrice × (1 + directorAdjustment).
+
+- Step 9 proves provenance is complete — every priced resource has
+  provenance entries, no unsourced resources.
+
+Tests Passed:
+- 9 application-boundary reconstruction tests (0 fail)
+- 147 unit tests (0 fail)
+- Lint clean
+
+Stage Summary:
+- Historical Bid Validation gate is now COMPLETE:
+    Layer 1 — historical DB snapshot → replay          ✅
+    Layer 2 — application services → revision → replay  ✅
+    Causal variance proof                               ✅
+    Synthetic matrix                                    ✅
+- Next gate: Contractor Workspace.
