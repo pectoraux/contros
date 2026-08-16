@@ -23,6 +23,32 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return res.json()
 }
 
+export async function apiPut<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }))
+    throw new Error(err.error || `Request failed: ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function apiPatch<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }))
+    throw new Error(err.error || `Request failed: ${res.status}`)
+  }
+  return res.json()
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface DashboardData {
@@ -81,15 +107,21 @@ export interface EstimateLine {
   quantity: number
   unit: string
   executionStrategy: string
+  calculationStatus: string
+  blockingInputs: unknown[]
   materialCost: number
   labourCost: number
   plantCost: number
   subcontractCost: number
+  feeCost: number
   directCost: number
   projectCost: number
   riskCost: number
   overheadCost: number
   profitCost: number
+  estimatedTotalCost: number
+  expectedProfit: number
+  expectedMarginPct: number
   sellPrice: number
   unitRate: number
   marginPct: number
@@ -99,6 +131,15 @@ export interface EstimateLine {
   unsourcedRationale: string | null
   unsourcedConfidence: number | null
   acknowledged: boolean
+  executionSegments: {
+    id: string
+    strategy: string
+    scopeDefinition: string
+    quantityPct: number
+    subcontractQuoteId: string | null
+    pricingBasis: string | null
+    quoteCoversSegmentScope: boolean
+  }[]
   scopeItem: { id: string; description: string; status: string } | null
   workDefinition: { id: string; code: string; name: string; unit: string } | null
   workDefinitionVersion: {
@@ -241,6 +282,8 @@ export interface OpportunityDetail {
     actor: string
     createdAt: string
   }[]
+  graphInconsistent?: boolean
+  inconsistencies?: { path: string; reason: string; entityId: string }[]
 }
 
 export interface WorkDefinitionItem {

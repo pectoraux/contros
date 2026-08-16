@@ -2,16 +2,16 @@ import { NextResponse } from 'next/server'
 import { requireAuth, authErrorResponse } from '@/lib/context'
 import { opportunityService } from '@/application/opportunity-service'
 
-// List opportunities with client + latest estimate value.
+// List all clients for the organization.
 // INVARIANT 12: scoped by ctx.organizationId (enforced by the service).
 export async function GET() {
   try {
     const ctx = await requireAuth()
-    const result = await opportunityService.listOpportunities({ ctx })
+    const result = await opportunityService.listClients({ ctx })
     if (!result.ok) {
       return NextResponse.json({ error: result.error }, { status: result.status })
     }
-    return NextResponse.json({ opportunities: result.opportunities })
+    return NextResponse.json({ clients: result.clients })
   } catch (e) {
     const authErr = authErrorResponse(e)
     if (authErr) return authErr
@@ -19,7 +19,7 @@ export async function GET() {
   }
 }
 
-// Create a new opportunity from an RFQ.
+// Create a new client.
 // The server resolves tenant context — the client never supplies organizationId.
 export async function POST(req: Request) {
   try {
@@ -28,21 +28,18 @@ export async function POST(req: Request) {
     if (!body) {
       return NextResponse.json({ error: 'Request body required' }, { status: 400 })
     }
-    const result = await opportunityService.createOpportunity({
+    const result = await opportunityService.createClient({
       ctx,
-      clientId: body.clientId,
-      title: body.title,
-      reference: body.reference,
-      source: body.source,
-      description: body.description,
-      submissionDeadline: body.submissionDeadline ? new Date(body.submissionDeadline) : null,
-      location: body.location,
-      ownerId: body.ownerId,
+      name: body.name,
+      contactName: body.contactName,
+      contactEmail: body.contactEmail,
+      contactPhone: body.contactPhone,
+      sector: body.sector,
     })
     if (!result.ok) {
       return NextResponse.json({ error: result.error }, { status: result.status })
     }
-    return NextResponse.json({ opportunityId: result.opportunityId }, { status: 201 })
+    return NextResponse.json({ clientId: result.clientId }, { status: 201 })
   } catch (e) {
     const authErr = authErrorResponse(e)
     if (authErr) return authErr

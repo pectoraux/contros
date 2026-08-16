@@ -1997,3 +1997,56 @@ Stage Summary:
     Real Estimate boundary                     ✅
     Real Bid boundary (createBid + adjudication) ✅  ← FINAL GAP CLOSED
 - Next gate: Contractor Workspace.
+
+---
+Task ID: contractor-workspace-phase1
+Agent: principal-engineer
+Task: Contractor Workspace Phase 1 — New Opportunity creation, blocked-pricing display, mobile nav, API helpers
+
+Repository Audit:
+- The workspace shell already exists: Zustand store, Sidebar, Header, Footer, 7 views, 10 opportunity tabs.
+- "New Opportunity" button in Header had no handler.
+- No mobile nav (Sidebar hidden on mobile).
+- No apiPut/apiPatch helpers.
+- EstimateTab did not display blocked pricing state (calculationStatus, blockingInputs).
+- EstimateLine type in api.ts was missing calculationStatus, blockingInputs, feeCost, estimatedTotalCost, expectedProfit, expectedMarginPct, executionSegments.
+
+Files Changed:
+- src/lib/api.ts — Added apiPut, apiPatch helpers. Extended EstimateLine type with calculationStatus, blockingInputs, feeCost, estimatedTotalCost, expectedProfit, expectedMarginPct, executionSegments. Extended OpportunityDetail with graphInconsistent, inconsistencies.
+- src/app/api/opportunities/route.ts — Added POST handler for opportunity creation via OpportunityService.
+- src/app/api/clients/route.ts — NEW: GET (list clients) + POST (create client) via OpportunityService.
+- src/components/workspace/NewOpportunityDialog.tsx — NEW: Dialog form for creating opportunities. Client selector with inline "New Client" creation. Fields: client, title, reference, source, deadline, location, description. Calls POST /api/opportunities, then navigates to the new opportunity workspace.
+- src/components/workspace/Header.tsx — Wired "New Opportunity" button to open the dialog.
+- src/components/workspace/Sidebar.tsx — Added mobile nav via Sheet component. Desktop sidebar unchanged. Mobile shows hamburger menu that opens a Sheet with the same nav content.
+- src/components/views/opportunity-tabs/EstimateTab.tsx — Added blocked-pricing display:
+  * Red "BLOCKED" badge on incomplete lines
+  * Blocking inputs listed inline (kind + detail)
+  * Authoritative financial fields (sellPrice, unitRate, directCost, margin) shown as "—" when blocked
+  * "No authoritative price" text instead of zero values
+  * "Why?" button hidden when blocked (no provenance to show for a zeroed price)
+  * Alert at top of estimate when any lines are blocked
+  * Row background tinted red for blocked lines
+
+Service/API Boundaries:
+- All new API routes are thin adapters calling frozen services:
+  * POST /api/opportunities → opportunityService.createOpportunity()
+  * GET/POST /api/clients → opportunityService.listClients() / createClient()
+- No business logic in React components.
+- No Prisma calls in components.
+- No pricing calculations in UI.
+- Tenant context resolved server-side via requireAuth().
+
+Tests:
+- 147 unit tests pass (0 fail)
+- Lint clean
+- Browser verification: dev server starts and serves the app. Full E2E browser verification was limited by sandbox process lifecycle (server killed between tool calls). The user can verify via the Preview Panel.
+
+Known Limitations:
+- The dev server does not persist across Bash tool calls in the sandbox. Browser verification should be done via the Preview Panel.
+- The OpportunityService POST route and clients route are new and don't have dedicated integration tests yet. The existing OpportunityService integration tests (31 tests) cover the service methods, and the API routes are thin adapters.
+- Programme tab still shows "coming in next phase" — not a fake Gantt.
+
+Next Steps:
+- Browser-verify the full E2E flow via the Preview Panel (login, dashboard, new opportunity dialog, opportunity workspace, estimate with blocked pricing).
+- Add integration tests for the new API routes (POST /api/opportunities, GET/POST /api/clients).
+- Continue improving the workspace surfaces (scope actions, document deliverables, bid workspace).

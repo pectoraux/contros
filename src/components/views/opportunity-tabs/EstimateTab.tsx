@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { apiPost } from '@/lib/api'
 import type { OpportunityDetail, EstimateLine } from '@/lib/api'
 import { formatGHS, formatPct, statusStyle, statusLabel, EXECUTION_STRATEGY_LABELS } from '@/lib/format'
@@ -18,7 +19,45 @@ import {
   AlertTriangle,
   ShieldCheck,
   TrendingUp,
+  Ban,
+  Eye,
 } from 'lucide-react'
+
+// Parse blocking inputs from JSON for display
+function parseBlockingInputs(line: EstimateLine): { kind: string; detail: string }[] {
+  try {
+    const parsed = line.blockingInputs
+    if (Array.isArray(parsed)) {
+      return parsed as { kind: string; detail: string }[]
+    }
+    return []
+  } catch {
+    return []
+  }
+}
+
+// Format blocking input kind for display
+function formatBlockerKind(kind: string): string {
+  const labels: Record<string, string> = {
+    'missing-price': 'Missing Price',
+    'missing-work-definition': 'Missing Work Definition',
+    'invalid-recipe': 'Invalid Recipe',
+    'missing-subcontract-quote': 'Missing Subcontract Quote',
+    'invalid-price-observation': 'Invalid Price',
+    'invalid-quantity': 'Invalid Quantity',
+    'invalid-wastage': 'Invalid Wastage',
+    'invalid-percentage': 'Invalid Percentage',
+    'invalid-hybrid-segment': 'Invalid Hybrid Segment',
+    'partial-subcontract-coverage': 'Partial Coverage',
+    'hybrid-missing-strategy': 'Hybrid Missing Strategy',
+    'uncovered-exposure-unknown': 'Unknown Exposure',
+    'segment-scope-not-covered': 'Scope Not Covered',
+    'missing-pricing-basis': 'Missing Pricing Basis',
+    'undecided-execution-strategy': 'Undecided Strategy',
+    'missing-hybrid-allocation': 'Missing Hybrid Allocation',
+  }
+  return labels[kind] ?? kind
+}
 
 export function EstimateTab({ opp, onReload }: { opp: OpportunityDetail; onReload: () => void }) {
   const estimate = opp.estimates[0]
@@ -60,6 +99,21 @@ export function EstimateTab({ opp, onReload }: { opp: OpportunityDetail; onReloa
 
   return (
     <div className="space-y-4">
+      {/* Blocked pricing alert */}
+      {(() => {
+        const blockedLines = estimate.lines.filter(l => l.calculationStatus === 'incomplete')
+        if (blockedLines.length === 0) return null
+        return (
+          <Alert variant="destructive">
+            <Ban className="h-4 w-4" />
+            <AlertDescription>
+              <strong>{blockedLines.length} line(s) are BLOCKED.</strong> Incomplete calculations have zero authoritative sell price.
+              Blocked lines cannot be committed to a finalized estimate revision. Resolve the blocking inputs or change the execution strategy.
+            </AlertDescription>
+          </Alert>
+        )
+      })()}
+
       {/* Summary cards */}
       <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
         <Card>
@@ -157,8 +211,11 @@ export function EstimateTab({ opp, onReload }: { opp: OpportunityDetail; onReloa
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {estimate.lines.map((line) => (
-                  <TableRow key={line.id} className="align-top">
+                {estimate.lines.map((line) => {
+                  const isBlocked = line.calculationStatus === 'incomplete'
+                  const blockers = parseBlockingInputs(line)
+                  return (
+                  <TableRow key={line.id} className={`align-top ${isBlocked ? 'bg-red-50/30' : ''}`}>
                     <TableCell>
                       <div className="flex flex-col gap-1">
                         <span className="text-sm font-medium leading-snug">{line.description}</span>
@@ -166,6 +223,12 @@ export function EstimateTab({ opp, onReload }: { opp: OpportunityDetail; onReloa
                           <Badge variant="outline" className="text-[10px]">
                             {EXECUTION_STRATEGY_LABELS[line.executionStrategy] ?? line.executionStrategy}
                           </Badge>
+                          {isBlocked && (
+                            <Badge variant="outline" className="text-[10px] bg-red-50 text-red-700 border-red-200">
+                              <Ban className="h-2.5 w-2.5 mr-0.5" />
+                              BLOCKED
+                            </Badge>
+                          )}
                           {line.isUnsourced && (
                             <Badge variant="outline" className="text-[10px] bg-amber-50 text-amber-700 border-amber-200">
                               <AlertTriangle className="h-2.5 w-2.5 mr-0.5" />
@@ -179,6 +242,16 @@ export function EstimateTab({ opp, onReload }: { opp: OpportunityDetail; onReloa
                             </Badge>
                           )}
                         </div>
+                        {isBlocked && blockers.length > 0 && (
+                          <div className="mt-1 space-y-0.5">
+                            {blockers.map((b, i) => (
+                              <div key={i} className="text-[10px] text-red-600 flex items-start gap-1">
+                                <AlertTriangle className="h-2.5 w-2.5 mt-0.5 shrink-0" />
+                                <span><strong>{formatBlockerKind(b.kind)}:</strong> {b.detail}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     </TableCell>
                     <TableCell>
@@ -199,13 +272,25 @@ export function EstimateTab({ opp, onReload }: { opp: OpportunityDetail; onReloa
                     <TableCell className="text-right font-mono text-sm">
                       {line.quantity.toLocaleString()} {line.unit}
                     </TableCell>
-                    <TableCell className="text-right font-mono text-sm">{formatGHS(line.directCost)}</TableCell>
-                    <TableCell className="text-right font-mono text-sm font-medium">
-                      {formatGHS(line.unitRate)}
-                      <span className="text-[10px] text-muted-foreground">/{line.unit}</span>
+                    <TableCell className={`text-right font-mono text-sm ${isBlocked ? 'text-muted-foreground/50 line-through' : ''}`}>
+                      {isBlocked ? '—' : formatGHS(line.directCost)}
                     </TableCell>
-                    <TableCell className="text-right font-mono text-sm font-semibold">{formatGHS(line.sellPrice)}</TableCell>
-                    <TableCell className="text-right font-mono text-xs">{formatPct(line.marginPct)}</TableCell>
+                    <TableCell className={`text-right font-mono text-sm font-medium ${isBlocked ? 'text-muted-foreground/50' : ''}`}>
+                      {isBlocked ? (
+                        <span className="text-red-600 text-xs font-normal">No authoritative price</span>
+                      ) : (
+                        <>
+                          {formatGHS(line.unitRate)}
+                          <span className="text-[10px] text-muted-foreground">/{line.unit}</span>
+                        </>
+                      )}
+                    </TableCell>
+                    <TableCell className={`text-right font-mono text-sm font-semibold ${isBlocked ? 'text-muted-foreground/50' : ''}`}>
+                      {isBlocked ? '—' : formatGHS(line.sellPrice)}
+                    </TableCell>
+                    <TableCell className={`text-right font-mono text-xs ${isBlocked ? 'text-muted-foreground/50' : ''}`}>
+                      {isBlocked ? '—' : formatPct(line.marginPct)}
+                    </TableCell>
                     <TableCell className="text-center">
                       <div className="flex flex-col items-center gap-1">
                         <div className="flex items-center gap-1">
@@ -221,16 +306,18 @@ export function EstimateTab({ opp, onReload }: { opp: OpportunityDetail; onReloa
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex items-center justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 px-2 text-[11px] gap-1"
-                          onClick={() => openProvenance(line.id)}
-                          title="Why this price?"
-                        >
-                          <HelpCircle className="h-3 w-3" />
-                          Why?
-                        </Button>
+                        {!isBlocked && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 px-2 text-[11px] gap-1"
+                            onClick={() => openProvenance(line.id)}
+                            title="Why this price?"
+                          >
+                            <HelpCircle className="h-3 w-3" />
+                            Why?
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -254,7 +341,8 @@ export function EstimateTab({ opp, onReload }: { opp: OpportunityDetail; onReloa
                       </div>
                     </TableCell>
                   </TableRow>
-                ))}
+                  )
+                })}
               </TableBody>
             </Table>
           </div>

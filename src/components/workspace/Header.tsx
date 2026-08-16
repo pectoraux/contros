@@ -1,5 +1,6 @@
 'use client'
 
+import { useState } from 'react'
 import { signOut } from 'next-auth/react'
 import { useWorkspace } from '@/store/workspace'
 import { Button } from '@/components/ui/button'
@@ -13,6 +14,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { NewOpportunityDialog } from '@/components/workspace/NewOpportunityDialog'
 import { Sparkles, ChevronLeft, Plus, LogOut, User as UserIcon } from 'lucide-react'
 import { formatDate } from '@/lib/format'
 import { toast } from 'sonner'
@@ -41,6 +43,7 @@ export function Header({ user }: { user: CurrentUser }) {
   const opportunityId = useWorkspace((s) => s.opportunityId)
   const closeOpportunity = useWorkspace((s) => s.closeOpportunity)
   const openAiPanel = useWorkspace((s) => s.openAiPanel)
+  const [showNewOpp, setShowNewOpp] = useState(false)
 
   const meta = VIEW_TITLES[view]
   const today = new Date()
@@ -81,10 +84,11 @@ export function Header({ user }: { user: CurrentUser }) {
           <Sparkles className="h-4 w-4" />
           <span className="hidden sm:inline">Ask Assistant</span>
         </Button>
-        <Button size="sm" className="gap-2">
+        <Button size="sm" className="gap-2" onClick={() => setShowNewOpp(true)}>
           <Plus className="h-4 w-4" />
           <span className="hidden sm:inline">New Opportunity</span>
         </Button>
+        <NewOpportunityDialog open={showNewOpp} onOpenChange={setShowNewOpp} />
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button className="flex items-center gap-2 rounded-full hover:bg-muted/50 p-0.5 pr-2 transition-colors">
