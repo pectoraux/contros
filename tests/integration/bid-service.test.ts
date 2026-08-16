@@ -51,7 +51,17 @@ describe('BidService integration tests', () => {
     await db.commercialException.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.tenderDeliverable.deleteMany({ where: { bid: { organizationId: { in: [ORG_A, ORG_B] } } } })
     await db.bid.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+    // SubcontractPackage cascade — must precede opportunity delete (FK RESTRICT).
+    // The bid/estimate services create SubcontractPackages + quotes during tests;
+    // without this cleanup, leftover rows from a prior run block opportunity delete.
+    await db.quoteScopeCoverage.deleteMany({ where: { quote: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
+    await db.subcontractQuoteLine.deleteMany({ where: { quote: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
+    await db.scopeAtom.deleteMany({ where: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
+    await db.subcontractQuote.deleteMany({ where: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
+    await db.subcontractPackageLine.deleteMany({ where: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
+    await db.subcontractPackage.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } }).catch(() => {})
     await db.estimateRevision.deleteMany({ where: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } })
+    await db.executionSegment.deleteMany({ where: { estimateLine: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
     await db.estimateLine.deleteMany({ where: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } })
     await db.estimate.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.opportunity.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
@@ -82,7 +92,15 @@ describe('BidService integration tests', () => {
     await db.commercialException.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.tenderDeliverable.deleteMany({ where: { bid: { organizationId: { in: [ORG_A, ORG_B] } } } })
     await db.bid.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
+    // SubcontractPackage cascade — must precede opportunity delete (FK RESTRICT).
+    await db.quoteScopeCoverage.deleteMany({ where: { quote: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
+    await db.subcontractQuoteLine.deleteMany({ where: { quote: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
+    await db.scopeAtom.deleteMany({ where: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
+    await db.subcontractQuote.deleteMany({ where: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
+    await db.subcontractPackageLine.deleteMany({ where: { subcontractPackage: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
+    await db.subcontractPackage.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } }).catch(() => {})
     await db.estimateRevision.deleteMany({ where: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } })
+    await db.executionSegment.deleteMany({ where: { estimateLine: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } } }).catch(() => {})
     await db.estimateLine.deleteMany({ where: { estimate: { organizationId: { in: [ORG_A, ORG_B] } } } })
     await db.estimate.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })
     await db.opportunity.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } })

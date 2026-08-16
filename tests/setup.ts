@@ -18,13 +18,21 @@
 //
 // WHAT THIS DOES
 // This file is registered as a Bun preload (see bunfig.toml) so it runs
-// BEFORE any test module imports `@/lib/db`. It explicitly establishes the
-// PostgreSQL test database URL with a strict, auditable precedence:
+// BEFORE any test module imports `@/lib/db`. It establishes the PostgreSQL
+// test database URL with a strict, auditable policy:
 //
-//   1. TEST_DATABASE_URL        — explicit, dedicated test DB (CI / Neon branch)
-//   2. .env DATABASE_URL        — parsed directly from the .env FILE, NOT the
-//                                 shell, so an inherited SQLite value can never
-//                                 win.
+//   CI (process.env.CI === 'true' or '1'):
+//     TEST_DATABASE_URL is MANDATORY. There is NO fallback. Integration tests
+//     in CI must run against a dedicated test database — never silently
+//     against the application/shared development Neon database, even if .env
+//     happens to be present. This is the architectural standard.
+//
+//   local (no CI env):
+//     1. TEST_DATABASE_URL      — explicit dedicated test DB (preferred).
+//     2. .env DATABASE_URL      — convenience fallback for local dev only,
+//                                  parsed directly from the .env FILE, NOT
+//                                  the shell, so an inherited SQLite value
+//                                  can never win.
 //
 // It validates that the resolved URL is postgresql:// (or postgres://) and
 // fails loudly otherwise. It never falls back to a non-postgres shell value.
@@ -81,18 +89,41 @@ function redact(url: string): string {
 
 const dotenv = parseEnvFile(resolve(process.cwd(), '.env'))
 
-// Resolve the test database URL with strict precedence.
-const testUrl =
-  process.env.TEST_DATABASE_URL || dotenv.DATABASE_URL || undefined
+// CI detection — virtually every CI provider (Vercel, GitHub Actions, etc.)
+// sets CI=true. In CI we REQUIRE a dedicated test database; .env is NOT a
+// fallback, so destructive integration tests can never silently run against
+// the application/shared development database.
+const isCI =
+  process.env.CI === 'true' || process.env.CI === '1' || process.env.CI === 1
+
+// TEST_DATABASE_URL is always the preferred source.
+const explicitTestUrl = process.env.TEST_DATABASE_URL || undefined
+
+// .env DATABASE_URL is a LOCAL-DEV convenience fallback ONLY. Never used in CI.
+const dotenvUrl = !isCI ? dotenv.DATABASE_URL || undefined : undefined
+
+const testUrl = explicitTestUrl || dotenvUrl || undefined
 
 const testDirectUrl =
   process.env.TEST_DIRECT_DATABASE_URL ||
-  dotenv.DIRECT_DATABASE_URL ||
+  (!isCI ? dotenv.DIRECT_DATABASE_URL || undefined : undefined) ||
   testUrl ||
   undefined
 
 if (!testUrl) {
   // Fail loudly — never silently run against nothing or against a SQLite shell value.
+  if (isCI) {
+    console.error(
+      '\n[FATAL tests/setup.ts] CI environment detected, but TEST_DATABASE_URL is not set.\n' +
+        'In CI, a DEDICATED PostgreSQL test database is MANDATORY (architectural standard).\n' +
+        'The .env application DATABASE_URL is intentionally NOT used as a fallback in CI,\n' +
+        'so destructive integration tests can never silently run against the shared\n' +
+        'development database. Set TEST_DATABASE_URL (and TEST_DIRECT_DATABASE_URL) in CI.\n',
+    )
+    throw new Error(
+      'TEST_DATABASE_URL is required in CI. See tests/setup.ts for the policy.',
+    )
+  }
   console.error(
     '\n[FATAL tests/setup.ts] No PostgreSQL test database URL could be resolved.\n' +
       'Set TEST_DATABASE_URL (preferred, dedicated test DB) or ensure .env contains DATABASE_URL.\n' +
@@ -121,10 +152,13 @@ if (!isPostgresUrl(testUrl)) {
 process.env.DATABASE_URL = testUrl
 process.env.DIRECT_DATABASE_URL = testDirectUrl
 
-// Visible confirmation on every test run — proves which DB the suite used.
+// Visible confirmation on every test run — proves which DB + policy applied.
+const sourceLabel = explicitTestUrl
+  ? isCI
+    ? 'TEST_DATABASE_URL (CI — dedicated test DB, mandatory)'
+    : 'TEST_DATABASE_URL (local — dedicated test DB)'
+  : '.env DATABASE_URL (local-dev fallback)'
 console.log(
   `[tests/setup] PostgreSQL test database established: ${redact(testUrl)}` +
-    (process.env.TEST_DATABASE_URL
-      ? '  (source: TEST_DATABASE_URL — dedicated test DB)'
-      : '  (source: .env DATABASE_URL)'),
+    `  (source: ${sourceLabel})`,
 )
