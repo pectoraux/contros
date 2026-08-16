@@ -1523,3 +1523,48 @@ Stage Summary:
 - Six application services: EstimateService (FROZEN), SubcontractService (FROZEN),
   BidService (FROZEN), OpportunityService (FROZEN), DocumentService (FROZEN),
   KnowledgeService (FROZEN).
+
+---
+Task ID: knowledge-service-fix
+Agent: principal-engineer
+Task: KnowledgeService final corrections — unapproved-rate detection + crew-day productivity
+
+Work Log:
+- FIX 1: Unapproved-rate detector now scans actual EstimateLine → WDV references.
+  * Created workDefinitionVersionRepository.findUnapprovedVersionsReferencedByEstimateLines(orgId)
+    — loads all estimate lines with workDefinitionVersionId, includes WDV + WD, filters
+    to those whose WDV.approvalState !== 'approved'.
+  * Replaced the broad "scan all WDVs" approach in generateHealthAlerts with this
+    precise detector. An unused draft WDV no longer generates a false-positive
+    blocker — only WDVs actively referenced by estimate lines are flagged.
+  * 2 adversarial tests:
+    - "does NOT alert on unused draft WDV (no EstimateLine reference)" — PASS
+    - "DOES alert on draft WDV referenced by EstimateLine" — PASS (creates real
+      opportunity + estimate + line referencing the draft WDV, verifies blocker)
+
+- FIX 2: Productivity calculation now uses crew-day semantics.
+  * Changed from: actualProductivity = quantityCompleted / daysTaken
+    to: actualProductivity = quantityCompleted / (daysTaken × crewSize)
+  * This matches the master prompt's definition: quantity / crew-day.
+  * Example from reviewer: 120 m², 4 days, 3-person crew → 10 m²/crew-day
+    (was incorrectly 30 m²/day).
+  * Updated existing test expectations + added dedicated test:
+    "recordProductivityObservation uses crew-day calculation (quantity / days × crewSize)"
+    — verifies 120 m², 4 days, 3 crew → 10 m²/crew-day, variance = 0 (on target).
+
+- Updated the productivity variance test with corrected numbers:
+  120 m², 3 days, 4 crew → 10 m²/crew-day vs 50 planned = -80% variance (blocker).
+
+Verification:
+- 39 integration tests pass (0 fail) — 37 previous + 2 new (unused draft + crew-day).
+- 106 unit tests pass (0 fail).
+- Lint clean.
+
+Stage Summary:
+- Both reviewer-identified bugs fixed:
+  * Unapproved-rate detection now operates on actual commercial usage (EstimateLine → WDV).
+  * Productivity calculation uses crew-day semantics (quantity / days × crewSize).
+- KnowledgeService is now FROZEN.
+- Six application services: EstimateService (FROZEN), SubcontractService (FROZEN),
+  BidService (FROZEN), OpportunityService (FROZEN), DocumentService (FROZEN),
+  KnowledgeService (FROZEN).

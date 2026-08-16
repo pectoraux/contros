@@ -824,23 +824,12 @@ export const knowledgeService = {
       }
     }
 
-    // 2. Unapproved rates: load all WDVs that are referenced by estimate lines
-    //    but are not approved. For now, we scan all WDVs in the org.
+    // 2. Unapproved rates: load EstimateLines that reference non-approved WDVs.
+    //    This scans ACTUAL commercial usage (EstimateLine → WDV), not all WDVs.
+    //    An unused draft WDV does NOT generate an alert — only one that is
+    //    actively used in an estimate.
     const wds = await workDefinitionRepository.listForOrganization(ctx.organizationId)
-    const unapprovedRateInputs = []
-    for (const wd of wds) {
-      for (const v of wd.versions) {
-        if (v.approvalState !== 'approved' && v.approvalState !== 'deprecated') {
-          unapprovedRateInputs.push({
-            estimateLineId: 'n/a', // we don't have the line link here; this is a WD-level scan
-            workDefinitionVersionId: v.id,
-            workDefinitionCode: wd.code,
-            workDefinitionName: wd.name,
-            approvalState: v.approvalState,
-          })
-        }
-      }
-    }
+    const unapprovedRateInputs = await workDefinitionVersionRepository.findUnapprovedVersionsReferencedByEstimateLines(ctx.organizationId)
 
     // 3. Productivity variance: load all productivity observations
     const productivityObs = await productivityObservationRepository.listForOrganization(ctx.organizationId)

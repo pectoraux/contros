@@ -267,6 +267,60 @@ export const workDefinitionVersionRepository = {
       orderBy: { version: 'desc' },
     })
   },
+
+  /**
+   * Find unapproved WorkDefinitionVersions that are ACTUALLY REFERENCED by
+   * EstimateLines in this organization. This is the precise detector for
+   * the "unapproved-rate" knowledge-health alert — it does NOT flag unused
+   * draft WDVs, only ones that are actively used in commercial estimates.
+   *
+   * Tenant-scoped: only loads estimate lines + WDVs belonging to this org.
+   *
+   * Returns a list of { estimateLineId, workDefinitionVersionId, workDefinitionCode,
+   * workDefinitionName, approvalState } for each line referencing a non-approved WDV.
+   */
+  async findUnapprovedVersionsReferencedByEstimateLines(orgId: string) {
+    // Load all estimate lines in the org that have a workDefinitionVersionId,
+    // including the WDV + WD (tenant-scoped via estimate → org).
+    const lines = await db.estimateLine.findMany({
+      where: {
+        estimate: { organizationId: orgId },
+        workDefinitionVersionId: { not: null },
+      },
+      include: {
+        workDefinitionVersion: {
+          include: {
+            workDefinition: true,
+          },
+        },
+      },
+    })
+
+    // Filter to lines whose WDV is not approved
+    const unapproved: Array<{
+      estimateLineId: string
+      workDefinitionVersionId: string
+      workDefinitionCode: string
+      workDefinitionName: string
+      approvalState: string
+    }> = []
+    for (const line of lines) {
+      const wdv = line.workDefinitionVersion
+      // Skip if the WDV doesn't belong to this org (cross-tenant guard —
+      // the include filter should have already excluded it, but double-check)
+      if (!wdv || wdv.workDefinition.organizationId !== orgId) continue
+      if (wdv.approvalState !== 'approved') {
+        unapproved.push({
+          estimateLineId: line.id,
+          workDefinitionVersionId: wdv.id,
+          workDefinitionCode: wdv.workDefinition.code,
+          workDefinitionName: wdv.workDefinition.name,
+          approvalState: wdv.approvalState,
+        })
+      }
+    }
+    return unapproved
+  },
 }
 
 // ─── Resource Repository ────────────────────────────────────────────────────
@@ -497,9 +551,17 @@ export const productivityObservationRepository = {
     })
     if (!wdv) return null
 
-    // Compute actual productivity and variance
-    const actualProductivity = data.daysTaken > 0
-      ? data.quantityCompleted / data.daysTaken
+    // Compute actual productivity and variance.
+    //
+    // Productivity is defined as: quantity / crew-day
+    //   crew-days = daysTaken × crewSize
+    //
+    // Example: 120 m², 4 days, 3-person crew → 120 / (4×3) = 10 m²/crew-day
+    // (NOT 30 m²/day — the crewSize must be included so that productivity
+    // is comparable across different crew sizes.)
+    const crewDays = data.daysTaken * data.crewSize
+    const actualProductivity = crewDays > 0
+      ? data.quantityCompleted / crewDays
       : 0
     const variancePct = data.plannedProductivity > 0
       ? (actualProductivity - data.plannedProductivity) / data.plannedProductivity

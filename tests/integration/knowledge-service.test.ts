@@ -721,8 +721,10 @@ describe('KnowledgeService integration tests', () => {
     })
     if (!vResult.ok) return
 
-    // Record: 100 m2 completed in 3 crew-days → 33.3 m2/day (planned 50)
-    // variance = (33.33 - 50) / 50 = -0.333 (worse than planned)
+    // Record: 100 m2 completed in 3 days with 5-person crew
+    // crew-days = 3 × 5 = 15 crew-days
+    // actualProductivity = 100 / 15 = 6.67 m2/crew-day (planned 50)
+    // variance = (6.67 - 50) / 50 = -0.867 (much worse than planned)
     const result = await knowledgeService.recordProductivityObservation({
       ctx: ctxA, workDefinitionVersionId: vResult.versionId,
       quantityCompleted: 100, daysTaken: 3, crewSize: 5,
@@ -737,10 +739,41 @@ describe('KnowledgeService integration tests', () => {
     const obs = await db.productivityObservation.findUnique({
       where: { id: result.observationId },
     })
-    expect(obs?.actualProductivity).toBeCloseTo(100 / 3, 2)
+    expect(obs?.actualProductivity).toBeCloseTo(100 / (3 * 5), 2) // 100 / 15 crew-days = 6.67
     expect(obs?.plannedProductivity).toBe(50)
     expect(obs?.organizationId).toBe(ORG_A)
     expect(obs?.recordedById).toBe(USER_A)
+  }, 30000)
+
+  test('recordProductivityObservation uses crew-day calculation (quantity / days × crewSize)', async () => {
+    // P0 fix: productivity = quantity / (days × crewSize), NOT quantity / days.
+    // Example from reviewer: 120 m², 4 days, 3-person crew → 10 m²/crew-day (NOT 30 m²/day)
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-CREW-001', name: 'Crew-Day Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+    const vResult = await knowledgeService.createVersion({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      costRecipeJson: '[]', productivityRule: 10, // 10 m2/crew-day
+    })
+    if (!vResult.ok) return
+
+    // 120 m2, 4 days, 3-person crew → crew-days = 12, actual = 120/12 = 10
+    const result = await knowledgeService.recordProductivityObservation({
+      ctx: ctxA, workDefinitionVersionId: vResult.versionId,
+      quantityCompleted: 120, daysTaken: 4, crewSize: 3,
+      plannedProductivity: 10,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const obs = await db.productivityObservation.findUnique({
+      where: { id: result.observationId },
+    })
+    // actualProductivity = 120 / (4 × 3) = 10 m²/crew-day
+    expect(obs?.actualProductivity).toBeCloseTo(10, 2)
+    // variance = (10 - 10) / 10 = 0 (on target)
+    expect(obs?.variancePct).toBeCloseTo(0, 2)
   }, 30000)
 
   // ── Knowledge health engine ──────────────────────────────────────────────
@@ -774,17 +807,65 @@ describe('KnowledgeService integration tests', () => {
     expect(matching?.severity).toBe('warning')
   }, 30000)
 
-  test('generateHealthAlerts detects unapproved rates', async () => {
-    // Create a WD with a draft version (not approved)
+  test('generateHealthAlerts does NOT alert on unused draft WDV (no EstimateLine reference)', async () => {
+    // Create a WD with a draft version (not approved) but NO estimate line referencing it.
+    // This should NOT generate an unapproved-rate alert — the detector scans
+    // actual EstimateLine → WDV usage, not all WDVs.
     const wdResult = await knowledgeService.createWorkDefinition({
-      ctx: ctxA, code: 'WD-UNAPP-001', name: 'Unapproved Rate Test', unit: 'm2',
+      ctx: ctxA, code: 'WD-UNUSED-001', name: 'Unused Draft WD', unit: 'm2',
     })
     if (!wdResult.ok) return
     await knowledgeService.createVersion({
       ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
       costRecipeJson: '[]',
     })
-    // Version is draft — not approved
+    // Version is draft — but NOT referenced by any estimate line.
+
+    const result = await knowledgeService.generateHealthAlerts({ ctx: ctxA, persist: false })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const matching = result.alerts.find(
+      (a) => a.type === 'unapproved-rate' && a.title.includes('WD-UNUSED-001'),
+    )
+    expect(matching).toBeUndefined() // no alert for unused draft
+  }, 30000)
+
+  test('generateHealthAlerts DOES alert on draft WDV referenced by EstimateLine', async () => {
+    // Create a WD + draft version, then create an estimate line that references it.
+    // This SHOULD generate an unapproved-rate blocker.
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-USED-001', name: 'Used Draft WD', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+    const vResult = await knowledgeService.createVersion({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      costRecipeJson: '[]',
+    })
+    if (!vResult.ok) return
+
+    // Create an opportunity + estimate + estimate line referencing this draft WDV
+    const client = await db.client.create({
+      data: { organizationId: ORG_A, name: 'Test Client UNAPP' },
+    })
+    const opp = await db.opportunity.create({
+      data: { organizationId: ORG_A, clientId: client.id, title: 'UNAPP Test Opp', status: 'estimating' },
+    })
+    await db.scopePackage.create({ data: { opportunityId: opp.id, completeness: 0, origin: 'rfq' } })
+    const estimate = await db.estimate.create({
+      data: { organizationId: ORG_A, opportunityId: opp.id, status: 'draft' },
+    })
+    await db.estimateLine.create({
+      data: {
+        estimateId: estimate.id,
+        workDefinitionId: wdResult.workDefinitionId,
+        workDefinitionVersionId: vResult.versionId,
+        description: 'Line referencing draft WDV',
+        quantity: 100, unit: 'm2',
+        executionStrategy: 'self-perform',
+        calculationStatus: 'complete',
+      },
+    })
 
     const result = await knowledgeService.generateHealthAlerts({ ctx: ctxA, persist: false })
     expect(result.ok).toBe(true)
@@ -792,10 +873,17 @@ describe('KnowledgeService integration tests', () => {
 
     const unapprovedAlerts = result.alerts.filter((a) => a.type === 'unapproved-rate')
     expect(unapprovedAlerts.length).toBeGreaterThan(0)
-    const matching = unapprovedAlerts.find((a) => a.title.includes('WD-UNAPP-001'))
+    const matching = unapprovedAlerts.find((a) => a.title.includes('WD-USED-001'))
     expect(matching).toBeDefined()
     expect(matching?.severity).toBe('blocker')
-  }, 30000)
+
+    // Cleanup
+    await db.estimateLine.deleteMany({ where: { estimateId: estimate.id } })
+    await db.estimate.deleteMany({ where: { id: estimate.id } })
+    await db.scopePackage.deleteMany({ where: { opportunityId: opp.id } })
+    await db.opportunity.deleteMany({ where: { id: opp.id } })
+    await db.client.deleteMany({ where: { id: client.id } })
+  }, 45000)
 
   test('generateHealthAlerts detects productivity variance', async () => {
     const wdResult = await knowledgeService.createWorkDefinition({
@@ -808,10 +896,12 @@ describe('KnowledgeService integration tests', () => {
     })
     if (!vResult.ok) return
 
-    // Record an observation with 30% variance (blocker threshold is 25%)
+    // Record an observation with >25% variance (blocker threshold).
+    // 120 m2, 3 days, 4-person crew → crew-days = 12
+    // actual = 120/12 = 10 m2/crew-day vs 50 planned = -80% variance (blocker)
     await knowledgeService.recordProductivityObservation({
       ctx: ctxA, workDefinitionVersionId: vResult.versionId,
-      quantityCompleted: 70, daysTaken: 2, crewSize: 4, // 35 m2/day vs 50 planned = -30%
+      quantityCompleted: 120, daysTaken: 3, crewSize: 4, // 10 m2/crew-day vs 50 planned = -80%
       plannedProductivity: 50,
     })
 
