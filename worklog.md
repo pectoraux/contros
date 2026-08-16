@@ -2089,3 +2089,53 @@ Architecture boundary now correct:
   API Route → ContractorDashboardService → dashboardRepository → Prisma
 
 Next: Scope tab enhancements, then Bid Readiness gate.
+
+---
+Task ID: scope-readiness
+Agent: principal-engineur
+Task: Scope Workspace + Bid Readiness Gate — application services, repositories, routes, tests
+
+What was built:
+- src/repositories/scope-workspace-repository.ts — 6 tenant-aware methods:
+  getScopePackage, getScopeItemsWithEstimateLinks, countUnmappedScopeItems,
+  countMissingScopeItems, countOpenQuestions, countUnacknowledgedHighRiskAssumptions
+- src/repositories/bid-readiness-repository.ts — 4 tenant-aware methods:
+  getEstimateLineStatuses, getTenderDeliverables, getUnacknowledgedAlerts, getScopeSummary
+- src/application/scope-workspace-service.ts — getScopeWorkspace() returns:
+  completenessPct, totalItems, knownItems, missingItems, ambiguousItems,
+  openQuestions, unacknowledgedHighRiskAssumptions, blockers[], items[]
+- src/application/bid-readiness-service.ts — getReadiness() returns:
+  ready (boolean), score {scope, pricing, documents, knowledge}, blockers[]
+  CRITICAL: Uses calculationStatus === 'complete' for pricing readiness,
+  NOT sellPrice > 0. The frozen PricingEngine boundary guarantees incomplete
+  calculations have zeroed authoritative fields.
+- src/app/api/opportunities/[id]/scope-workspace/route.ts — thin adapter
+- src/app/api/opportunities/[id]/readiness/route.ts — thin adapter
+- Re-exported both repositories from barrel.
+
+Tests added (13 integration tests):
+- Scope workspace returns mapped items with completeness
+- Scope workspace detects blockers (MISSING_QUANTITY, OPEN_QUESTION, UNACKNOWLEDGED_HIGH_RISK_ASSUMPTION)
+- Scope workspace tenant isolation
+- Bid readiness returns ready=false for incomplete opportunity
+- Bid readiness detects blocked pricing (calculationStatus, NOT sellPrice)
+- Bid readiness detects incomplete scope
+- Bid readiness detects missing documents (no bid → no deliverables)
+- Bid readiness tenant isolation
+- Bid readiness for complete Org B opportunity returns high scope score
+- Architecture audit: scope-workspace-service has zero db.* calls
+- Architecture audit: bid-readiness-service has zero db.* calls
+- Architecture audit: scope-workspace route has zero db.* calls
+- Architecture audit: readiness route has zero db.* calls
+
+Tests Passed:
+- 13 scope + readiness integration tests (0 fail)
+- 147 unit tests (0 fail)
+- Lint clean
+
+Architecture boundary correct:
+  Route → Service → Repository → Prisma
+  No raw Prisma in routes or services.
+  Pricing readiness uses calculationStatus, NOT sellPrice.
+
+Next: UI enhancements (Scope tab + readiness display in workspace header).

@@ -1339,3 +1339,9 @@ export {
 // ─── Dashboard Repository ───────────────────────────────────────────────────
 // Re-exported from a dedicated module. Tenant-scoped via organizationId.
 export { dashboardRepository } from './dashboard-repository'
+
+// ─── Scope Workspace Repository ─────────────────────────────────────────────
+export { scopeWorkspaceRepository } from './scope-workspace-repository'
+
+// ─── Bid Readiness Repository ───────────────────────────────────────────────
+export { bidReadinessRepository } from './bid-readiness-repository'
