@@ -24,11 +24,11 @@ const OPP_A = 'test-doc-opp-a'
 const OPP_B = 'test-doc-opp-b'
 
 const ctxA: RequestContext = {
-  userId: USER_A, organizationId: ORG_A, role: 'estimator', isDemo: false,
+  userId: USER_A, organizationId: ORG_A, role: 'estimator', isDemo: false, actorType: 'human',
   name: 'Test User A', email: 'a@doc-test.com',
 }
 const ctxB: RequestContext = {
-  userId: USER_B, organizationId: ORG_B, role: 'estimator', isDemo: false,
+  userId: USER_B, organizationId: ORG_B, role: 'estimator', isDemo: false, actorType: 'human',
   name: 'Test User B', email: 'b@doc-test.com',
 }
 

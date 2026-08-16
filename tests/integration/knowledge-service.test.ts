@@ -20,17 +20,19 @@ const USER_A = 'test-kn-user-a'
 const USER_B = 'test-kn-user-b'
 
 const ctxA: RequestContext = {
-  userId: USER_A, organizationId: ORG_A, role: 'estimator', isDemo: false,
+  userId: USER_A, organizationId: ORG_A, role: 'estimator', isDemo: false, actorType: 'human',
   name: 'Test User A', email: 'a@kn-test.com',
 }
 const ctxB: RequestContext = {
-  userId: USER_B, organizationId: ORG_B, role: 'estimator', isDemo: false,
+  userId: USER_B, organizationId: ORG_B, role: 'estimator', isDemo: false, actorType: 'human',
   name: 'Test User B', email: 'b@kn-test.com',
 }
 
 describe('KnowledgeService integration tests', () => {
   beforeAll(async () => {
     // Clean up any leftover data
+    await db.calibrationProposal.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } }).catch(() => {})
+    await db.productivityObservation.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } }).catch(() => {})
     await db.resourcePriceObservation.deleteMany({ where: { resource: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
     await db.knowledgeAlert.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } }).catch(() => {})
     await db.workDefinitionVersion.deleteMany({ where: { workDefinition: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
@@ -48,6 +50,8 @@ describe('KnowledgeService integration tests', () => {
   }, 120000)
 
   afterAll(async () => {
+    await db.calibrationProposal.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } }).catch(() => {})
+    await db.productivityObservation.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } }).catch(() => {})
     await db.resourcePriceObservation.deleteMany({ where: { resource: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
     await db.knowledgeAlert.deleteMany({ where: { organizationId: { in: [ORG_A, ORG_B] } } }).catch(() => {})
     await db.workDefinitionVersion.deleteMany({ where: { workDefinition: { organizationId: { in: [ORG_A, ORG_B] } } } }).catch(() => {})
@@ -60,6 +64,8 @@ describe('KnowledgeService integration tests', () => {
   }, 120000)
 
   beforeEach(async () => {
+    await db.calibrationProposal.deleteMany({ where: { organizationId: ORG_A } }).catch(() => {})
+    await db.productivityObservation.deleteMany({ where: { organizationId: ORG_A } }).catch(() => {})
     await db.resourcePriceObservation.deleteMany({ where: { resource: { organizationId: ORG_A } } }).catch(() => {})
     await db.knowledgeAlert.deleteMany({ where: { organizationId: ORG_A } }).catch(() => {})
     await db.workDefinitionVersion.deleteMany({ where: { workDefinition: { organizationId: ORG_A } } }).catch(() => {})
@@ -572,5 +578,413 @@ describe('KnowledgeService integration tests', () => {
       where: { workDefinitionId: wdResult.workDefinitionId },
     })
     expect(versionCountAfter).toBe(versionCountBefore) // rolled back
+  }, 30000)
+
+  // ── Actor policy (INVARIANT 5: AI cannot commit) ─────────────────────────
+
+  test('INVARIANT 5: AI actor cannot approveVersion', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-AI-001', name: 'AI Actor Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+    const vResult = await knowledgeService.createVersion({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      costRecipeJson: '[]',
+    })
+    if (!vResult.ok) return
+
+    // Create an AI actor context
+    const ctxAI: RequestContext = { ...ctxA, actorType: 'ai' }
+
+    const result = await knowledgeService.approveVersion({
+      ctx: ctxAI, workDefinitionId: wdResult.workDefinitionId,
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(403)
+      expect(result.error).toContain('human actor')
+    }
+
+    // Verify the version is still draft (not approved)
+    const version = await db.workDefinitionVersion.findFirst({
+      where: { workDefinitionId: wdResult.workDefinitionId },
+    })
+    expect(version?.approvalState).toBe('draft')
+  }, 30000)
+
+  test('INVARIANT 5: AI actor cannot recordPriceObservation', async () => {
+    const resResult = await knowledgeService.createResource({
+      ctx: ctxA, code: 'RES-AI-001', name: 'AI Price Test', unit: 'bag', kind: 'material',
+    })
+    if (!resResult.ok) return
+
+    const ctxAI: RequestContext = { ...ctxA, actorType: 'ai' }
+
+    const result = await knowledgeService.recordPriceObservation({
+      ctx: ctxAI, resourceId: resResult.resourceId,
+      price: 100, provenance: 'supplier-quote',
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(403)
+      expect(result.error).toContain('human actor')
+    }
+
+    // Verify no observation was created
+    const obs = await db.resourcePriceObservation.findMany({
+      where: { resourceId: resResult.resourceId },
+    })
+    expect(obs.length).toBe(0)
+  }, 30000)
+
+  test('INVARIANT 5: AI actor cannot recordProductivityObservation', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-AI-PROD', name: 'AI Prod Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+    const vResult = await knowledgeService.createVersion({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      costRecipeJson: '[]', productivityRule: 50,
+    })
+    if (!vResult.ok) return
+
+    const ctxAI: RequestContext = { ...ctxA, actorType: 'ai' }
+
+    const result = await knowledgeService.recordProductivityObservation({
+      ctx: ctxAI, workDefinitionVersionId: vResult.versionId,
+      quantityCompleted: 100, daysTaken: 2, crewSize: 5, plannedProductivity: 50,
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(403)
+    }
+  }, 30000)
+
+  test('INVARIANT 5: AI actor CAN create calibration proposals (suggest, not commit)', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-AI-PROP', name: 'AI Proposal Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+
+    const ctxAI: RequestContext = { ...ctxA, actorType: 'ai' }
+
+    const result = await knowledgeService.createCalibrationProposal({
+      ctx: ctxAI, workDefinitionId: wdResult.workDefinitionId,
+      type: 'productivity-update',
+      currentValue: '50', proposedValue: '55',
+      rationale: 'AI detected consistent productivity improvement in recent bids',
+    })
+    expect(result.ok).toBe(true)
+  }, 30000)
+
+  test('INVARIANT 5: AI actor cannot reviewCalibrationProposal', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-AI-REV', name: 'AI Review Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+
+    // AI creates a proposal
+    const ctxAI: RequestContext = { ...ctxA, actorType: 'ai' }
+    const propResult = await knowledgeService.createCalibrationProposal({
+      ctx: ctxAI, workDefinitionId: wdResult.workDefinitionId,
+      type: 'price-update', currentValue: '100', proposedValue: '110',
+      rationale: 'Price increase observed',
+    })
+    if (!propResult.ok) return
+
+    // AI tries to approve it — should fail
+    const reviewResult = await knowledgeService.reviewCalibrationProposal({
+      ctx: ctxAI, proposalId: propResult.proposalId, decision: 'approved',
+    })
+    expect(reviewResult.ok).toBe(false)
+    if (!reviewResult.ok) {
+      expect(reviewResult.status).toBe(403)
+    }
+
+    // Human CAN approve it
+    const humanReview = await knowledgeService.reviewCalibrationProposal({
+      ctx: ctxA, proposalId: propResult.proposalId, decision: 'approved',
+    })
+    expect(humanReview.ok).toBe(true)
+  }, 30000)
+
+  // ── Productivity observations ────────────────────────────────────────────
+
+  test('recordProductivityObservation computes variance and persists', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-PROD-001', name: 'Productivity Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+    const vResult = await knowledgeService.createVersion({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      costRecipeJson: '[]', productivityRule: 50, // 50 m2 per crew-day
+    })
+    if (!vResult.ok) return
+
+    // Record: 100 m2 completed in 3 crew-days → 33.3 m2/day (planned 50)
+    // variance = (33.33 - 50) / 50 = -0.333 (worse than planned)
+    const result = await knowledgeService.recordProductivityObservation({
+      ctx: ctxA, workDefinitionVersionId: vResult.versionId,
+      quantityCompleted: 100, daysTaken: 3, crewSize: 5,
+      plannedProductivity: 50,
+      sourceReference: 'Project ABC',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    expect(result.variancePct).toBeLessThan(0) // worse than planned
+
+    const obs = await db.productivityObservation.findUnique({
+      where: { id: result.observationId },
+    })
+    expect(obs?.actualProductivity).toBeCloseTo(100 / 3, 2)
+    expect(obs?.plannedProductivity).toBe(50)
+    expect(obs?.organizationId).toBe(ORG_A)
+    expect(obs?.recordedById).toBe(USER_A)
+  }, 30000)
+
+  // ── Knowledge health engine ──────────────────────────────────────────────
+
+  test('generateHealthAlerts detects stale prices', async () => {
+    // Create a resource + price observation that's old
+    const resResult = await knowledgeService.createResource({
+      ctx: ctxA, code: 'RES-STALE-001', name: 'Stale Price Resource', unit: 'bag', kind: 'material',
+    })
+    if (!resResult.ok) return
+
+    // Insert a price observation with an old date directly
+    const oldDate = new Date()
+    oldDate.setDate(oldDate.getDate() - 120) // 120 days ago (> 90 threshold)
+    await db.resourcePriceObservation.create({
+      data: {
+        resourceId: resResult.resourceId,
+        price: 25, provenance: 'supplier-quote',
+        observedAt: oldDate,
+      },
+    })
+
+    const result = await knowledgeService.generateHealthAlerts({ ctx: ctxA, persist: false })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const staleAlerts = result.alerts.filter((a) => a.type === 'stale-price')
+    expect(staleAlerts.length).toBeGreaterThan(0)
+    const matching = staleAlerts.find((a) => a.entityId === resResult.resourceId)
+    expect(matching).toBeDefined()
+    expect(matching?.severity).toBe('warning')
+  }, 30000)
+
+  test('generateHealthAlerts detects unapproved rates', async () => {
+    // Create a WD with a draft version (not approved)
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-UNAPP-001', name: 'Unapproved Rate Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+    await knowledgeService.createVersion({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      costRecipeJson: '[]',
+    })
+    // Version is draft — not approved
+
+    const result = await knowledgeService.generateHealthAlerts({ ctx: ctxA, persist: false })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const unapprovedAlerts = result.alerts.filter((a) => a.type === 'unapproved-rate')
+    expect(unapprovedAlerts.length).toBeGreaterThan(0)
+    const matching = unapprovedAlerts.find((a) => a.title.includes('WD-UNAPP-001'))
+    expect(matching).toBeDefined()
+    expect(matching?.severity).toBe('blocker')
+  }, 30000)
+
+  test('generateHealthAlerts detects productivity variance', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-VAR-001', name: 'Variance Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+    const vResult = await knowledgeService.createVersion({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      costRecipeJson: '[]', productivityRule: 50,
+    })
+    if (!vResult.ok) return
+
+    // Record an observation with 30% variance (blocker threshold is 25%)
+    await knowledgeService.recordProductivityObservation({
+      ctx: ctxA, workDefinitionVersionId: vResult.versionId,
+      quantityCompleted: 70, daysTaken: 2, crewSize: 4, // 35 m2/day vs 50 planned = -30%
+      plannedProductivity: 50,
+    })
+
+    const result = await knowledgeService.generateHealthAlerts({ ctx: ctxA, persist: false })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const varAlerts = result.alerts.filter((a) => a.type === 'productivity-variance')
+    expect(varAlerts.length).toBeGreaterThan(0)
+    const matching = varAlerts.find((a) => a.entityId === vResult.versionId)
+    expect(matching).toBeDefined()
+    expect(matching?.severity).toBe('blocker') // 30% > 25% threshold
+  }, 30000)
+
+  test('generateHealthAlerts persist=true creates KnowledgeAlert records', async () => {
+    // Create a stale price
+    const resResult = await knowledgeService.createResource({
+      ctx: ctxA, code: 'RES-PERSIST-001', name: 'Persist Test', unit: 'bag', kind: 'material',
+    })
+    if (!resResult.ok) return
+    const oldDate = new Date()
+    oldDate.setDate(oldDate.getDate() - 120)
+    await db.resourcePriceObservation.create({
+      data: {
+        resourceId: resResult.resourceId,
+        price: 30, provenance: 'supplier-quote',
+        observedAt: oldDate,
+      },
+    })
+
+    const result = await knowledgeService.generateHealthAlerts({ ctx: ctxA, persist: true })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.persisted).toBeGreaterThan(0)
+
+    // Verify alerts were persisted to the DB
+    const alerts = await db.knowledgeAlert.findMany({
+      where: { organizationId: ORG_A, type: 'stale-price' },
+    })
+    expect(alerts.length).toBeGreaterThan(0)
+
+    // Verify audit log
+    const audit = await db.auditLog.findFirst({
+      where: { organizationId: ORG_A, action: 'knowledge-health.alerts-generated' },
+    })
+    expect(audit).not.toBeNull()
+
+    // Cleanup
+    await db.knowledgeAlert.deleteMany({ where: { organizationId: ORG_A } })
+  }, 30000)
+
+  // ── Calibration proposals ────────────────────────────────────────────────
+
+  test('createCalibrationProposal creates a pending proposal (no auto-mutate)', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-CAL-001', name: 'Calibration Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+
+    const result = await knowledgeService.createCalibrationProposal({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      type: 'productivity-update',
+      currentValue: '50', proposedValue: '55',
+      rationale: 'Observed 10% productivity improvement in recent projects',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const proposal = await db.calibrationProposal.findUnique({
+      where: { id: result.proposalId },
+    })
+    expect(proposal?.status).toBe('pending')
+    expect(proposal?.type).toBe('productivity-update')
+    expect(proposal?.currentValue).toBe('50')
+    expect(proposal?.proposedValue).toBe('55')
+    expect(proposal?.organizationId).toBe(ORG_A)
+
+    // INVARIANT 4: the WorkDefinition is NOT mutated by the proposal
+    const wd = await db.workDefinition.findUnique({
+      where: { id: wdResult.workDefinitionId },
+    })
+    expect(wd?.approvalState).toBe('draft') // unchanged
+  }, 30000)
+
+  test('reviewCalibrationProposal approves and records reviewer', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-CAL-002', name: 'Review Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+
+    const propResult = await knowledgeService.createCalibrationProposal({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      type: 'price-update', currentValue: '100', proposedValue: '110',
+      rationale: 'Supplier price increase',
+    })
+    if (!propResult.ok) return
+
+    const reviewResult = await knowledgeService.reviewCalibrationProposal({
+      ctx: ctxA, proposalId: propResult.proposalId, decision: 'approved',
+    })
+    expect(reviewResult.ok).toBe(true)
+
+    const proposal = await db.calibrationProposal.findUnique({
+      where: { id: propResult.proposalId },
+    })
+    expect(proposal?.status).toBe('approved')
+    expect(proposal?.reviewedById).toBe(USER_A)
+    expect(proposal?.reviewedAt).not.toBeNull()
+  }, 30000)
+
+  test('reviewCalibrationProposal rejects already-reviewed proposal', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-CAL-003', name: 'Double Review Test', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+
+    const propResult = await knowledgeService.createCalibrationProposal({
+      ctx: ctxA, workDefinitionId: wdResult.workDefinitionId,
+      type: 'method-update', currentValue: 'old', proposedValue: 'new',
+      rationale: 'Method improvement',
+    })
+    if (!propResult.ok) return
+
+    // First review — approved
+    await knowledgeService.reviewCalibrationProposal({
+      ctx: ctxA, proposalId: propResult.proposalId, decision: 'approved',
+    })
+
+    // Second review — should fail (already reviewed)
+    const result = await knowledgeService.reviewCalibrationProposal({
+      ctx: ctxA, proposalId: propResult.proposalId, decision: 'rejected',
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(400)
+      expect(result.error).toContain('already been reviewed')
+    }
+  }, 30000)
+
+  test('Org B cannot create calibration proposal on Org A WorkDefinition', async () => {
+    const wdResult = await knowledgeService.createWorkDefinition({
+      ctx: ctxA, code: 'WD-CAL-CT', name: 'Cross-tenant Cal', unit: 'm2',
+    })
+    if (!wdResult.ok) return
+
+    const result = await knowledgeService.createCalibrationProposal({
+      ctx: ctxB, workDefinitionId: wdResult.workDefinitionId,
+      type: 'price-update', currentValue: '100', proposedValue: '110',
+      rationale: 'Cross-tenant attempt',
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.status).toBe(404)
+  }, 30000)
+
+  // ── Price semantics (INVARIANT 6) ────────────────────────────────────────
+
+  test('INVARIANT 6: recordPriceObservation rounds price to 2 decimal places', async () => {
+    const resResult = await knowledgeService.createResource({
+      ctx: ctxA, code: 'RES-RND-001', name: 'Rounding Test', unit: 'bag', kind: 'material',
+    })
+    if (!resResult.ok) return
+
+    // 123.456 should be rounded to 123.46 (banker's rounding)
+    const result = await knowledgeService.recordPriceObservation({
+      ctx: ctxA, resourceId: resResult.resourceId,
+      price: 123.456, provenance: 'supplier-quote',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const obs = await db.resourcePriceObservation.findUnique({
+      where: { id: result.observationId },
+    })
+    expect(obs?.price).toBe(123.46) // rounded via round2
   }, 30000)
 })

@@ -37,11 +37,11 @@ const RECIPE = JSON.stringify([
 ])
 
 const ctxA: RequestContext = {
-  userId: USER_A, organizationId: ORG_A, role: 'estimator', isDemo: false,
+  userId: USER_A, organizationId: ORG_A, role: 'estimator', isDemo: false, actorType: 'human',
   name: 'Test User A', email: 'a@bid-test.com',
 }
 const ctxB: RequestContext = {
-  userId: USER_B, organizationId: ORG_B, role: 'estimator', isDemo: false,
+  userId: USER_B, organizationId: ORG_B, role: 'estimator', isDemo: false, actorType: 'human',
   name: 'Test User B', email: 'b@bid-test.com',
 }
 

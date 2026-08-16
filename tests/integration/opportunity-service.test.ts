@@ -22,11 +22,11 @@ const CLIENT_A = 'test-opp-client-a'
 const CLIENT_B = 'test-opp-client-b'
 
 const ctxA: RequestContext = {
-  userId: USER_A, organizationId: ORG_A, role: 'estimator', isDemo: false,
+  userId: USER_A, organizationId: ORG_A, role: 'estimator', isDemo: false, actorType: 'human',
   name: 'Test User A', email: 'a@opp-test.com',
 }
 const ctxB: RequestContext = {
-  userId: USER_B, organizationId: ORG_B, role: 'estimator', isDemo: false,
+  userId: USER_B, organizationId: ORG_B, role: 'estimator', isDemo: false, actorType: 'human',
   name: 'Test User B', email: 'b@opp-test.com',
 }
 

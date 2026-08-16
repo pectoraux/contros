@@ -37,6 +37,7 @@ model Organization {
   projectActuals   ProjectActual[]
   calibrationProposals CalibrationProposal[]
   documents      Document[]
+  productivityObservations ProductivityObservation[]
 }
 
 model User {
@@ -250,6 +251,30 @@ model WorkDefinitionVersion {
   workDefinition      WorkDefinition @relation(fields: [workDefinitionId], references: [id])
   estimateLines       EstimateLine[]
   priceObservations   ResourcePriceObservation[] @relation("PriceObservationWDV")
+  productivityObservations ProductivityObservation[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Productivity Observations — append-only actuals from executed work
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ProductivityObservation {
+  id                      String   @id @default(cuid())
+  organizationId          String
+  workDefinitionVersionId String
+  quantityCompleted       Float    // actual quantity completed
+  daysTaken               Float    // actual crew-days taken
+  crewSize                Float    // actual crew size
+  actualProductivity      Float    // quantityCompleted / daysTaken (computed)
+  plannedProductivity     Float    // from WDV.productivityRule (snapshot for variance)
+  variancePct             Float    // (actual - planned) / planned (computed)
+  sourceReference         String?  // project name, bid ID, etc.
+  observedAt              DateTime @default(now())
+  recordedById            String?
+  createdAt               DateTime @default(now())
+
+  organization            Organization @relation(fields: [organizationId], references: [id])
+  workDefinitionVersion   WorkDefinitionVersion @relation(fields: [workDefinitionVersionId], references: [id])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

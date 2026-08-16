@@ -461,3 +461,172 @@ export const knowledgeAlertRepository = {
     return updated.count > 0
   },
 }
+
+// ─── Productivity Observation Repository ────────────────────────────────────
+//
+// ProductivityObservation ownership is direct (organizationId) AND via
+// workDefinitionVersion → workDefinition → organization.
+// These are APPEND-ONLY — no update or delete methods exist.
+
+export const productivityObservationRepository = {
+  /**
+   * Create a productivity observation within a transaction.
+   * Verifies the WorkDefinitionVersion belongs to this org.
+   * Computes actualProductivity and variancePct from the inputs.
+   */
+  async createInTransaction(
+    tx: PrismaTransaction,
+    orgId: string,
+    data: {
+      workDefinitionVersionId: string
+      quantityCompleted: number
+      daysTaken: number
+      crewSize: number
+      plannedProductivity: number
+      sourceReference?: string | null
+      recordedById?: string | null
+    },
+  ) {
+    // Verify the WDV belongs to this org
+    const wdv = await tx.workDefinitionVersion.findFirst({
+      where: {
+        id: data.workDefinitionVersionId,
+        workDefinition: { organizationId: orgId },
+      },
+      select: { id: true, productivityRule: true },
+    })
+    if (!wdv) return null
+
+    // Compute actual productivity and variance
+    const actualProductivity = data.daysTaken > 0
+      ? data.quantityCompleted / data.daysTaken
+      : 0
+    const variancePct = data.plannedProductivity > 0
+      ? (actualProductivity - data.plannedProductivity) / data.plannedProductivity
+      : 0
+
+    return tx.productivityObservation.create({
+      data: {
+        organizationId: orgId,
+        workDefinitionVersionId: data.workDefinitionVersionId,
+        quantityCompleted: data.quantityCompleted,
+        daysTaken: data.daysTaken,
+        crewSize: data.crewSize,
+        actualProductivity,
+        plannedProductivity: data.plannedProductivity,
+        variancePct,
+        sourceReference: data.sourceReference ?? null,
+        recordedById: data.recordedById ?? null,
+      },
+    })
+  },
+
+  /**
+   * List productivity observations for a WorkDefinitionVersion.
+   * Tenant-scoped.
+   */
+  async listForVersion(orgId: string, wdvId: string) {
+    return db.productivityObservation.findMany({
+      where: {
+        organizationId: orgId,
+        workDefinitionVersionId: wdvId,
+      },
+      orderBy: { observedAt: 'desc' },
+    })
+  },
+
+  /**
+   * List all productivity observations for an organization.
+   */
+  async listForOrganization(orgId: string) {
+    return db.productivityObservation.findMany({
+      where: { organizationId: orgId },
+      orderBy: { observedAt: 'desc' },
+    })
+  },
+}
+
+// ─── Calibration Proposal Repository ────────────────────────────────────────
+//
+// CalibrationProposal ownership is direct (organizationId).
+// These represent proposed amendments to approved knowledge — they do NOT
+// auto-mutate the WorkDefinitionVersion. A human must review and apply.
+
+export const calibrationProposalRepository = {
+  /**
+   * List all CalibrationProposals for an organization.
+   */
+  async listForOrganization(orgId: string) {
+    return db.calibrationProposal.findMany({
+      where: { organizationId: orgId },
+      orderBy: { createdAt: 'desc' },
+    })
+  },
+
+  /**
+   * Get a single CalibrationProposal by ID, tenant-scoped.
+   */
+  async getForOrganization(orgId: string, proposalId: string) {
+    return db.calibrationProposal.findFirst({
+      where: { id: proposalId, organizationId: orgId },
+    })
+  },
+
+  /**
+   * Create a CalibrationProposal within a transaction.
+   * Tenant-scoped by construction.
+   */
+  async createInTransaction(
+    tx: PrismaTransaction,
+    orgId: string,
+    data: {
+      workDefinitionId: string
+      projectActualId?: string | null
+      type: string // productivity-update | price-update | method-update
+      currentValue: string
+      proposedValue: string
+      rationale: string
+    },
+  ) {
+    // Verify the WorkDefinition belongs to this org
+    const wd = await tx.workDefinition.findFirst({
+      where: { id: data.workDefinitionId, organizationId: orgId },
+      select: { id: true },
+    })
+    if (!wd) return null
+
+    return tx.calibrationProposal.create({
+      data: {
+        organizationId: orgId,
+        workDefinitionId: data.workDefinitionId,
+        projectActualId: data.projectActualId ?? null,
+        type: data.type,
+        currentValue: data.currentValue,
+        proposedValue: data.proposedValue,
+        rationale: data.rationale,
+        status: 'pending',
+      },
+    })
+  },
+
+  /**
+   * Update a CalibrationProposal status within a transaction.
+   * Tenant-scoped via organizationId in updateMany.
+   */
+  async updateStatusInTransaction(
+    tx: PrismaTransaction,
+    orgId: string,
+    proposalId: string,
+    data: {
+      status: string // pending | approved | rejected | applied
+      reviewedById: string
+      reviewedAt: Date
+    },
+  ) {
+    const updated = await tx.calibrationProposal.updateMany({
+      where: { id: proposalId, organizationId: orgId },
+      data,
+    })
+    return updated.count > 0
+  },
+}

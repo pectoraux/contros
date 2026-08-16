@@ -57,6 +57,7 @@ const ctxA: RequestContext = {
   organizationId: ORG_A,
   role: 'estimator',
   isDemo: false,
+  actorType: 'human',
   name: 'Test User A',
   email: 'a-sc@test.com',
 }
@@ -66,6 +67,7 @@ const ctxB: RequestContext = {
   organizationId: ORG_B,
   role: 'estimator',
   isDemo: false,
+  actorType: 'human',
   name: 'Test User B',
   email: 'b-sc@test.com',
 }

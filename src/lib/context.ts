@@ -8,7 +8,17 @@ import { authOptions, isValidRole, type AllowedRole } from '@/lib/auth'
  * INVARIANT 12: Every organization is isolated from every other organization.
  * Never trust organizationId / userId / role from the request body or query
  * string. Always resolve from the server-side session.
+ *
+ * INVARIANT 5 (AI safety): The `actorType` field distinguishes human
+ * requests from AI/tool requests. Mutations that commit commercial truth
+ * (approving a WorkDefinitionVersion, recording a price observation,
+ * finalizing a document, submitting a bid) require `actorType='human'`.
+ * AI actors can READ everything and PROPOSE changes, but cannot COMMIT
+ * them. This is enforced at the service layer, not just documented.
  */
+
+export type ActorType = 'human' | 'ai'
+
 export interface RequestContext {
   userId: string
   organizationId: string
@@ -16,6 +26,13 @@ export interface RequestContext {
   isDemo: boolean
   name: string | null
   email: string | null
+  /**
+   * Whether this request originates from a human user or an AI/tool actor.
+   * Defaults to 'human' for normal NextAuth sessions.
+   * AI-facing API routes (e.g. /api/ai-assistant) set this to 'ai' when
+   * they invoke services on behalf of an AI actor.
+   */
+  actorType: ActorType
 }
 
 /**
@@ -54,6 +71,7 @@ export async function requireAuth(): Promise<RequestContext> {
     isDemo: u.isDemo ?? false,
     name: u.name ?? null,
     email: u.email ?? null,
+    actorType: 'human', // Normal NextAuth sessions are human-initiated
   }
 }
 
@@ -73,6 +91,32 @@ export async function requireRole(
     throw err
   }
   return ctx
+}
+
+/**
+ * Require that the request originates from a human actor (not AI).
+ *
+ * INVARIANT 5: AI cannot silently commit a price or approve commercial truth.
+ * Use this guard in service methods that commit immutable commercial state:
+ *   - approveVersion (WorkDefinitionVersion)
+ *   - recordPriceObservation
+ *   - finalizeVersion (Document)
+ *   - submitBid
+ *   - recordAdjudication
+ *
+ * AI actors can READ everything and PROPOSE changes (create drafts,
+ * calibration proposals), but cannot COMMIT them.
+ *
+ * Throws a 403-shaped error if the actor is not human.
+ */
+export function requireHumanActor(ctx: RequestContext): void {
+  if (ctx.actorType !== 'human') {
+    const err = new Error(
+      'Forbidden: this mutation requires a human actor. AI may propose but not commit commercial truth. (INVARIANT 5)',
+    ) as Error & { status: number }
+    err.status = 403
+    throw err
+  }
 }
 
 /**

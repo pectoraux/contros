@@ -1332,4 +1332,6 @@ export {
   resourceRepository,
   resourcePriceObservationRepository,
   knowledgeAlertRepository,
+  productivityObservationRepository,
+  calibrationProposalRepository,
 } from './knowledge-repositories'

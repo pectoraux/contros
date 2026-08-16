@@ -80,3 +80,19 @@ export type {
   RevisionSnapshot,
 } from './revision-service';
 export { finalizeRevision, replayRevision, validateBidSubmission } from './revision-service';
+
+export type {
+  StalePriceInput,
+  UnapprovedRateInput,
+  ProductivityVarianceInput,
+  KnowledgeAlertSeed,
+  KnowledgeHealthResult,
+  KnowledgeHealthConfig,
+} from './knowledge-health';
+export {
+  detectStalePrices,
+  detectUnapprovedRates,
+  detectProductivityVariance,
+  runKnowledgeHealth,
+  DEFAULT_KNOWLEDGE_HEALTH_CONFIG,
+} from './knowledge-health';

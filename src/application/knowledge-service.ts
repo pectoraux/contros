@@ -45,12 +45,18 @@
 
 import { dbTx } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
+import { requireHumanActor } from '@/lib/context'
+import { round2 } from '@/lib/engines/money'
+import { runKnowledgeHealth, DEFAULT_KNOWLEDGE_HEALTH_CONFIG } from '@/lib/engines/knowledge-health'
+import type { KnowledgeAlertSeed } from '@/lib/engines/knowledge-health'
 import {
   workDefinitionRepository,
   workDefinitionVersionRepository,
   resourceRepository,
   resourcePriceObservationRepository,
   knowledgeAlertRepository,
+  productivityObservationRepository,
+  calibrationProposalRepository,
   auditLogRepository,
 } from '@/repositories'
 
@@ -141,6 +147,38 @@ export interface ListKnowledgeAlertsInput { ctx: RequestContext }
 export interface AcknowledgeAlertInput {
   ctx: RequestContext
   alertId: string
+}
+
+export interface RecordProductivityObservationInput {
+  ctx: RequestContext
+  workDefinitionVersionId: string
+  quantityCompleted: number
+  daysTaken: number
+  crewSize: number
+  plannedProductivity: number
+  sourceReference?: string | null
+}
+
+export interface GenerateHealthAlertsInput {
+  ctx: RequestContext
+  /** If true, persists generated alerts to the DB. If false, returns them for preview. */
+  persist?: boolean
+}
+
+export interface CreateCalibrationProposalInput {
+  ctx: RequestContext
+  workDefinitionId: string
+  projectActualId?: string | null
+  type: string // productivity-update | price-update | method-update
+  currentValue: string
+  proposedValue: string
+  rationale: string
+}
+
+export interface ReviewCalibrationProposalInput {
+  ctx: RequestContext
+  proposalId: string
+  decision: 'approved' | 'rejected'
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -348,6 +386,16 @@ export const knowledgeService = {
   async approveVersion(input: ApproveVersionInput): Promise<{ ok: true; versionId: string; versionNo: number } | Err> {
     const { ctx, workDefinitionId, versionId } = input
 
+    // INVARIANT 5: AI cannot approve commercial truth. Only a human can.
+    try {
+      requireHumanActor(ctx)
+    } catch (e) {
+      if (e instanceof Error && 'status' in e) {
+        return { ok: false, error: e.message, status: (e as Error & { status: number }).status }
+      }
+      throw e
+    }
+
     try {
       const result = await dbTx.$transaction(async (tx) => {
         // Load the WorkDefinition (tenant-scoped)
@@ -538,6 +586,16 @@ export const knowledgeService = {
   async recordPriceObservation(input: RecordPriceObservationInput): Promise<{ ok: true; observationId: string } | Err> {
     const { ctx, resourceId, workDefinitionVersionId, price, currency, provenance, sourceReference } = input
 
+    // INVARIANT 5: AI cannot commit a price. Only a human can record a price observation.
+    try {
+      requireHumanActor(ctx)
+    } catch (e) {
+      if (e instanceof Error && 'status' in e) {
+        return { ok: false, error: e.message, status: (e as Error & { status: number }).status }
+      }
+      throw e
+    }
+
     if (!Number.isFinite(price) || price < 0) {
       return { ok: false, error: 'Price must be a non-negative finite number', status: 400 }
     }
@@ -545,11 +603,15 @@ export const knowledgeService = {
       return { ok: false, error: `Invalid provenance: ${provenance}. Must be one of: ${VALID_PROVENANCE_TYPES.join(', ')}`, status: 400 }
     }
 
+    // INVARIANT 6: Deterministic monetary representation.
+    // Round the price to 2 decimal places (banker's rounding) before persisting.
+    const canonicalPrice = round2(price)
+
     const observation = await dbTx.$transaction(async (tx) => {
       const created = await resourcePriceObservationRepository.createInTransaction(tx, ctx.organizationId, {
         resourceId,
         workDefinitionVersionId: workDefinitionVersionId ?? null,
-        price,
+        price: canonicalPrice,
         currency: currency ?? 'GHS',
         provenance,
         sourceReference: sourceReference ?? null,
@@ -563,9 +625,9 @@ export const knowledgeService = {
         action: 'resource.price-observed',
         entityType: 'ResourcePriceObservation',
         entityId: created.id,
-        summary: `Price observed: ${price} ${currency ?? 'GHS'} (${provenance})`,
+        summary: `Price observed: ${canonicalPrice} ${currency ?? 'GHS'} (${provenance})`,
         afterJson: JSON.stringify({
-          resourceId, price, currency: currency ?? 'GHS', provenance,
+          resourceId, price: canonicalPrice, currency: currency ?? 'GHS', provenance,
           sourceReference: sourceReference ?? null,
           workDefinitionVersionId: workDefinitionVersionId ?? null,
         }),
@@ -640,6 +702,338 @@ export const knowledgeService = {
     } catch (e) {
       if (e instanceof Error && e.message === 'ALERT_NOT_FOUND') {
         return { ok: false, error: 'Knowledge alert not found', status: 404 }
+      }
+      throw e
+    }
+  },
+
+  // ─── Productivity Observations ──────────────────────────────────────────
+
+  /**
+   * Record a productivity observation from executed work.
+   *
+   * These are APPEND-ONLY (like price observations) — no update/delete.
+   * The service computes actualProductivity and variancePct from the inputs.
+   * Transactional with audit.
+   *
+   * INVARIANT 5: AI cannot record actuals — only a human can.
+   */
+  async recordProductivityObservation(input: RecordProductivityObservationInput): Promise<{ ok: true; observationId: string; variancePct: number } | Err> {
+    const { ctx, workDefinitionVersionId, quantityCompleted, daysTaken, crewSize, plannedProductivity, sourceReference } = input
+
+    // INVARIANT 5: AI cannot record actuals. Only a human can.
+    try {
+      requireHumanActor(ctx)
+    } catch (e) {
+      if (e instanceof Error && 'status' in e) {
+        return { ok: false, error: e.message, status: (e as Error & { status: number }).status }
+      }
+      throw e
+    }
+
+    if (!Number.isFinite(quantityCompleted) || quantityCompleted < 0) {
+      return { ok: false, error: 'quantityCompleted must be a non-negative finite number', status: 400 }
+    }
+    if (!Number.isFinite(daysTaken) || daysTaken <= 0) {
+      return { ok: false, error: 'daysTaken must be a positive finite number', status: 400 }
+    }
+    if (!Number.isFinite(crewSize) || crewSize <= 0) {
+      return { ok: false, error: 'crewSize must be a positive finite number', status: 400 }
+    }
+    if (!Number.isFinite(plannedProductivity) || plannedProductivity <= 0) {
+      return { ok: false, error: 'plannedProductivity must be a positive finite number', status: 400 }
+    }
+
+    try {
+      const result = await dbTx.$transaction(async (tx) => {
+        const obs = await productivityObservationRepository.createInTransaction(tx, ctx.organizationId, {
+          workDefinitionVersionId,
+          quantityCompleted,
+          daysTaken,
+          crewSize,
+          plannedProductivity,
+          sourceReference: sourceReference ?? null,
+          recordedById: ctx.userId,
+        })
+        if (!obs) {
+          throw new Error('WDV_NOT_FOUND')
+        }
+
+        await auditLogRepository.createInTransaction(tx, ctx.organizationId, ctx.userId, {
+          action: 'productivity.observed',
+          entityType: 'ProductivityObservation',
+          entityId: obs.id,
+          summary: `Productivity observed: ${obs.actualProductivity.toFixed(2)} (planned ${obs.plannedProductivity.toFixed(2)}, variance ${(obs.variancePct * 100).toFixed(1)}%)`,
+          afterJson: JSON.stringify({
+            workDefinitionVersionId,
+            quantityCompleted, daysTaken, crewSize,
+            actualProductivity: obs.actualProductivity,
+            plannedProductivity: obs.plannedProductivity,
+            variancePct: obs.variancePct,
+          }),
+        })
+
+        return obs
+      })
+
+      return { ok: true, observationId: result.id, variancePct: result.variancePct }
+    } catch (e) {
+      if (e instanceof Error && e.message === 'WDV_NOT_FOUND') {
+        return { ok: false, error: 'WorkDefinitionVersion not found in this organization', status: 404 }
+      }
+      throw e
+    }
+  },
+
+  // ─── Knowledge Health Engine ────────────────────────────────────────────
+
+  /**
+   * Run the deterministic knowledge-health analysis.
+   *
+   * Scans the organization's price observations, productivity observations,
+   * and estimate lines for:
+   *   - stale prices (observations older than threshold)
+   *   - unapproved rates (estimate lines referencing draft WDVs)
+   *   - productivity variance (actual vs planned, above threshold)
+   *
+   * If persist=true, creates KnowledgeAlert records for each finding.
+   * If persist=false, returns the alert seeds for preview without persisting.
+   *
+   * Transactional when persisting. Audit logged.
+   */
+  async generateHealthAlerts(input: GenerateHealthAlertsInput): Promise<{ ok: true; alerts: KnowledgeAlertSeed[]; persisted: number } | Err> {
+    const { ctx, persist = false } = input
+
+    // Gather inputs for the engine (using raw db reads via repositories)
+    // 1. Stale prices: load all resources + their latest price observation
+    const resources = await resourceRepository.listForOrganization(ctx.organizationId)
+    const stalePriceInputs = []
+    const now = Date.now()
+    for (const res of resources) {
+      const latest = await resourcePriceObservationRepository.getLatestForResource(ctx.organizationId, res.id)
+      if (latest) {
+        const ageInDays = Math.floor((now - latest.observedAt.getTime()) / (1000 * 60 * 60 * 24))
+        stalePriceInputs.push({
+          resourceId: res.id,
+          resourceName: res.name,
+          resourceCode: res.code,
+          latestPrice: latest.price,
+          latestObservedAt: latest.observedAt.toISOString(),
+          ageInDays,
+        })
+      }
+    }
+
+    // 2. Unapproved rates: load all WDVs that are referenced by estimate lines
+    //    but are not approved. For now, we scan all WDVs in the org.
+    const wds = await workDefinitionRepository.listForOrganization(ctx.organizationId)
+    const unapprovedRateInputs = []
+    for (const wd of wds) {
+      for (const v of wd.versions) {
+        if (v.approvalState !== 'approved' && v.approvalState !== 'deprecated') {
+          unapprovedRateInputs.push({
+            estimateLineId: 'n/a', // we don't have the line link here; this is a WD-level scan
+            workDefinitionVersionId: v.id,
+            workDefinitionCode: wd.code,
+            workDefinitionName: wd.name,
+            approvalState: v.approvalState,
+          })
+        }
+      }
+    }
+
+    // 3. Productivity variance: load all productivity observations
+    const productivityObs = await productivityObservationRepository.listForOrganization(ctx.organizationId)
+    const productivityVarianceInputs = productivityObs
+      .filter((o) => o.variancePct !== 0)
+      .map((o) => {
+        const wdv = wds.flatMap((w) => w.versions).find((v) => v.id === o.workDefinitionVersionId)
+        const wd = wds.find((w) => w.id === wdv?.workDefinitionId)
+        return {
+          workDefinitionVersionId: o.workDefinitionVersionId,
+          workDefinitionCode: wd?.code ?? 'unknown',
+          plannedProductivity: o.plannedProductivity,
+          actualProductivity: o.actualProductivity,
+          variancePct: o.variancePct,
+          sourceReference: o.sourceReference,
+        }
+      })
+
+    // Run the deterministic engine
+    const result = runKnowledgeHealth(
+      stalePriceInputs,
+      unapprovedRateInputs,
+      productivityVarianceInputs,
+      DEFAULT_KNOWLEDGE_HEALTH_CONFIG,
+    )
+
+    if (!persist) {
+      return { ok: true, alerts: result.alerts, persisted: 0 }
+    }
+
+    // Persist the alerts
+    let persistedCount = 0
+    if (result.alerts.length > 0) {
+      await dbTx.$transaction(async (tx) => {
+        for (const alert of result.alerts) {
+          await knowledgeAlertRepository.createInTransaction(tx, ctx.organizationId, {
+            type: alert.type,
+            severity: alert.severity,
+            title: alert.title,
+            detail: alert.detail,
+            entityId: alert.entityId,
+            entityType: alert.entityType,
+          })
+          persistedCount++
+        }
+        await auditLogRepository.createInTransaction(tx, ctx.organizationId, ctx.userId, {
+          action: 'knowledge-health.alerts-generated',
+          entityType: 'KnowledgeAlert',
+          entityId: ctx.organizationId,
+          summary: `${persistedCount} knowledge health alerts generated`,
+          afterJson: JSON.stringify({ count: persistedCount, types: result.alerts.map((a) => a.type) }),
+        })
+      })
+    }
+
+    return { ok: true, alerts: result.alerts, persisted: persistedCount }
+  },
+
+  // ─── Calibration Proposals ─────────────────────────────────────────────
+
+  /**
+   * Create a calibration proposal — a proposed amendment to approved knowledge.
+   *
+   * INVARIANT 4: This does NOT auto-mutate the WorkDefinitionVersion.
+   * It creates a proposal that a human must review and explicitly apply.
+   * The proposal captures current vs proposed values + rationale.
+   *
+   * AI actors CAN create proposals (suggesting changes) — they just can't
+   * approve/apply them.
+   *
+   * Transactional with audit.
+   */
+  async createCalibrationProposal(input: CreateCalibrationProposalInput): Promise<{ ok: true; proposalId: string } | Err> {
+    const { ctx, workDefinitionId, projectActualId, type, currentValue, proposedValue, rationale } = input
+
+    if (!type || !['productivity-update', 'price-update', 'method-update'].includes(type)) {
+      return { ok: false, error: `Invalid proposal type: ${type}`, status: 400 }
+    }
+    if (!currentValue || !currentValue.trim()) {
+      return { ok: false, error: 'currentValue is required', status: 400 }
+    }
+    if (!proposedValue || !proposedValue.trim()) {
+      return { ok: false, error: 'proposedValue is required', status: 400 }
+    }
+    if (!rationale || !rationale.trim()) {
+      return { ok: false, error: 'rationale is required', status: 400 }
+    }
+
+    try {
+      const result = await dbTx.$transaction(async (tx) => {
+        const proposal = await calibrationProposalRepository.createInTransaction(tx, ctx.organizationId, {
+          workDefinitionId,
+          projectActualId: projectActualId ?? null,
+          type,
+          currentValue: currentValue.trim(),
+          proposedValue: proposedValue.trim(),
+          rationale: rationale.trim(),
+        })
+        if (!proposal) {
+          throw new Error('WD_NOT_FOUND')
+        }
+
+        await auditLogRepository.createInTransaction(tx, ctx.organizationId, ctx.userId, {
+          action: 'calibration-proposal.created',
+          entityType: 'CalibrationProposal',
+          entityId: proposal.id,
+          summary: `Calibration proposal created: ${type} (${currentValue} → ${proposedValue})`,
+          afterJson: JSON.stringify({
+            workDefinitionId, type, currentValue, proposedValue, rationale,
+            actorType: ctx.actorType,
+          }),
+        })
+
+        return proposal
+      })
+
+      return { ok: true, proposalId: result.id }
+    } catch (e) {
+      if (e instanceof Error && e.message === 'WD_NOT_FOUND') {
+        return { ok: false, error: 'Work Definition not found in this organization', status: 404 }
+      }
+      throw e
+    }
+  },
+
+  /**
+   * Review a calibration proposal — approve or reject it.
+   *
+   * INVARIANT 5: Only a human can approve/reject a proposal.
+   * AI can create proposals but cannot apply them.
+   *
+   * Note: approving a proposal does NOT automatically mutate the
+   * WorkDefinitionVersion. It marks the proposal as 'approved', and a
+   * separate `createVersion` + `approveVersion` flow is needed to create
+   * the new immutable version with the proposed changes.
+   *
+   * Transactional with audit.
+   */
+  async reviewCalibrationProposal(input: ReviewCalibrationProposalInput): Promise<{ ok: true; status: string } | Err> {
+    const { ctx, proposalId, decision } = input
+
+    // INVARIANT 5: Only a human can approve/reject.
+    try {
+      requireHumanActor(ctx)
+    } catch (e) {
+      if (e instanceof Error && 'status' in e) {
+        return { ok: false, error: e.message, status: (e as Error & { status: number }).status }
+      }
+      throw e
+    }
+
+    try {
+      await dbTx.$transaction(async (tx) => {
+        const proposal = await calibrationProposalRepository.getForOrganization(
+          ctx.organizationId, proposalId,
+        )
+        if (!proposal) {
+          throw new Error('PROPOSAL_NOT_FOUND')
+        }
+        if (proposal.status !== 'pending') {
+          throw new Error('PROPOSAL_NOT_PENDING')
+        }
+
+        const reviewedAt = new Date()
+        const updated = await calibrationProposalRepository.updateStatusInTransaction(
+          tx, ctx.organizationId, proposalId,
+          { status: decision, reviewedById: ctx.userId, reviewedAt },
+        )
+        if (!updated) {
+          throw new Error('PROPOSAL_UPDATE_FAILED')
+        }
+
+        await auditLogRepository.createInTransaction(tx, ctx.organizationId, ctx.userId, {
+          action: `calibration-proposal.${decision}`,
+          entityType: 'CalibrationProposal',
+          entityId: proposalId,
+          summary: `Calibration proposal ${decision}: ${proposal.type} (${proposal.currentValue} → ${proposal.proposedValue})`,
+          afterJson: JSON.stringify({
+            proposalId, decision, reviewedById: ctx.userId,
+            workDefinitionId: proposal.workDefinitionId,
+          }),
+        })
+      })
+
+      return { ok: true, status: decision }
+    } catch (e) {
+      if (e instanceof Error) {
+        if (e.message === 'PROPOSAL_NOT_FOUND') {
+          return { ok: false, error: 'Calibration proposal not found', status: 404 }
+        }
+        if (e.message === 'PROPOSAL_NOT_PENDING') {
+          return { ok: false, error: 'Calibration proposal has already been reviewed', status: 400 }
+        }
       }
       throw e
     }

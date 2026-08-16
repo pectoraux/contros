@@ -1456,3 +1456,70 @@ Stage Summary:
 - Six application services: EstimateService (FROZEN), SubcontractService (FROZEN),
   BidService (FROZEN), OpportunityService (FROZEN), DocumentService (FROZEN),
   KnowledgeService (code-complete).
+
+---
+Task ID: knowledge-service-hardening
+Agent: principal-engineer
+Task: KnowledgeService hardening — actor policy, knowledge-health engine, productivity observations, calibration proposals, price semantics
+
+Work Log:
+- P0: Actor/AI write authorization (INVARIANT 5).
+  * Added `actorType: 'human' | 'ai'` to RequestContext.
+  * Added `requireHumanActor(ctx)` guard in context.ts.
+  * Applied to: approveVersion, recordPriceObservation, recordProductivityObservation,
+    reviewCalibrationProposal. AI actors get 403 on these methods.
+  * AI actors CAN: listWorkDefinitions, getWorkDefinition, createVersion (draft),
+    createCalibrationProposal (suggest), listKnowledgeAlerts, generateHealthAlerts (read).
+  * AI CANNOT: approve, record price/productivity, review proposals. Proven by 5 tests.
+- P0: Knowledge-health engine (deterministic alert generation).
+  * Created src/lib/engines/knowledge-health.ts — pure functions:
+    detectStalePrices, detectUnapprovedRates, detectProductivityVariance, runKnowledgeHealth.
+  * Configurable thresholds (stalePriceThresholdDays=90, productivityBlocker=25%,
+    productivityWarning=10%).
+  * generateHealthAlerts service method scans org's resources, WDVs, productivity obs
+    and generates KnowledgeAlert records. Supports persist=true/false (preview mode).
+- P0: Productivity observations (append-only actuals from executed work).
+  * Added ProductivityObservation model to schema.
+  * productivityObservationRepository: create (computes actualProductivity + variancePct),
+    listForVersion, listForOrganization. Append-only — no update/delete.
+  * recordProductivityObservation service method (human-only, INVARIANT 5).
+- P0: Calibration/amendment proposal model.
+  * CalibrationProposal model already existed — added repository + service methods.
+  * createCalibrationProposal: creates a pending proposal (AI can create, human must review).
+    Does NOT auto-mutate the WorkDefinitionVersion (INVARIANT 4).
+  * reviewCalibrationProposal: approves/rejects (human-only, INVARIANT 5).
+    Rejects already-reviewed proposals.
+- P0: Stronger price semantics (INVARIANT 6).
+  * recordPriceObservation now applies round2 (banker's rounding) before persisting.
+  * Proven by test: 123.456 → 123.46.
+- Added 4 new API routes:
+  * GET /api/knowledge-health?persist=true|false
+  * GET/POST /api/calibration-proposals
+  * POST /api/calibration-proposals/[id]/review
+  * POST /api/work-definitions/[id]/productivity-observations
+- Updated all existing test contexts to include `actorType: 'human'`.
+- 15 new integration tests (37 total):
+  * Actor policy (5): AI cannot approve/record price/record productivity/review proposals;
+    AI CAN create proposals.
+  * Productivity observations (1): variance computation + persistence.
+  * Knowledge health engine (4): stale price detection, unapproved rate detection,
+    productivity variance detection, persist=true creates alerts.
+  * Calibration proposals (4): create (no auto-mutate), review, double-review rejection,
+    cross-tenant rejection.
+  * Price semantics (1): round2 applied.
+
+Verification:
+- 37 integration tests pass (0 fail) — 22 original + 15 new.
+- 106 unit tests pass (0 fail).
+- Lint clean.
+
+Stage Summary:
+- KnowledgeService now satisfies the full hardening gate:
+  * Actor/AI write authorization enforced (INVARIANT 5).
+  * Knowledge-health engine generates alerts deterministically from operational evidence.
+  * Productivity observations captured with variance computation.
+  * Calibration proposals created/reviewed (no auto-mutate of approved knowledge).
+  * Price observations rounded via banker's rounding (INVARIANT 6).
+- Six application services: EstimateService (FROZEN), SubcontractService (FROZEN),
+  BidService (FROZEN), OpportunityService (FROZEN), DocumentService (FROZEN),
+  KnowledgeService (FROZEN).
