@@ -1760,3 +1760,53 @@ Stage Summary:
 - Historical Bid Validation gate passed. The architecture correctly reconstructs all 10 fixtures from immutable domain state.
 - The domain foundation, frozen application services, knowledge foundation, and deterministic PricingEngine are validated against real commercial reasoning.
 - Next gate: Contractor Workspace (Phase 4 per the roadmap).
+
+---
+Task ID: real-bid-reconstruction
+Agent: principal-engineer
+Task: Real Historical Bid Reconstruction — classify variances between DB and replayed revision
+
+What was audited:
+- The actual seeded "Office Complex — Zenith Properties" bid (the only fully closed-loop won bid)
+- 5 estimate lines, all self-perform, with real Ghana construction rates
+- The immutable revision snapshot (rev-office-1) and its replay
+- 35 commercial fields compared between DB (persisted by old engine) and replay (new engine)
+
+What was changed:
+- tests/integration/real-bid-reconstruction.test.ts — NEW: 14 real-bid reconstruction tests
+  with variance classification (EXACT, EXPLAINABLE, MODEL_GAP, DATA_GAP, RECONSTRUCTION_ERROR)
+
+Variance classification results:
+  Total fields compared: 35
+  EXACT:                14 (material costs, subcontract costs — unaffected by wastage fix)
+  EXPLAINABLE:          21 (sellPrice, unitRate, directCost, labour, plant — ~1% lower in replay)
+  MODEL_GAP:            0
+  DATA_GAP:             0
+  RECONSTRUCTION_ERROR: 0
+
+The EXPLAINABLE variances are caused by the wastage-semantics fix:
+- The old engine applied wastage to ALL recipe lines (material, labour, plant, subcontract, fee)
+- The new engine applies wastage to MATERIAL ONLY
+- The DB values were computed by the old engine; the replay uses the new engine
+- The replayed values are CORRECT; the DB values reflect the old (corrected) behavior
+- The variance is consistently ~1% (proportional to labour cost × 5% wastage)
+
+Architectural defects discovered:
+- One EXPLAINABLE variance: the wastage-semantics fix changed the engine's output for
+  lines with labour/plant components. Historical bids computed by the old engine will
+  have slightly higher prices than a replay with the new engine. This is expected and
+  documented — it is the correct effect of fixing the wastage bug.
+- No MODEL_GAP, DATA_GAP, or RECONSTRUCTION_ERROR variances were found.
+
+Tests Passed:
+- 14 real-bid reconstruction tests (0 fail)
+- 147 unit tests (0 fail)
+- Lint clean
+
+Stage Summary:
+- Real Historical Validation gate passed. The architecture correctly reconstructs
+  the actual historical bid from the immutable revision snapshot. All variances are
+  classified and explained — no unexplained reconstruction errors or model gaps.
+- The synthetic matrix (10 fixtures) + real-bid reconstruction (actual seeded data)
+  together satisfy the Historical Bid Validation gate.
+- Next gate: Contractor Workspace.
