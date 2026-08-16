@@ -1335,3 +1335,7 @@ export {
   productivityObservationRepository,
   calibrationProposalRepository,
 } from './knowledge-repositories'
+
+// ─── Dashboard Repository ───────────────────────────────────────────────────
+// Re-exported from a dedicated module. Tenant-scoped via organizationId.
+export { dashboardRepository } from './dashboard-repository'

@@ -2050,3 +2050,42 @@ Next Steps:
 - Browser-verify the full E2E flow via the Preview Panel (login, dashboard, new opportunity dialog, opportunity workspace, estimate with blocked pricing).
 - Add integration tests for the new API routes (POST /api/opportunities, GET/POST /api/clients).
 - Continue improving the workspace surfaces (scope actions, document deliverables, bid workspace).
+
+---
+Task ID: dashboard-architecture-fix
+Agent: principal-engineer
+Task: Fix dashboard architecture regression — extract raw Prisma behind ContractorDashboardService + repository
+
+What was fixed:
+- The /api/dashboard route had raw `db.*` Prisma calls (db.estimateLine.count, db.bid.count, etc.)
+  violating the frozen architecture: API Route → Application Service → Repository → Prisma.
+- Created src/repositories/dashboard-repository.ts with 12 tenant-aware methods:
+  countOpenOpportunities, countBidsDueThisWeek, countAwaitingQuotes,
+  countEstimatesNeedingReview, countKnowledgeAlerts, countBlockedPricingItems,
+  countSubmittedBids, countAwardedProjects, getRecentActivity,
+  getUnacknowledgedAlerts, getPipelineByStatus, getPipelineValue.
+- Created src/application/contractor-dashboard-service.ts with a single
+  getDashboard() method that calls the repository in parallel (Promise.all)
+  and returns the full dashboard result.
+- Rewrote src/app/api/dashboard/route.ts as a thin adapter:
+  requireAuth() → contractorDashboardService.getDashboard() → JSON response.
+  Zero db.* calls in the route.
+- Re-exported dashboardRepository from src/repositories/index.ts barrel.
+
+Tests added (6 integration tests):
+- Org A dashboard returns correct KPIs (openOpps, bidsDue, blockedPricing, submittedBids, awarded, alerts)
+- Tenant isolation: Org A does NOT see Org B's opportunities, alerts, or activity
+- blockedPricingItems count matches actual incomplete lines in DB
+- pipelineValue is correctly summed from latest estimate sellPrices
+- Source-code audit: ContractorDashboardService has zero db.* calls
+- Source-code audit: dashboard route has zero db.* calls
+
+Tests Passed:
+- 6 dashboard integration tests (0 fail)
+- 147 unit tests (0 fail)
+- Lint clean
+
+Architecture boundary now correct:
+  API Route → ContractorDashboardService → dashboardRepository → Prisma
+
+Next: Scope tab enhancements, then Bid Readiness gate.
