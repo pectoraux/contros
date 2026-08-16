@@ -1,18 +1,37 @@
 'use client'
 
+import { useEffect, useState } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
-import type { OpportunityDetail } from '@/lib/api'
+import { Skeleton } from '@/components/ui/skeleton'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { apiGet, type OpportunityDetail, type ScopeWorkspace } from '@/lib/api'
 import { formatPct, severityStyle } from '@/lib/format'
 import { useWorkspace } from '@/store/workspace'
-import { Sparkles, FileQuestion, AlertTriangle, FileText, Paperclip } from 'lucide-react'
+import { Sparkles, FileQuestion, AlertTriangle, FileText, Paperclip, Ban, Link2, Unlink } from 'lucide-react'
 
 export function ScopeTab({ opp, onReload }: { opp: OpportunityDetail; onReload: () => void }) {
   const openAiPanel = useWorkspace((s) => s.openAiPanel)
+  const setTab = useWorkspace((s) => s.setOpportunityTab)
   void onReload
   const scope = opp.scopePackage
+
+  const [workspace, setWorkspace] = useState<ScopeWorkspace | null>(null)
+  const [loadingWs, setLoadingWs] = useState(true)
+
+  useEffect(() => {
+    if (!opp.id) return
+    let mounted = true
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLoadingWs(true)
+    apiGet<ScopeWorkspace>(`/api/opportunities/${opp.id}/scope-workspace`)
+      .then((ws) => mounted && setWorkspace(ws))
+      .catch(() => mounted && setWorkspace(null))
+      .finally(() => mounted && setLoadingWs(false))
+    return () => { mounted = false }
+  }, [opp.id])
 
   if (!scope) {
     return (
@@ -26,6 +45,21 @@ export function ScopeTab({ opp, onReload }: { opp: OpportunityDetail; onReload: 
 
   return (
     <div className="space-y-4">
+      {/* Scope blockers from the authoritative service */}
+      {workspace && workspace.blockers.length > 0 && (
+        <Alert variant="destructive">
+          <Ban className="h-4 w-4" />
+          <AlertDescription>
+            <strong>{workspace.blockers.length} scope blocker(s):</strong>
+            <ul className="mt-1 space-y-0.5">
+              {workspace.blockers.map((b, i) => (
+                <li key={i} className="text-xs">• {b.description}</li>
+              ))}
+            </ul>
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* Completeness banner */}
       <Card>
         <CardHeader>
@@ -58,20 +92,81 @@ export function ScopeTab({ opp, onReload }: { opp: OpportunityDetail; onReload: 
               <div className="text-[11px] text-muted-foreground">Ambiguous</div>
             </div>
           </div>
+
+          {/* Scope workspace summary from the service */}
+          {workspace && (
+            <div className="mt-4 pt-3 border-t border-border grid grid-cols-2 gap-3 text-xs">
+              <div className="flex items-center gap-1.5">
+                <FileQuestion className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="text-muted-foreground">Open questions:</span>
+                <span className={`font-mono font-medium ${workspace.openQuestions > 0 ? 'text-amber-600' : 'text-emerald-600'}`}>
+                  {workspace.openQuestions}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <AlertTriangle className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="text-muted-foreground">Unack high-risk:</span>
+                <span className={`font-mono font-medium ${workspace.unacknowledgedHighRiskAssumptions > 0 ? 'text-red-600' : 'text-emerald-600'}`}>
+                  {workspace.unacknowledgedHighRiskAssumptions}
+                </span>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Scope items */}
+        {/* Scope items with estimate-line links from the service */}
         <Card>
           <CardHeader>
             <CardTitle className="text-base flex items-center gap-2">
               <FileText className="h-4 w-4" /> Scope Items
             </CardTitle>
-            <CardDescription>What is explicitly specified, inferred, or missing</CardDescription>
+            <CardDescription>
+              {workspace ? 'Items with estimate-line mapping from scope-workspace service' : 'What is explicitly specified, inferred, or missing'}
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-2 max-h-96 overflow-y-auto">
-            {scope.items.map((item) => (
+            {loadingWs && <Skeleton className="h-20 w-full" />}
+            {!loadingWs && workspace && workspace.items.map((item) => (
+              <div key={item.id} className="flex items-start gap-3 p-2 rounded-md hover:bg-muted/40">
+                <Badge
+                  variant="outline"
+                  className={`text-[10px] uppercase shrink-0 ${
+                    item.status === 'known'
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : item.status === 'missing'
+                        ? 'bg-red-50 text-red-700 border-red-200'
+                        : 'bg-amber-50 text-amber-700 border-amber-200'
+                  }`}
+                >
+                  {item.status}
+                </Badge>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm leading-snug">{item.description}</p>
+                  <div className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-2">
+                    <span className="capitalize">origin: {item.origin}</span>
+                    {item.category && <span>· {item.category}</span>}
+                  </div>
+                  {/* Estimate line link indicator */}
+                  {item.hasEstimateLine ? (
+                    <button
+                      onClick={() => setTab('estimate')}
+                      className="mt-1 flex items-center gap-1 text-[10px] text-primary hover:underline"
+                    >
+                      <Link2 className="h-2.5 w-2.5" />
+                      Linked to estimate line
+                    </button>
+                  ) : (
+                    <div className="mt-1 flex items-center gap-1 text-[10px] text-muted-foreground">
+                      <Unlink className="h-2.5 w-2.5" />
+                      No estimate line
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+            {!loadingWs && !workspace && scope.items.map((item) => (
               <div key={item.id} className="flex items-start gap-3 p-2 rounded-md hover:bg-muted/40">
                 <Badge
                   variant="outline"

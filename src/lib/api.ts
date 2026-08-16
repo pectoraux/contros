@@ -409,3 +409,53 @@ export interface AiAssistantResponse {
   detail?: string
   fallback?: string
 }
+
+// ─── Scope Workspace ────────────────────────────────────────────────────────
+
+export interface ScopeWorkspaceItem {
+  id: string
+  description: string
+  category: string | null
+  status: string
+  origin: string
+  hasEstimateLine: boolean
+  estimateLineId: string | null
+  estimateStatus: string | null
+}
+
+export interface ScopeBlocker {
+  type: string
+  severity: string
+  description: string
+}
+
+export interface ScopeWorkspace {
+  completenessPct: number
+  totalItems: number
+  knownItems: number
+  missingItems: number
+  ambiguousItems: number
+  openQuestions: number
+  unacknowledgedHighRiskAssumptions: number
+  blockers: ScopeBlocker[]
+  items: ScopeWorkspaceItem[]
+}
+
+// ─── Bid Readiness ──────────────────────────────────────────────────────────
+
+export interface ReadinessBlocker {
+  category: 'SCOPE' | 'PRICING' | 'DOCUMENT' | 'KNOWLEDGE'
+  code: string
+  message: string
+}
+
+export interface BidReadiness {
+  ready: boolean
+  score: {
+    scope: number
+    pricing: number
+    documents: number
+    knowledge: number
+  }
+  blockers: ReadinessBlocker[]
+}
