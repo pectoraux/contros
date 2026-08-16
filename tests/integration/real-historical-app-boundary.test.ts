@@ -28,6 +28,7 @@
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { PrismaClient } from '@prisma/client'
 import { estimateService } from '../../src/application/estimate-service'
+import { bidService } from '../../src/application/bid-service'
 import { replayRevision } from '../../src/lib/engines/revision-service'
 import { round2 } from '../../src/lib/engines/money'
 import type { RequestContext } from '../../src/lib/context'
@@ -79,6 +80,7 @@ let historicalBid: { finalPrice: number; directorAdjustment: number }
 // ─── Clone data ─────────────────────────────────────────────────────────────
 
 let cloneRevisionId: string
+let cloneBidId: string
 
 describe('Real Historical Application-Boundary Reconstruction', () => {
   beforeAll(async () => {
@@ -440,16 +442,133 @@ describe('Real Historical Application-Boundary Reconstruction', () => {
       }
     }
   }, 30000)
+
+  // ─── Step 8: Create bid via BidService ────────────────────────────────────
+
+  test('Step 8: BidService.createBid creates bid for the clone opportunity', async () => {
+    const result = await bidService.createBid({
+      ctx, opportunityId: CLONE_OPP, estimateId: CLONE_EST,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    cloneBidId = result.bidId
+
+    const bid = await db.bid.findUnique({ where: { id: cloneBidId } })
+    expect(bid?.tenderPackStatus).toBe('draft')
+    expect(bid?.organizationId).toBe(CLONE_ORG)
+  }, 30000)
+
+  // ─── Step 9: Record adjudication via BidService ───────────────────────────
+
+  test('Step 9: BidService.recordAdjudication freezes clone commercial state', async () => {
+    // Use the same director adjustment as the historical bid
+    // historicalBid.directorAdjustment = -2500 (absolute GHS, not a percentage)
+    // But BidService.recordAdjudication takes a fractional adjustment.
+    // The historical seed used directorAdjustment=-2500 as an absolute GHS value
+    // stored directly on the Bid. The BidService.recordAdjudication() takes a
+    // fractional adjustment (e.g. -0.02 = 2% discount).
+    // We need to convert: fraction = -2500 / systemSellPrice
+    const rev = await db.estimateRevision.findUnique({
+      where: { id: cloneRevisionId },
+      select: { snapshotJson: true },
+    })
+    const replay = replayRevision(rev!.snapshotJson)
+    expect(replay.ok).toBe(true)
+    if (!replay.ok) return
+
+    const systemSellPrice = replay.totalSellPrice
+    const directorAdjustmentFraction = historicalBid.directorAdjustment / systemSellPrice
+
+    const result = await bidService.recordAdjudication({
+      ctx, bidId: cloneBidId, estimateRevisionId: cloneRevisionId,
+      directorAdjustment: directorAdjustmentFraction,
+      adjustmentRationale: 'Clone: same director adjustment as historical Office Complex bid',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    expect(result.systemSellPrice).toBe(systemSellPrice)
+    expect(result.finalPrice).toBeGreaterThan(0)
+
+    // Verify the bid has the adjudicated revision
+    const bid = await db.bid.findUnique({ where: { id: cloneBidId } })
+    expect(bid?.adjudicatedRevisionId).toBe(cloneRevisionId)
+    expect(bid?.estimateRevisionId).toBe(cloneRevisionId)
+    expect(bid?.systemSellPrice).toBe(systemSellPrice)
+  }, 30000)
+
+  // ─── Step 10: Clone bid vs historical bid comparison ──────────────────────
+
+  test('Step 10: Clone bid commercial state matches historical bid structure', async () => {
+    const cloneBid = await db.bid.findUnique({ where: { id: cloneBidId } })
+    const histBid = await db.bid.findUnique({ where: { id: 'bid-office' } })
+
+    expect(cloneBid).not.toBeNull()
+    expect(histBid).not.toBeNull()
+    if (!cloneBid || !histBid) return
+
+    // The historical bid was seeded directly (not through BidService.recordAdjudication),
+    // so it does NOT have adjudicatedRevisionId or systemSellPrice set.
+    // The CLONE bid was created through BidService.recordAdjudication, so it DOES.
+    // This is the key difference: the clone goes through the full application boundary,
+    // while the historical bid was seeded as a finished record.
+
+    // Clone bid has the full adjudication chain (proves BidService works)
+    expect(cloneBid.adjudicatedRevisionId).toBe(cloneRevisionId)
+    expect(cloneBid.estimateRevisionId).toBe(cloneRevisionId)
+    expect(cloneBid.systemSellPrice).not.toBeNull()
+    expect(cloneBid.systemSellPrice!).toBeGreaterThan(0)
+
+    // Historical bid has finalPrice but no adjudicatedRevisionId (seeded directly)
+    expect(histBid.finalPrice).toBeGreaterThan(0)
+    expect(histBid.directorAdjustment).toBe(historicalBid.directorAdjustment)
+
+    // The clone's systemSellPrice (from the corrected engine) should be
+    // less than the historical bid's finalPrice (from the old engine).
+    // This is the wastage-fix effect — the corrected engine produces lower prices.
+    expect(cloneBid.systemSellPrice!).toBeLessThan(histBid.finalPrice)
+
+    // The clone's finalPrice = systemSellPrice + directorAdjustment (absolute GHS equivalent)
+    // BidService.recordAdjudication computes: finalPrice = round2(systemSellPrice * (1 + directorAdjustmentFraction))
+    // where directorAdjustmentFraction = historicalBid.directorAdjustment / systemSellPrice
+    // So finalPrice = round2(systemSellPrice * (1 + (-2500 / systemSellPrice)))
+    //               = round2(systemSellPrice - 2500)
+    const expectedCloneFinalPrice = round2(cloneBid.systemSellPrice! - 2500)
+    expect(cloneBid.finalPrice).toBe(expectedCloneFinalPrice)
+
+    // Verify the adjudicated revision can be replayed and matches the bid's systemSellPrice
+    const cloneRev = await db.estimateRevision.findUnique({
+      where: { id: cloneRevisionId },
+      select: { snapshotJson: true },
+    })
+    const cloneReplay = replayRevision(cloneRev!.snapshotJson)
+    expect(cloneReplay.ok).toBe(true)
+    if (!cloneReplay.ok) return
+
+    // The bid's systemSellPrice must match the replay's totalSellPrice
+    expect(cloneBid.systemSellPrice).toBe(cloneReplay.totalSellPrice)
+
+    // The clone's finalPrice (corrected engine - 2500) should be less than
+    // the historical finalPrice (old engine, no adjustment deducted).
+    // Wait — historical finalPrice = sum(line.sellPrice) from old engine = 124911.11
+    // historical winningPrice = finalPrice - 2500 = 122411.11
+    // clone finalPrice = systemSellPrice - 2500 (corrected engine)
+    // So clone finalPrice < historical winningPrice (because corrected engine < old engine)
+    expect(cloneBid.finalPrice).toBeLessThan(histBid.finalPrice)
+  }, 30000)
 })
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
 
 async function cleanupClone() {
+  await db.tenderDeliverable.deleteMany({ where: { bid: { organizationId: CLONE_ORG } } }).catch(() => {})
   await db.commercialException.deleteMany({ where: { organizationId: CLONE_ORG } }).catch(() => {})
   await db.executionSegment.deleteMany({ where: { estimateLine: { estimate: { organizationId: CLONE_ORG } } } }).catch(() => {})
   await db.estimateLine.deleteMany({ where: { estimate: { organizationId: CLONE_ORG } } }).catch(() => {})
   await db.estimateRevision.deleteMany({ where: { estimate: { organizationId: CLONE_ORG } } }).catch(() => {})
   await db.estimate.deleteMany({ where: { organizationId: CLONE_ORG } }).catch(() => {})
+  await db.bid.deleteMany({ where: { organizationId: CLONE_ORG } }).catch(() => {})
   await db.scopePackage.deleteMany({ where: { opportunity: { organizationId: CLONE_ORG } } }).catch(() => {})
   await db.opportunity.deleteMany({ where: { organizationId: CLONE_ORG } }).catch(() => {})
   await db.client.deleteMany({ where: { organizationId: CLONE_ORG } }).catch(() => {})

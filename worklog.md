@@ -1957,3 +1957,43 @@ Stage Summary:
     Synthetic app-boundary conformance         ✅
     REAL historical app-boundary reconstruction ✅
 - Next gate: Contractor Workspace.
+
+---
+Task ID: real-historical-bid-boundary
+Agent: principal-engineer
+Task: Add BidService.createBid + recordAdjudication to the real historical app-boundary reconstruction
+
+What was added:
+- Step 8: BidService.createBid() — creates bid for the clone opportunity via the frozen service
+- Step 9: BidService.recordAdjudication() — freezes clone commercial state using the same
+  director adjustment as the historical Office Complex bid (-2500 GHS)
+- Step 10: Clone bid vs historical bid comparison — verifies:
+  * Clone has adjudicatedRevisionId + systemSellPrice (historical doesn't — seeded directly)
+  * Clone's systemSellPrice < historical finalPrice (wastage-fix effect)
+  * Clone's finalPrice = systemSellPrice - 2500 (same director adjustment)
+  * Clone's systemSellPrice = replay totalSellPrice (bid = replay)
+  * Clone's finalPrice < historical finalPrice (corrected engine produces lower prices)
+
+The full application-boundary chain is now:
+  OpportunityService.createOpportunity() (setup)
+  → EstimateService.recomputeLine() × 5 (application boundary)
+  → EstimateService.finalizeRevision() (immutable snapshot)
+  → BidService.createBid() (application boundary)           ← NEW
+  → BidService.recordAdjudication() (application boundary)  ← NEW
+  → replayRevision() (comparison)
+  → compare clone bid vs historical bid                     ← NEW
+
+Tests Passed:
+- 10 real historical app-boundary tests (0 fail) — 7 existing + 3 new
+- 147 unit tests (0 fail)
+- Lint clean
+
+Stage Summary:
+- Historical Bid Validation gate is now COMPLETE with the full application boundary:
+    Synthetic matrix                           ✅
+    Real persisted-bid replay                  ✅
+    Causal variance classification             ✅
+    Synthetic app-boundary conformance         ✅
+    Real Estimate boundary                     ✅
+    Real Bid boundary (createBid + adjudication) ✅  ← FINAL GAP CLOSED
+- Next gate: Contractor Workspace.
