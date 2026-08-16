@@ -1323,3 +1323,13 @@ export {
   documentVersionRepository,
   tenderDeliverableLinkRepository,
 } from './document-repositories'
+
+// ─── Knowledge / Work Library Repositories ──────────────────────────────────
+// Re-exported from a dedicated module. Tenant-scoped via workDefinition → org.
+export {
+  workDefinitionRepository,
+  workDefinitionVersionRepository,
+  resourceRepository,
+  resourcePriceObservationRepository,
+  knowledgeAlertRepository,
+} from './knowledge-repositories'

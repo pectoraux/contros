@@ -1394,3 +1394,65 @@ Stage Summary:
   * The snapshot is frozen until the user explicitly re-finalizes + re-marks-ready.
 - Five application services: EstimateService (FROZEN), SubcontractService (FROZEN),
   BidService (FROZEN), OpportunityService (FROZEN), DocumentService (FROZEN).
+
+---
+Task ID: knowledge-service-1
+Agent: principal-engineer
+Task: KnowledgeService — Work Library lifecycle, immutable approved versions, price provenance, knowledge alerts
+
+Work Log:
+- Created src/repositories/knowledge-repositories.ts with 5 tenant-scoped repos:
+  * workDefinitionRepository (list, get, create, update, getLatestVersionNumber — all inTransaction)
+  * workDefinitionVersionRepository (createDraft, approve [idempotent], get, getCurrentApproved —
+    NO update method for approved versions [IMMUTABLE])
+  * resourceRepository (list, get, create)
+  * resourcePriceObservationRepository (create [append-only], getLatest, list — NO update/delete)
+  * knowledgeAlertRepository (list, create, acknowledge)
+- Re-exported all 5 repos from src/repositories/index.ts barrel.
+- Created src/application/knowledge-service.ts with 12 service methods:
+  * WorkDefinitions: listWorkDefinitions, getWorkDefinition, createWorkDefinition,
+    createVersion, approveVersion, deprecateWorkDefinition
+  * Resources: listResources, createResource
+  * Price Observations: recordPriceObservation, listPriceObservations
+  * Knowledge Alerts: listKnowledgeAlerts, acknowledgeAlert
+- All follow the frozen pattern: RequestContext → Service → Repository → Transaction → Audit
+- Zero raw db.* calls — all through tenant-scoped repos
+- INVARIANT 4: Approved WorkDefinitionVersions are immutable. approveVersion freezes
+  the version (approvalState='approved', approvedAt, approvedById). No update method
+  exists for approved versions. New changes require a new version.
+- INVARIANT 3: ResourcePriceObservations are append-only with provenance
+  (supplier-quote | invoice | market-survey | manual | historical-bid | subcontract-quote).
+  No update/delete methods.
+- approveVersion is idempotent (already-approved → success, no duplicate audit).
+- Refactored /api/work-definitions and /api/knowledge-alerts to thin adapters.
+- Added new API routes:
+  * GET/POST /api/work-definitions (list + create)
+  * GET /api/work-definitions/[id] (detail)
+  * POST /api/work-definitions/[id]/versions (create version)
+  * POST /api/work-definitions/[id]/approve (approve version)
+  * POST /api/work-definitions/[id]/deprecate (deprecate WD)
+  * GET/POST /api/resources (list + create)
+  * GET/POST /api/resources/[id]/price-observations (list + record)
+  * GET /api/knowledge-alerts (list)
+  * POST /api/knowledge-alerts/[id]/acknowledge (acknowledge)
+- Fixed Next.js routing conflict: moved opportunity-level document routes from
+  /api/documents/[opportunityId] to /api/opportunities/[id]/documents (slug name
+  conflict with /api/documents/[documentId]).
+- 22 integration tests pass:
+  * WD lifecycle (create, createVersion, approve, deprecate)
+  * INVARIANT 4 immutability (approved version cannot be modified, idempotent approve)
+  * Cross-tenant isolation (Org B cannot list/get/create-version/approve Org A WDs)
+  * Resources (create, validation)
+  * Price observations (append-only, provenance validation, cross-tenant rejection)
+  * Knowledge alerts (org-scoped list, acknowledge, cross-tenant rejection)
+  * Validation (missing fields, invalid kinds/provenance)
+  * Transaction rollback (version insert + audit failure → rollback)
+- 106 unit tests pass. Lint clean.
+
+Stage Summary:
+- KnowledgeService is code-complete and tested.
+- INVARIANT 4 preserved: approved knowledge is immutable.
+- INVARIANT 3 preserved: every price has provenance (append-only observations).
+- Six application services: EstimateService (FROZEN), SubcontractService (FROZEN),
+  BidService (FROZEN), OpportunityService (FROZEN), DocumentService (FROZEN),
+  KnowledgeService (code-complete).

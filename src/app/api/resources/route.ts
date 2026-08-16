@@ -2,16 +2,16 @@ import { NextResponse } from 'next/server'
 import { requireAuth, authErrorResponse } from '@/lib/context'
 import { knowledgeService } from '@/application/knowledge-service'
 
-// Work Library — list all work definitions with their current version.
-// INVARIANT 12: scoped by ctx.organizationId (enforced by the service).
+// GET /api/resources
+// List all resources for the organization.
 export async function GET() {
   try {
     const ctx = await requireAuth()
-    const result = await knowledgeService.listWorkDefinitions({ ctx })
+    const result = await knowledgeService.listResources({ ctx })
     if (!result.ok) {
       return NextResponse.json({ error: result.error }, { status: result.status })
     }
-    return NextResponse.json({ workDefinitions: result.workDefinitions })
+    return NextResponse.json({ resources: result.resources })
   } catch (e) {
     const authErr = authErrorResponse(e)
     if (authErr) return authErr
@@ -19,8 +19,8 @@ export async function GET() {
   }
 }
 
-// POST /api/work-definitions
-// Create a new Work Definition (starts in 'draft' state).
+// POST /api/resources
+// Create a new resource.
 export async function POST(req: Request) {
   try {
     const ctx = await requireAuth()
@@ -28,18 +28,19 @@ export async function POST(req: Request) {
     if (!body) {
       return NextResponse.json({ error: 'Request body required' }, { status: 400 })
     }
-    const result = await knowledgeService.createWorkDefinition({
+    const result = await knowledgeService.createResource({
       ctx,
       code: body.code,
       name: body.name,
-      category: body.category,
       unit: body.unit,
-      industry: body.industry,
+      kind: body.kind,
+      currency: body.currency,
+      region: body.region,
     })
     if (!result.ok) {
       return NextResponse.json({ error: result.error }, { status: result.status })
     }
-    return NextResponse.json({ workDefinitionId: result.workDefinitionId }, { status: 201 })
+    return NextResponse.json({ resourceId: result.resourceId }, { status: 201 })
   } catch (e) {
     const authErr = authErrorResponse(e)
     if (authErr) return authErr
