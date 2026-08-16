@@ -1706,3 +1706,57 @@ Stage Summary:
   * Service persistence boundary hardened: incomplete → no authoritative price.
 - EstimateService → PricingEngine is one canonical calculation path.
 - Next gate: Historical Bid Validation.
+
+---
+Task ID: historical-bid-validation
+Agent: principal-engineer
+Task: Historical Bid Validation — 10-fixture matrix testing the architecture against real commercial reasoning
+
+Audit Findings:
+- The architecture was tested against 10 historical bid scenarios covering the master prompt's fixture matrix:
+  * 3 straightforward bids (self-perform, all prices sourced, no subcontract)
+  * 3 subcontract-heavy bids (full coverage, partial coverage, hybrid)
+  * 2 ambiguous bids (unsourced rate, undecided strategy)
+  * 1 client-provided BOQ (3 items mapped to WorkDefinitions)
+  * 1 estimator-created scope (4 lines, mixed strategies)
+
+Files Changed:
+- tests/fixtures/historical-bids.ts — NEW: 10 fixture definitions with full recipes, quantities, policies, expected outcomes
+- tests/integration/historical-bids.test.ts — NEW: validation harness + 14 tests
+
+Validation Harness:
+1. Loads fixture data (recipes, quantities, policies, execution strategies)
+2. Runs the pure PricingEngine (priceLine) for each line
+3. For valid bids: builds an immutable revision snapshot (finalizeRevision), replays it (replayRevision), and asserts the replayed price matches the computed price
+4. For valid bids: runs validateBidSubmission and asserts it passes
+5. For ambiguous bids: asserts the calculation is incomplete (blocking)
+6. Cross-fixture invariants: replay determinism (same inputs → same output), valid bids produce non-zero sellPrice, ambiguous bids produce incomplete calculations
+
+Tests Added (14):
+- fixture matrix count (10 fixtures in 5 categories)
+- 10 per-fixture validation tests (each fixture reconstructable from immutable state)
+- all valid bids produce non-zero sellPrice
+- all ambiguous bids produce incomplete calculations
+- replay determinism (second replay produces same price)
+
+Tests Passed:
+- 14 historical bid validation tests (0 fail)
+- 147 unit tests (0 fail)
+- Lint clean
+
+Architectural Defects Discovered:
+- None. The fixtures validated cleanly against the existing architecture. The pricing engine, revision service, and validation gate all behaved correctly across all 10 scenarios.
+- The 3 ambiguous fixtures (unsourced rate, undecided strategy, partial coverage) correctly produced incomplete calculations and failed validation — exactly as designed.
+- The 7 valid fixtures (straightforward, subcontract full-coverage, hybrid, client BOQ, estimator scope) all produced non-zero sellPrices and passed validateBidSubmission.
+- Replay determinism was confirmed: calling replayRevision twice on the same snapshot produced identical results.
+
+Known Limitations:
+- The fixtures use the pure engine directly (no DB writes for the core validation). This is intentional — the engine is pure and the validation is about mathematical correctness, not DB persistence. A future integration test could seed the full fixture data into Neon and verify the EstimateService → DB → revision → replay round-trip.
+- The fixtures use Ghana construction rates (GHS, Accra market). They are representative but not exhaustive — a real historical validation would use actual bid data from the contractor's archive.
+- The fixture matrix covers the 5 categories from the master prompt but does not cover every possible edge case (e.g. multi-currency, very large quantities > 1M, negative adjustments > 100%).
+
+Commit SHA: (pending push)
+Stage Summary:
+- Historical Bid Validation gate passed. The architecture correctly reconstructs all 10 fixtures from immutable domain state.
+- The domain foundation, frozen application services, knowledge foundation, and deterministic PricingEngine are validated against real commercial reasoning.
+- Next gate: Contractor Workspace (Phase 4 per the roadmap).
