@@ -59,6 +59,9 @@ export interface DashboardData {
     estimatesNeedingReview: number
     knowledgeAlerts: number
     pipelineValue: number
+    blockedPricingItems: number
+    submittedBids: number
+    awardedProjects: number
   }
   recentActivity: {
     id: string
@@ -96,6 +99,7 @@ export interface OpportunityListItem {
   estimateId: string | null
   estimateValue: number
   estimateStatus: string | null
+  blockedLineCount: number
   bidOutcome: string | null
   createdAt: string
   updatedAt: string

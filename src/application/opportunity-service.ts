@@ -260,6 +260,9 @@ export const opportunityService = {
       const estimateValue = latestEstimate
         ? latestEstimate.lines.reduce((s, l) => s + l.sellPrice, 0)
         : 0
+      const blockedLineCount = latestEstimate
+        ? latestEstimate.lines.filter((l) => l.calculationStatus === 'incomplete').length
+        : 0
       return {
         id: o.id,
         title: o.title,
@@ -275,6 +278,7 @@ export const opportunityService = {
         estimateId: latestEstimate?.id ?? null,
         estimateValue,
         estimateStatus: latestEstimate?.status ?? null,
+        blockedLineCount,
         bidOutcome: o.bid?.outcome ?? null,
         createdAt: o.createdAt,
         updatedAt: o.updatedAt,

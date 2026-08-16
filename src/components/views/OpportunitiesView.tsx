@@ -9,7 +9,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useWorkspace } from '@/store/workspace'
 import { formatGHS, formatDate, daysUntil, statusStyle, statusLabel } from '@/lib/format'
-import { ChevronRight, MapPin, User, FileText } from 'lucide-react'
+import { ChevronRight, MapPin, User, FileText, Ban, AlertTriangle } from 'lucide-react'
 
 export function OpportunitiesView() {
   const [items, setItems] = useState<OpportunityListItem[]>([])
@@ -35,6 +35,15 @@ export function OpportunitiesView() {
     )
   }
 
+  // Sort: blocked first, then by deadline urgency
+  const sorted = [...items].sort((a, b) => {
+    if (a.blockedLineCount > 0 && b.blockedLineCount === 0) return -1
+    if (a.blockedLineCount === 0 && b.blockedLineCount > 0) return 1
+    const da = a.submissionDeadline ? new Date(a.submissionDeadline).getTime() : Infinity
+    const db = b.submissionDeadline ? new Date(b.submissionDeadline).getTime() : Infinity
+    return da - db
+  })
+
   return (
     <div className="p-6 space-y-4">
       <div className="flex items-center justify-between">
@@ -42,6 +51,11 @@ export function OpportunitiesView() {
           <h2 className="text-xl font-semibold tracking-tight">Opportunities</h2>
           <p className="text-sm text-muted-foreground">
             {items.length} opportunities · click a row to open the full workspace
+            {items.some(i => i.blockedLineCount > 0) && (
+              <span className="text-red-600 font-medium ml-2">
+                · {items.filter(i => i.blockedLineCount > 0).length} with blocked pricing
+              </span>
+            )}
           </p>
         </div>
       </div>
@@ -55,19 +69,20 @@ export function OpportunitiesView() {
                 <TableHead>Client</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead className="text-right">Estimate Value</TableHead>
+                <TableHead>Pricing</TableHead>
                 <TableHead>Deadline</TableHead>
                 <TableHead>Owner</TableHead>
                 <TableHead className="w-12"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {items.map((o) => {
+              {sorted.map((o) => {
                 const days = daysUntil(o.submissionDeadline)
                 return (
                   <TableRow
                     key={o.id}
                     onClick={() => openOpportunity(o.id)}
-                    className="cursor-pointer hover:bg-muted/50 transition-colors"
+                    className={`cursor-pointer hover:bg-muted/50 transition-colors ${o.blockedLineCount > 0 ? 'bg-red-50/20' : ''}`}
                   >
                     <TableCell>
                       <div className="flex flex-col">
@@ -113,6 +128,20 @@ export function OpportunitiesView() {
                       )}
                     </TableCell>
                     <TableCell>
+                      {o.blockedLineCount > 0 ? (
+                        <Badge variant="outline" className="text-[10px] bg-red-50 text-red-700 border-red-200">
+                          <Ban className="h-2.5 w-2.5 mr-0.5" />
+                          {o.blockedLineCount} blocked
+                        </Badge>
+                      ) : o.hasEstimate ? (
+                        <Badge variant="outline" className="text-[10px] bg-emerald-50 text-emerald-700 border-emerald-200">
+                          Ready
+                        </Badge>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      )}
+                    </TableCell>
+                    <TableCell>
                       {o.submissionDeadline ? (
                         <div className="flex flex-col">
                           <span className="text-xs">{formatDate(o.submissionDeadline)}</span>
@@ -154,8 +183,9 @@ export function OpportunitiesView() {
           <CardContent className="flex flex-col items-center justify-center py-12 text-center">
             <FileText className="h-10 w-10 text-muted-foreground mb-3" />
             <p className="text-sm font-medium">No opportunities yet</p>
-            <p className="text-xs text-muted-foreground mt-1">Create one to start estimating.</p>
-            <Button className="mt-4">New Opportunity</Button>
+            <p className="text-xs text-muted-foreground mt-1">
+              Click "New Opportunity" in the header to create one.
+            </p>
           </CardContent>
         </Card>
       )}

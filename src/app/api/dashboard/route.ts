@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { requireAuth, authErrorResponse } from '@/lib/context'
 
-// Dashboard KPIs + recent activity + knowledge alerts.
+// Contractor Dashboard — real KPIs from the domain model.
 // Deterministic aggregation — no AI on this path.
 // INVARIANT 12: Every query is scoped by ctx.organizationId.
 export async function GET() {
@@ -45,6 +45,35 @@ export async function GET() {
       where: {
         organizationId: ctx.organizationId,
         acknowledged: false,
+      },
+    })
+
+    // Contractor-specific KPI: blocked pricing items
+    // Count estimate lines with calculationStatus='incomplete' across all
+    // non-submitted/superseded estimates in the org.
+    const blockedPricingItems = await db.estimateLine.count({
+      where: {
+        estimate: {
+          organizationId: ctx.organizationId,
+          status: { in: ['draft', 'internal-review', 'adjudicated'] },
+        },
+        calculationStatus: 'incomplete',
+      },
+    })
+
+    // Contractor-specific KPI: submitted bids
+    const submittedBids = await db.bid.count({
+      where: {
+        organizationId: ctx.organizationId,
+        tenderPackStatus: { in: ['submitted', 'clarification'] },
+      },
+    })
+
+    // Contractor-specific KPI: awarded projects
+    const awardedProjects = await db.bid.count({
+      where: {
+        organizationId: ctx.organizationId,
+        outcome: 'won',
       },
     })
 
@@ -95,6 +124,9 @@ export async function GET() {
         estimatesNeedingReview,
         knowledgeAlerts: knowledgeAlertsCount,
         pipelineValue,
+        blockedPricingItems,
+        submittedBids,
+        awardedProjects,
       },
       recentActivity: recentActivity.map((a) => ({
         id: a.id,

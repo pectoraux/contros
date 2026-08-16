@@ -4,8 +4,10 @@ import { useEffect, useState, useCallback } from 'react'
 import { apiGet, type OpportunityDetail } from '@/lib/api'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Card, CardContent } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { useWorkspace, type OpportunityTab } from '@/store/workspace'
+import { statusStyle, statusLabel } from '@/lib/format'
 import {
   LayoutDashboard,
   FileSearch,
@@ -17,6 +19,8 @@ import {
   ShieldAlert,
   PackageCheck,
   History,
+  Ban,
+  AlertTriangle,
 } from 'lucide-react'
 import { OverviewTab } from './opportunity-tabs/OverviewTab'
 import { ScopeTab } from './opportunity-tabs/ScopeTab'
@@ -82,14 +86,32 @@ export function OpportunityDetail() {
     )
   }
 
+  // Compute estimate status summary
+  const estimate = opp.estimates[0]
+  const blockedLines = estimate?.lines.filter(l => l.calculationStatus === 'incomplete') ?? []
+  const totalLines = estimate?.lines.length ?? 0
+  const readyLines = totalLines - blockedLines.length
+  const estimateReadyPct = totalLines > 0 ? Math.round((readyLines / totalLines) * 100) : 0
+
   return (
     <div className="p-6 space-y-4">
-      {/* Header card */}
+      {/* Header card with status + blocked pricing indicator */}
       <Card>
         <CardContent className="py-4">
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
             <div className="min-w-0">
-              <h2 className="text-xl font-semibold tracking-tight truncate">{opp.title}</h2>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h2 className="text-xl font-semibold tracking-tight truncate">{opp.title}</h2>
+                <Badge variant="outline" className={`text-[10px] ${statusStyle(opp.status)}`}>
+                  {statusLabel(opp.status)}
+                </Badge>
+                {blockedLines.length > 0 && (
+                  <Badge variant="outline" className="text-[10px] bg-red-50 text-red-700 border-red-200">
+                    <Ban className="h-2.5 w-2.5 mr-0.5" />
+                    {blockedLines.length} blocked
+                  </Badge>
+                )}
+              </div>
               <p className="text-sm text-muted-foreground mt-0.5">
                 {opp.client.name}
                 {opp.client.sector && <span className="capitalize"> · {opp.client.sector}</span>}
@@ -97,10 +119,19 @@ export function OpportunityDetail() {
                 {opp.reference && <span> · Ref: {opp.reference}</span>}
               </p>
             </div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground shrink-0">
-              <span>Owner: {opp.owner?.name ?? 'Unassigned'}</span>
-              <span>·</span>
-              <span>Received {new Date(opp.receivedAt).toLocaleDateString()}</span>
+            <div className="flex items-center gap-3 text-xs shrink-0">
+              {estimate && (
+                <div className="flex flex-col items-end">
+                  <span className="text-muted-foreground">Estimate Readiness</span>
+                  <span className={`font-mono font-medium ${estimateReadyPct === 100 ? 'text-emerald-600' : estimateReadyPct < 70 ? 'text-red-600' : 'text-amber-600'}`}>
+                    {estimateReadyPct}% ({readyLines}/{totalLines} priced)
+                  </span>
+                </div>
+              )}
+              <div className="flex flex-col items-end text-muted-foreground">
+                <span>Owner</span>
+                <span className="text-foreground">{opp.owner?.name ?? 'Unassigned'}</span>
+              </div>
             </div>
           </div>
         </CardContent>

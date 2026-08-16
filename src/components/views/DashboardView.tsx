@@ -17,6 +17,9 @@ import {
   Activity,
   ArrowRight,
   AlertTriangle,
+  Ban,
+  Send,
+  Trophy,
 } from 'lucide-react'
 import { formatGHSCompact, formatGHS, relativeTime, severityStyle } from '@/lib/format'
 import { useWorkspace } from '@/store/workspace'
@@ -55,30 +58,44 @@ export function DashboardView() {
   }
 
   const kpis = [
-    { label: 'Open Opportunities', value: data.kpis.openOpportunities, icon: FolderKanban, hint: 'Active pipeline' },
-    { label: 'Bids Due This Week', value: data.kpis.bidsDueThisWeek, icon: CalendarClock, hint: 'Within 7 days' },
-    { label: 'Awaiting Quotes', value: data.kpis.awaitingQuotes, icon: GitCompareArrows, hint: 'Subcontract packages' },
-    { label: 'Estimates Needing Review', value: data.kpis.estimatesNeedingReview, icon: ClipboardCheck, hint: 'Draft or in review' },
-    { label: 'Knowledge Alerts', value: data.kpis.knowledgeAlerts, icon: Brain, hint: 'Stale / unapproved' },
-    { label: 'Pipeline Value', value: formatGHSCompact(data.kpis.pipelineValue), icon: TrendingUp, hint: 'Active estimates' },
+    { label: 'Active Opportunities', value: data.kpis.openOpportunities, icon: FolderKanban, hint: 'In pipeline', urgency: '' },
+    { label: 'Bids Due This Week', value: data.kpis.bidsDueThisWeek, icon: CalendarClock, hint: 'Within 7 days', urgency: data.kpis.bidsDueThisWeek > 0 ? 'urgent' : '' },
+    { label: 'Pending Estimates', value: data.kpis.estimatesNeedingReview, icon: ClipboardCheck, hint: 'Draft or review', urgency: '' },
+    { label: 'Blocked Pricing', value: data.kpis.blockedPricingItems, icon: Ban, hint: 'Need resolution', urgency: data.kpis.blockedPricingItems > 0 ? 'danger' : '' },
+    { label: 'Submitted Bids', value: data.kpis.submittedBids, icon: Send, hint: 'Awaiting outcome', urgency: '' },
+    { label: 'Awarded', value: data.kpis.awardedProjects, icon: Trophy, hint: 'Won projects', urgency: '' },
+    { label: 'Awaiting Quotes', value: data.kpis.awaitingQuotes, icon: GitCompareArrows, hint: 'Subcontract packages', urgency: '' },
+    { label: 'Knowledge Alerts', value: data.kpis.knowledgeAlerts, icon: Brain, hint: 'Stale / unapproved', urgency: data.kpis.knowledgeAlerts > 0 ? 'warning' : '' },
+    { label: 'Pipeline Value', value: formatGHSCompact(data.kpis.pipelineValue), icon: TrendingUp, hint: 'Active estimates', urgency: '' },
   ]
 
   const maxPipeline = Math.max(...data.pipelineByStatus.map((p) => p.count), 1)
 
   return (
     <div className="p-6 space-y-6">
-      {/* KPI grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+      {/* KPI grid — contractor operating metrics */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-3 gap-4">
         {kpis.map((kpi) => {
           const Icon = kpi.icon
           return (
-            <Card key={kpi.label} className="hover:shadow-md transition-shadow">
+            <Card
+              key={kpi.label}
+              className={`hover:shadow-md transition-shadow ${
+                kpi.urgency === 'danger' ? 'border-red-200 bg-red-50/30' :
+                kpi.urgency === 'urgent' ? 'border-amber-200 bg-amber-50/30' :
+                kpi.urgency === 'warning' ? 'border-amber-200' : ''
+              }`}
+            >
               <CardHeader className="pb-2">
                 <div className="flex items-center justify-between">
                   <CardDescription className="text-[11px] uppercase tracking-wider">
                     {kpi.label}
                   </CardDescription>
-                  <Icon className="h-4 w-4 text-muted-foreground" />
+                  <Icon className={`h-4 w-4 ${
+                    kpi.urgency === 'danger' ? 'text-red-500' :
+                    kpi.urgency === 'urgent' ? 'text-amber-500' :
+                    'text-muted-foreground'
+                  }`} />
                 </div>
               </CardHeader>
               <CardContent>
