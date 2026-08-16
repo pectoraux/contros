@@ -1655,3 +1655,54 @@ Stage Summary:
   * authoritative (EstimateService uses priceLine as the single canonical path)
 - EstimateService → PricingEngine is one canonical calculation path.
 - Ready for Historical Bid Validation gate.
+
+---
+Task ID: pricing-engine-boundary
+Agent: principal-engineer
+Task: PricingEngine service-boundary hardening — incomplete calculations must not persist authoritative prices
+
+Audit Finding:
+- The pure engine correctly marks `undecided` strategy and missing prices as `incomplete`.
+- BUT EstimateService.recomputeLine() persisted sellPrice, unitRate, profit, etc.
+  as authoritative financial state even when calculationStatus='incomplete'.
+- This left stale/indicative prices in the canonical EstimateLine row that
+  downstream code (BidService, gate, BOQ) reads as commercial truth.
+
+Fix:
+- EstimateService.recomputeLine() now zeroes authoritative commercial fields
+  when calculationStatus='incomplete':
+    sellPrice, unitRate, directCost, projectCost, riskCost, overheadCost,
+    profitCost, estimatedTotalCost, expectedProfit, expectedMarginPct, marginPct
+- Preview/diagnostic breakdown components (materialCost, labourCost, plantCost,
+  subcontractCost, feeCost) are still persisted so the estimator can see what
+  the engine computed.
+- Diagnostic fields (calculationStatus, blockingInputsJson, isUnsourced,
+  provenanceSummary, executionStrategy) are always persisted.
+- CommercialException.exposure is now 0 (not the stale sellPrice).
+- Audit log summary says "BLOCKED" (not "GHS X.XX") when incomplete.
+- Audit log afterJson has unitRate=0, sellPrice=0 when incomplete.
+
+Pattern:
+    complete → persist all financial fields as authoritative
+    incomplete → zero authoritative fields, persist only diagnostic + preview
+
+Tests Added (5 integration tests):
+- complete calculation → authoritative sellPrice/unitRate persisted
+- undecided strategy → incomplete → sellPrice/unitRate ZEROED in DB
+- missing price observation → incomplete → sellPrice/unitRate ZEROED in DB
+- previously valid price is NOT retained after recomputation becomes blocked
+- audit log for incomplete calculation does NOT present indicative unitRate as committed
+
+Tests Passed:
+- 147 unit tests (0 fail)
+- 5 pricing-boundary integration tests (0 fail)
+- Lint clean
+
+Commit SHA: (pending push)
+Stage Summary:
+- PricingEngine is now FROZEN.
+  * pure, deterministic, provenance-aware, invalid-input-safe,
+    subcontract-aware, hybrid-safe, money-policy-consistent, reproducible.
+  * Service persistence boundary hardened: incomplete → no authoritative price.
+- EstimateService → PricingEngine is one canonical calculation path.
+- Next gate: Historical Bid Validation.

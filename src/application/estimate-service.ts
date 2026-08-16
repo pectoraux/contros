@@ -204,26 +204,51 @@ export const estimateService = {
       : baseProvenance
 
     // 8. Persist within a transaction (atomic: line update + exception + audit).
+    //
+    // P0 BOUNDARY: When calculationStatus === 'incomplete', the engine's result
+    // is indicative/diagnostic ONLY. We must NOT persist authoritative
+    // commercial fields (sellPrice, unitRate, profit, etc.) as canonical
+    // estimate state. Downstream code (BidService, gate, BOQ projection)
+    // reads these fields as commercial truth — an incomplete calculation
+    // must not leave a stale or indicative price in the canonical row.
+    //
+    // Pattern:
+    //   complete → persist all financial fields as authoritative
+    //   incomplete → zero out authoritative fields, persist only diagnostic
+    //                fields (calculationStatus, blockingInputs, isUnsourced,
+    //                provenanceSummary, executionStrategy) + preview breakdown
+    //                components (material/labour/plant/etc.) for the estimator
+    //                to see what's missing.
+    const isIncomplete = breakdown.calculationStatus === 'incomplete'
+
     const updated = await dbTx.$transaction(async (tx) => {
       const updatedLine = await tx.estimateLine.update({
         where: { id: line.id },
         data: {
+          // Preview/diagnostic breakdown components — always persisted so the
+          // estimator can see what the engine computed, even when incomplete.
+          // These are NOT the authoritative commercial price.
           materialCost: round2(breakdown.material),
           labourCost: round2(breakdown.labour),
           plantCost: round2(breakdown.plant),
           subcontractCost: round2(breakdown.subcontract),
           feeCost: round2(breakdown.fee),
-          directCost: round2(breakdown.directCost),
-          projectCost: round2(breakdown.projectCost),
-          riskCost: round2(breakdown.riskCost),
-          overheadCost: round2(breakdown.overhead),
-          profitCost: round2(breakdown.profit),
-          estimatedTotalCost: round2(breakdown.estimatedTotalCost),
-          expectedProfit: round2(breakdown.expectedProfit),
-          expectedMarginPct: round2(breakdown.expectedMarginPct),
-          sellPrice: round2(breakdown.sellPrice),
-          unitRate: round2(breakdown.unitRate),
-          marginPct: round2(breakdown.marginPct),
+          // Authoritative commercial fields — ZEROED when incomplete.
+          // An incomplete calculation must not leave a stale or indicative
+          // price in the canonical row. Downstream consumers (BidService,
+          // gate, BOQ) read these as commercial truth.
+          directCost: isIncomplete ? 0 : round2(breakdown.directCost),
+          projectCost: isIncomplete ? 0 : round2(breakdown.projectCost),
+          riskCost: isIncomplete ? 0 : round2(breakdown.riskCost),
+          overheadCost: isIncomplete ? 0 : round2(breakdown.overhead),
+          profitCost: isIncomplete ? 0 : round2(breakdown.profit),
+          estimatedTotalCost: isIncomplete ? 0 : round2(breakdown.estimatedTotalCost),
+          expectedProfit: isIncomplete ? 0 : round2(breakdown.expectedProfit),
+          expectedMarginPct: isIncomplete ? 0 : round2(breakdown.expectedMarginPct),
+          sellPrice: isIncomplete ? 0 : round2(breakdown.sellPrice),
+          unitRate: isIncomplete ? 0 : round2(breakdown.unitRate),
+          marginPct: isIncomplete ? 0 : round2(breakdown.marginPct),
+          // Diagnostic fields — always persisted
           calculationStatus: breakdown.calculationStatus,
           blockingInputsJson: JSON.stringify(breakdown.blockingInputs),
           confidence: round2(confidence.score),
@@ -234,7 +259,7 @@ export const estimateService = {
       })
 
       // Create CommercialException if incomplete.
-      if (breakdown.calculationStatus === 'incomplete') {
+      if (isIncomplete) {
         const reason = breakdown.blockingInputs.length > 0
           ? breakdown.blockingInputs.map((b) => `${b.kind}: ${b.detail}`).join(' | ')
           : 'Calculation incomplete — unknown reason.'
@@ -254,7 +279,9 @@ export const estimateService = {
               entityId: line.id,
               type: 'incomplete-calculation',
               reason,
-              exposure: round2(breakdown.sellPrice),
+              // Exposure is 0 — the calculation did not produce an authoritative
+              // price. The blocking inputs describe the risk, not a stale number.
+              exposure: 0,
               approvalRequired: false,
             },
           })
@@ -262,6 +289,12 @@ export const estimateService = {
       }
 
       // Audit log.
+      // When incomplete, the audit summary does NOT present the indicative
+      // unitRate as a committed price — it explicitly says "BLOCKED".
+      const summaryText = isIncomplete
+        ? `Rate recomputed for "${line.description}": BLOCKED (${breakdown.blockingInputs.length} blocker(s))${breakdown.unsourced ? ' [UNSOURCED]' : ''}`
+        : `Rate recomputed for "${line.description}": GHS ${round2(breakdown.unitRate).toFixed(2)}/${line.unit} [${breakdown.calculationStatus.toUpperCase()}]${breakdown.unsourced ? ' [UNSOURCED]' : ''}`
+
       await tx.auditLog.create({
         data: {
           organizationId: ctx.organizationId,
@@ -269,10 +302,11 @@ export const estimateService = {
           action: 'estimate.rate-recomputed',
           entityType: 'EstimateLine',
           entityId: line.id,
-          summary: `Rate recomputed for "${line.description}": GHS ${round2(breakdown.unitRate).toFixed(2)}/${line.unit} [${breakdown.calculationStatus.toUpperCase()}]${breakdown.unsourced ? ' [UNSOURCED]' : ''}`,
+          summary: summaryText,
           afterJson: JSON.stringify({
-            unitRate: breakdown.unitRate,
-            sellPrice: breakdown.sellPrice,
+            // When incomplete, unitRate/sellPrice are indicative only.
+            unitRate: isIncomplete ? 0 : breakdown.unitRate,
+            sellPrice: isIncomplete ? 0 : breakdown.sellPrice,
             unsourced: breakdown.unsourced,
             calculationStatus: breakdown.calculationStatus,
             blockingInputs: breakdown.blockingInputs,
