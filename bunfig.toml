@@ -1,0 +1,14 @@
+# Bun configuration for the Contractor OS.
+#
+# `[test] preload` runs before every `bun test` file is imported, so that
+# tests/setup.ts can establish the PostgreSQL test database URL BEFORE any
+# test module imports @/lib/db (or constructs a PrismaClient directly). This
+# prevents an inherited shell SQLite DATABASE_URL from silently overriding
+# the postgres URL in .env.
+#
+# NOTE: in Bun 1.3.x the top-level `preload` key applies to `bun run`/`bun <file>`
+# but NOT to `bun test`; the `[test]` table is required for test preloads.
+#
+# See tests/setup.ts for the full rationale and precedence rules.
+[test]
+preload = ["./tests/setup.ts"]
