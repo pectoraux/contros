@@ -2139,3 +2139,95 @@ Architecture boundary correct:
   Pricing readiness uses calculationStatus, NOT sellPrice.
 
 Next: UI enhancements (Scope tab + readiness display in workspace header).
+
+---
+Task ID: phase1-freeze
+Agent: principal-engineer
+Task: Formal Phase 1 freeze decision — record honest verification status and deployment-pending gate.
+
+Context:
+- User reviewed commit cf990f5 and issued a freeze decision:
+  "Treat Phase 1 as code-complete / freeze-pending deployment verification."
+- User explicitly instructed: do NOT reopen the implementation, do NOT add
+  more Phase 1 features.
+- Next architectural stage is fixed by the user's roadmap:
+    Contractor Workspace (FROZEN)
+      -> BOQ / XLSX Binding + Reconciliation
+      -> Deterministic Schedule Engine
+      -> apps/plan
+      -> Microsoft Project-style clone
+
+Re-verification performed at freeze time (sandbox shell, commit cf990f5):
+- `bun run lint` ............. CLEAN (0 errors, 0 warnings)
+- `bun test` .................. 147 pass / 18 fail / 409 expect() across 24 files
+- dev server (port 3000) ...... UP, serving GET / 200, GET /api/auth/* 200
+- git HEAD .................... cf990f5 "Phase 1 verification: lint clean, 147 unit tests pass, build succeeds"
+
+The 147 passing tests are the pure-logic unit tests (PricingEngine, services,
+deterministic financial logic). These are the canonical verified gate and match
+the commit's claim.
+
+Root-cause analysis of the 18 integration-test failures (NOT a code regression):
+- Symptom: PrismaClientInitializationError — "Error validating datasource `db`:
+  the URL must start with the protocol `postgresql://` or `postgres://`."
+- Cause: the sandbox shell exports `DATABASE_URL=file:/home/z/my-project/db/custom.db`
+  (a SQLite file URL, 258KB, created by the sandbox test harness
+  tests/database-runtime-build.sh which fakes `bun run db:push` for SQLite).
+- This shell var takes precedence over the `.env` file's Neon PostgreSQL URL in
+  BOTH `bun test` and `bun run dev` (Next.js / @next/env also respects
+  pre-existing process.env over .env).
+- `schema.prisma` declares `provider = "postgresql"` (has been postgres since
+  commit 1afc9e8, well before cf990f5). Prisma therefore rejects the SQLite URL
+  at datasource-validation time.
+- The integration test CODE (cross-tenant, OpportunityService, BidService,
+  Scope/Readiness, Dashboard, Knowledge, Document, Subcontract, PricingEngine
+  boundary, historical bid reconstruction) was verified in an earlier SQLite
+  era and is recorded as passing in prior worklog entries. It cannot be
+  re-run against the current Neon schema from this shell without a dedicated
+  test database.
+- Conclusion: this is an environment / CI-infra gap, not a Phase 1 code defect.
+  It does not reopen the implementation.
+
+Deployment-verification requirement (the remaining formal gate):
+- For Vercel / CI to run the integration suite, a dedicated test database is
+  required (e.g. a Neon branch), and the build environment must NOT have a
+  shell-level `DATABASE_URL` pointing at a SQLite file. The application's
+  runtime DATABASE_URL must be the Neon postgresql:// string.
+- Vercel's current status for cf990f5 is a build-rate-limit failure, which is
+  a platform/quotum condition, not a code regression.
+- Browser E2E (login -> dashboard -> opportunities -> Office Complex -> scope
+  -> estimate -> bid readiness -> blocker navigation) remains
+  not-independently-verified, documented as a sandbox process-lifecycle
+  limitation. The user will verify via the Preview Panel / deployed app.
+
+Stage Summary — Phase 1 honest status:
+- Implementation ........................ COMPLETE (frozen)
+- Unit tests (147) ........................ PASS (verified at freeze)
+- Lint .................................... CLEAN (verified at freeze)
+- Build ................................... SUCCEEDS (per commit cf990f5)
+- Dev server startup ...................... UP (verified at freeze)
+- Integration tests (18 files) ............ ENV-BLOCKED (shell SQLite URL vs
+                                                 postgres schema; not a code
+                                                 regression; need dedicated CI
+                                                 test DB to re-verify)
+- Browser E2E ............................. NOT independently verified
+                                                 (sandbox limitation; verify
+                                                 via Preview Panel / deploy)
+- Production deployment ................... NOT verified (Vercel build-rate-limit)
+
+FREEZE DECISION (recorded):
+- Phase 1 = CODE-COMPLETE / FREEZE-PENDING DEPLOYMENT VERIFICATION.
+- Implementation is FROZEN. No Phase 1 features will be added.
+- The only remaining gates are deployment/infra gates, not code gates.
+
+Next stage (scoped, awaiting go-ahead to begin):
+- BOQ / XLSX Binding + Reconciliation:
+    * XLSX BOQ import -> structured BOQ items (parse-only, no pricing trust)
+    * Bind BOQ items <-> canonical Estimate WorkDefinitions / EstimateLines
+    * Reconciliation engine: missing-scope, extra-scope, qty mismatch, unit
+      mismatch, rate divergence — all classified, provenance-preserved
+    * Respects INVARIANT 1 (domain model is source of truth, not the XLSX),
+      INVARIANT 2 (Estimate canonical; BOQ is a projection/binding target),
+      INVARIANT 3 (every price has provenance), INVARIANT 9 (XLSX is a
+      working copy / import artifact, not canonical state).
+- Followed by: Deterministic Schedule Engine -> apps/plan -> MS Project clone.
