@@ -13,6 +13,20 @@
  *   so the engine can verify the quote covers the segment's specific scope.
  * - Fix #4: Percentages (overhead, profit, contingency) bounded to 0..1, not just >= 0.
  *
+ * PricingEngine hardening:
+ * - Fee resources are now included in directCost (as a `fee` cost component)
+ *   and their provenance is recorded. Previously `case 'fee': break;` silently
+ *   dropped them — violating "a recipe line that contributes financial truth
+ *   must never be parsed and then ignored."
+ * - Wastage is now applied to MATERIAL recipe lines only. Labour, plant, and
+ *   subcontract costs are NOT inflated by wastage — they have their own
+ *   productivity/cost model. The previous behavior silently inflated labour
+ *   and plant costs by the material wastage percentage.
+ * - `undecided` execution strategy now returns `incomplete` with a blocker,
+ *   rather than falling through to the self-perform path and producing a
+ *   falsely authoritative `complete` result.
+ * - Formula documentation added for margin vs markup semantics.
+ *
  * Pure: no `Math.random`, no `Date.now`, no I/O, no Prisma client.
  */
 
@@ -116,7 +130,7 @@ export interface PricingProvenanceEntry {
 }
 
 export interface BlockingInput {
-  kind: 'missing-price' | 'missing-hybrid-allocation' | 'missing-work-definition' | 'invalid-recipe' | 'missing-subcontract-quote' | 'invalid-price-observation' | 'invalid-quantity' | 'invalid-wastage' | 'invalid-percentage' | 'invalid-hybrid-segment' | 'partial-subcontract-coverage' | 'hybrid-missing-strategy' | 'uncovered-exposure-unknown' | 'segment-scope-not-covered' | 'missing-pricing-basis';
+  kind: 'missing-price' | 'missing-hybrid-allocation' | 'missing-work-definition' | 'invalid-recipe' | 'missing-subcontract-quote' | 'invalid-price-observation' | 'invalid-quantity' | 'invalid-wastage' | 'invalid-percentage' | 'invalid-hybrid-segment' | 'partial-subcontract-coverage' | 'hybrid-missing-strategy' | 'uncovered-exposure-unknown' | 'segment-scope-not-covered' | 'missing-pricing-basis' | 'undecided-execution-strategy';
   resourceName?: string;
   resourceCode?: string;
   detail: string;
@@ -131,6 +145,8 @@ export interface PricingBreakdown {
   labour: number;
   plant: number;
   subcontract: number;
+  /** Fee costs (e.g. permits, levies) — included in directCost. */
+  fee: number;
   uncoveredSubcontractExposure: number;
   /** True when exposure couldn't be determined (no uncoveredScopeValue provided). */
   exposureUnknown: boolean;
@@ -143,7 +159,18 @@ export interface PricingBreakdown {
   expectedProfit: number;
   sellPrice: number;
   unitRate: number;
+  /**
+   * True profit margin: expectedProfit / sellPrice.
+   * This is the actual margin the contractor earns on the selling price.
+   * Example: cost=100, profit markup=10% → sell=110, profit=10, margin=9.09%.
+   */
   expectedMarginPct: number;
+  /**
+   * Spread margin: (sellPrice - directCost) / sellPrice.
+   * This includes overhead + risk + profit in the spread. It is NOT the same
+   * as expectedMarginPct. Kept for backward compatibility with legacy reports
+   * that call this "margin" — but the true commercial margin is expectedMarginPct.
+   */
   marginPct: number;
   provenance: PricingProvenanceEntry[];
   unsourced: boolean;
@@ -161,6 +188,7 @@ function emptyBreakdown(
     labour: 0,
     plant: 0,
     subcontract: 0,
+    fee: 0,
     uncoveredSubcontractExposure: 0,
     exposureUnknown: false,
     directCost: 0,
@@ -299,6 +327,7 @@ export function priceLine(input: PricingInput): PricingBreakdown {
   let labour = 0;
   let plant = 0;
   let subcontractFromRecipe = 0;
+  let fee = 0;
 
   for (const line of recipe) {
     if (!line || typeof line !== 'object') continue;
@@ -348,16 +377,24 @@ export function priceLine(input: PricingInput): PricingBreakdown {
 
     const price = line.priceObservation.price;
     const qpu = line.quantityPerUnit;
-    const lineCost = round2(qpu * qty * (1 + wastage) * price);
+
+    // Wastage semantics: material wastage applies to MATERIAL recipe lines only.
+    // Labour, plant, subcontract, and fee costs are NOT inflated by wastage —
+    // they have their own productivity/cost model. The previous behavior
+    // silently inflated labour and plant costs by the material wastage %.
+    const wastageMultiplier = kind === 'material' ? (1 + wastage) : 1;
+    const lineCost = round2(qpu * qty * wastageMultiplier * price);
 
     switch (kind) {
       case 'material': material += lineCost; break;
       case 'labour': labour += lineCost; break;
       case 'plant': plant += lineCost; break;
       case 'subcontract': subcontractFromRecipe += lineCost; break;
-      case 'fee': break;
+      case 'fee': fee += lineCost; break;
     }
 
+    // Provenance is recorded for ALL priced resources, including fees.
+    // An unsourced price must never appear indistinguishable from a sourced one.
     provenance.push({
       resourceCode: line.resourceCode,
       resourceName: line.resourceName,
@@ -374,6 +411,17 @@ export function priceLine(input: PricingInput): PricingBreakdown {
   let subcontractCost = subcontractFromRecipe;
   let uncoveredSubcontractExposure = 0;
   let exposureUnknown = false;
+
+  // F5: `undecided` execution strategy must NOT produce a falsely authoritative
+  // `complete` result. An undecided strategy means the estimator hasn't decided
+  // how the work will be executed — the price is indicative at best, and
+  // committing it to a finalized estimate would give false precision.
+  if (executionStrategy === 'undecided') {
+    blockingInputs.push({
+      kind: 'undecided-execution-strategy',
+      detail: 'Execution strategy is "undecided" — the work has not been assigned a self-perform, subcontract, or hybrid strategy. The calculated price is indicative only and cannot be committed to a finalized estimate.',
+    });
+  }
 
   if (executionStrategy === 'subcontract') {
     if (!subcontractQuote) {
@@ -533,17 +581,30 @@ export function priceLine(input: PricingInput): PricingBreakdown {
   labour = round2(labour);
   plant = round2(plant);
   subcontractCost = round2(subcontractCost);
+  fee = round2(fee);
 
-  const directCost = round2(material + labour + plant + subcontractCost);
+  // directCost includes all cost components: material + labour + plant + subcontract + fee.
+  // Fee costs (permits, levies, etc.) are part of direct cost — they are not
+  // overhead or profit. Previously fees were silently dropped from the calculation.
+  const directCost = round2(material + labour + plant + subcontractCost + fee);
   const projectCost = directCost;
+  // Risk/contingency is calculated on direct+project cost, NOT on sell price or profit.
   const riskCost = round2(directCost * contingencyPct);
+  // Overhead is recovered on project cost + risk, NOT on profit or sell price.
   const overhead = round2((projectCost + riskCost) * overheadPct);
+  // estimatedTotalCost = everything except profit (direct + risk + overhead).
   const estimatedTotalCost = round2(projectCost + riskCost + overhead);
+  // Profit is a markup on estimatedTotalCost (NOT on sell price — that would be circular).
+  // profitPct here is a markup percentage, NOT a margin percentage.
+  // Example: cost=100, profitPct=0.10 → profit=10, sell=110, margin=9.09%.
   const profit = round2(estimatedTotalCost * profitPct);
   const sellPrice = round2(estimatedTotalCost + profit);
   const expectedProfit = round2(sellPrice - estimatedTotalCost);
   const unitRate = qty > 0 ? round2(sellPrice / qty) : 0;
+  // expectedMarginPct = true margin (profit / sell price).
   const expectedMarginPct = sellPrice > 0 ? round2(expectedProfit / sellPrice) : 0;
+  // marginPct = spread margin ((sell - direct) / sell) — includes overhead+risk+profit.
+  // NOT the same as expectedMarginPct. Kept for backward compatibility.
   const marginPct = sellPrice > 0 ? round2((sellPrice - directCost) / sellPrice) : 0;
 
   const calculationStatus: CalculationStatus =
@@ -556,6 +617,7 @@ export function priceLine(input: PricingInput): PricingBreakdown {
     labour,
     plant,
     subcontract: subcontractCost,
+    fee,
     uncoveredSubcontractExposure,
     exposureUnknown,
     directCost,

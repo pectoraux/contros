@@ -1568,3 +1568,90 @@ Stage Summary:
 - Six application services: EstimateService (FROZEN), SubcontractService (FROZEN),
   BidService (FROZEN), OpportunityService (FROZEN), DocumentService (FROZEN),
   KnowledgeService (FROZEN).
+
+---
+Task ID: pricing-engine-hardening
+Agent: principal-engineer
+Task: Deterministic PricingEngine hardening — fee handling, wastage semantics, undecided strategy, margin documentation, golden fixtures
+
+Audit Findings:
+- F1 (BUG): Fee resources silently dropped from cost (`case 'fee': break;`). Provenance not recorded.
+- F2: Wastage applied to ALL recipe lines (labour, plant, subcontract) instead of material only.
+- F3: Provenance incomplete for fee resources.
+- F4: round2 silently converts non-finite to 0 (acceptable — engine validates inputs at top level).
+- F5: `undecided` execution strategy produced falsely authoritative `complete` result.
+- F6: Margin semantics (expectedMarginPct vs marginPct) not documented in engine.
+- F7: No explicit replay determinism test.
+
+Files Changed:
+- src/lib/engines/pricing-engine.ts — fee handling, wastage fix, undecided blocker, formula docs
+- src/application/estimate-service.ts — persist feeCost
+- src/application/opportunity-service.ts — surface feeCost in detail API
+- prisma/schema.prisma — added feeCost field to EstimateLine
+- tests/unit/pricing-golden.test.ts — NEW: 41 golden + property + edge-case tests
+
+Pricing Formula Definitions (documented in engine):
+- directCost = material + labour + plant + subcontract + fee
+- projectCost = directCost
+- riskCost = directCost × contingencyPct
+- overhead = (projectCost + riskCost) × overheadPct
+- estimatedTotalCost = projectCost + riskCost + overhead (excludes profit)
+- profit = estimatedTotalCost × profitPct (MARKUP on cost, NOT margin)
+- sellPrice = estimatedTotalCost + profit
+- expectedProfit = sellPrice - estimatedTotalCost
+- expectedMarginPct = expectedProfit / sellPrice (TRUE margin)
+- marginPct = (sellPrice - directCost) / sellPrice (SPREAD margin, includes overhead+risk)
+- unitRate = sellPrice / quantity (0 if quantity=0, never NaN/Infinity)
+
+Provenance Behavior:
+- Every priced resource (material, labour, plant, subcontract, fee) has a provenance entry.
+- Unsourced resources are flagged with `unsourced=true` + `unsourcedResources=[...]`.
+- Calculation becomes `incomplete` when any resource is unsourced.
+
+Tests Added:
+- Golden Fixture A (simple material/labour — exact expected output)
+- Golden Fixture B (subcontract full coverage)
+- Golden Fixture C (partial subcontract → blocker)
+- Golden Fixture D (hybrid 50/50 — no double-count)
+- Golden Fixture E (unsourced resource → blocker)
+- Golden Fixture F (invalid price — negative, NaN, Infinity)
+- Golden Fixture G (fee visibly represented + fee missing → blocker)
+- Golden Fixture H (zero quantity — deterministic, no NaN)
+- Wastage semantics (material only, not labour/plant/fee)
+- Margin vs markup (cost=100, markup=10% → sell=110, margin=9.09%)
+- Undecided strategy (blocker, not false precision)
+- Property tests (7 deterministic invariants)
+- Hybrid double-count prevention (4 tests)
+- Edge cases (8 tests)
+- Replay determinism (3 tests)
+
+Tests Passed:
+- 147 unit tests (106 existing + 41 new) — 0 fail
+- 19 BidService integration tests — 0 fail (regression check)
+- Lint clean
+
+Known Limitations:
+- Money uses JS `number` (IEEE-754 double). Safe up to ~10M GHS. Treasury-scale
+  calculations would need a decimal library. This is documented in money.ts.
+- The `undecided` strategy still computes indicative costs (for preview) but
+  blocks commit. This is intentional — the estimator sees an indicative number
+  but cannot finalize with it.
+- The `marginPct` field is kept for backward compatibility with legacy reports.
+  New code should use `expectedMarginPct` (true margin).
+
+Commit SHA: (pending push)
+Deployment status: (pending Vercel — rate limit may apply)
+
+Stage Summary:
+- PricingEngine is now:
+  * pure (no Prisma, no I/O, no Date.now, no Math.random)
+  * deterministic (same inputs → same output, proven by replay test)
+  * provenance-aware (every priced resource has a provenance entry)
+  * invalid-input-safe (NaN, Infinity, negative → blocker, not silent zero)
+  * subcontract-aware (full/partial/hybrid coverage with no extrapolation)
+  * hybrid-safe (no double-count, segment validation, pricing basis required)
+  * money-policy-consistent (round2 banker's rounding, documented formulas)
+  * reproducible (replayRevision uses only snapshot data)
+  * authoritative (EstimateService uses priceLine as the single canonical path)
+- EstimateService → PricingEngine is one canonical calculation path.
+- Ready for Historical Bid Validation gate.

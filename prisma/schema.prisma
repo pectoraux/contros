@@ -370,6 +370,7 @@ model EstimateLine {
   labourCost            Float    @default(0)
   plantCost             Float    @default(0)
   subcontractCost       Float    @default(0)
+  feeCost               Float    @default(0) // permits, levies, fees — part of directCost
   directCost            Float    @default(0)
   projectCost           Float    @default(0) // direct + project-specific
   riskCost              Float    @default(0)

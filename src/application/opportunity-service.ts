@@ -379,6 +379,7 @@ export const opportunityService = {
             labourCost: l.labourCost,
             plantCost: l.plantCost,
             subcontractCost: l.subcontractCost,
+            feeCost: l.feeCost,
             directCost: l.directCost,
             projectCost: l.projectCost,
             riskCost: l.riskCost,

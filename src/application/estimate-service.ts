@@ -212,6 +212,7 @@ export const estimateService = {
           labourCost: round2(breakdown.labour),
           plantCost: round2(breakdown.plant),
           subcontractCost: round2(breakdown.subcontract),
+          feeCost: round2(breakdown.fee),
           directCost: round2(breakdown.directCost),
           projectCost: round2(breakdown.projectCost),
           riskCost: round2(breakdown.riskCost),
