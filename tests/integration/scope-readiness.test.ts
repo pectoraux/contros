@@ -208,6 +208,78 @@ describe('Scope Workspace + Bid Readiness integration tests', () => {
     const result = await bidReadinessService.getReadiness({ ctx: ctxA, opportunityId: OPP_A })
 
     expect(result.score.documents).toBe(0) // No bid → no deliverables
+    // FIX: must also produce a DOCUMENT blocker — not just score=0
+    const docBlockers = result.blockers.filter(b => b.category === 'DOCUMENT')
+    expect(docBlockers.length).toBeGreaterThan(0)
+    expect(docBlockers.some(b => b.code === 'MISSING_DOCUMENT')).toBe(true)
+    // ready must be false when documents are missing
+    expect(result.ready).toBe(false)
+  }, 30000)
+
+  test('bid readiness with no bid cannot return ready=true', async () => {
+    // This is the adversarial test for the no-bid fix.
+    // Even if scope/pricing/knowledge are all perfect, missing documents
+    // (no bid) must block readiness.
+    const result = await bidReadinessService.getReadiness({ ctx: ctxA, opportunityId: OPP_A })
+    expect(result.ready).toBe(false)
+    expect(result.blockers.some(b => b.category === 'DOCUMENT')).toBe(true)
+  }, 30000)
+
+  test('knowledge alerts are opportunity-relevant, not org-wide', async () => {
+    // Org A has a knowledge alert. Org B has a different one.
+    // The alert on Org A should be relevant to OPP_A only if it references
+    // an entity used by OPP_A's estimate, or has no entityId (org-wide).
+
+    // Create an alert with an entityId that is NOT related to OPP_A
+    // (e.g. referencing a different opportunity's scope item)
+    const unrelatedAlert = await db.knowledgeAlert.create({
+      data: {
+        organizationId: ORG_A,
+        type: 'stale-price',
+        severity: 'blocker',
+        title: 'Unrelated stale price',
+        detail: 'This alert references an entity not used by OPP_A',
+        entityId: 'some-unrelated-entity-id',
+        entityType: 'Resource',
+      },
+    })
+
+    const result = await bidReadinessService.getReadiness({ ctx: ctxA, opportunityId: OPP_A })
+
+    // The unrelated alert should NOT appear in the blockers
+    const unrelatedBlockers = result.blockers.filter(
+      b => b.category === 'KNOWLEDGE' && b.message.includes('Unrelated stale price'),
+    )
+    expect(unrelatedBlockers.length).toBe(0)
+
+    // Clean up
+    await db.knowledgeAlert.delete({ where: { id: unrelatedAlert.id } })
+  }, 30000)
+
+  test('org-wide knowledge alert (no entityId) blocks all opportunities', async () => {
+    // An alert with no entityId is truly org-wide and should affect all opportunities
+    const orgWideAlert = await db.knowledgeAlert.create({
+      data: {
+        organizationId: ORG_A,
+        type: 'stale-price',
+        severity: 'blocker',
+        title: 'Org-wide stale price',
+        detail: 'Affects all bids',
+        entityId: null,
+        entityType: null,
+      },
+    })
+
+    const result = await bidReadinessService.getReadiness({ ctx: ctxA, opportunityId: OPP_A })
+
+    // The org-wide alert SHOULD appear in the blockers
+    const orgWideBlockers = result.blockers.filter(
+      b => b.category === 'KNOWLEDGE' && b.message.includes('Org-wide stale price'),
+    )
+    expect(orgWideBlockers.length).toBe(1)
+
+    // Clean up
+    await db.knowledgeAlert.delete({ where: { id: orgWideAlert.id } })
   }, 30000)
 
   test('bid readiness tenant isolation — Org B cannot see Org A readiness', async () => {

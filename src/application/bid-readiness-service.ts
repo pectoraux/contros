@@ -152,12 +152,25 @@ export const bidReadinessService = {
 
     // ── Document readiness ───────────────────────────────────────────────
     // Use TenderDeliverable status, NOT file existence.
+    // If no bid exists, this is a blocker — the opportunity cannot be
+    // ready for submission without a bid and its deliverables.
+    const hasBid = await bidReadinessRepository.bidExists(
+      ctx.organizationId, opportunityId,
+    )
     const deliverables = await bidReadinessRepository.getTenderDeliverables(
       ctx.organizationId, opportunityId,
     )
 
     let documentsScore = 0
-    if (deliverables.length > 0) {
+    if (!hasBid) {
+      // No bid → no deliverables at all. This is a blocker.
+      documentsScore = 0
+      blockers.push({
+        category: 'DOCUMENT',
+        code: 'MISSING_DOCUMENT',
+        message: 'No bid has been created for this opportunity — required deliverables cannot be assessed.',
+      })
+    } else if (deliverables.length > 0) {
       const requiredDeliverables = deliverables.filter((d) => d.required)
       if (requiredDeliverables.length > 0) {
         const readyDocs = requiredDeliverables.filter(
@@ -179,13 +192,23 @@ export const bidReadinessService = {
         documentsScore = 100 // No required deliverables
       }
     } else {
-      // No bid → no deliverables. If there's no bid yet, documents are 0%.
+      // Bid exists but no deliverables created yet — blocker.
       documentsScore = 0
+      blockers.push({
+        category: 'DOCUMENT',
+        code: 'MISSING_DOCUMENT',
+        message: 'Bid exists but no tender deliverables have been created — required deliverables must be initialized.',
+      })
     }
 
     // ── Knowledge readiness ──────────────────────────────────────────────
-    const alerts = await bidReadinessRepository.getUnacknowledgedAlerts(
-      ctx.organizationId,
+    // Only include alerts RELEVANT to this opportunity — not org-wide
+    // alerts that happen to reference unrelated entities.
+    // An alert is relevant if it references a WorkDefinition/WDV/Resource
+    // used by this opportunity's estimate, or if it has no entityId
+    // (truly org-wide alerts that apply to all bids).
+    const alerts = await bidReadinessRepository.getOpportunityRelevantAlerts(
+      ctx.organizationId, opportunityId,
     )
 
     let knowledgeScore = 100
