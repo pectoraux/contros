@@ -73,21 +73,35 @@ function classifyVariance(
  *
  * The old engine applied wastage to ALL recipe lines (material, labour, plant,
  * subcontract, fee). The new engine applies wastage to MATERIAL ONLY.
- * This produces a consistent variance on lines that have labour/plant/fee
- * components — the DB value is slightly higher because labour was inflated
- * by the wastage percentage.
  *
- * This is classified as EXPLAINABLE, not RECONSTRUCTION_ERROR, because:
- * 1. The variance is consistently in one direction (DB > replay)
- * 2. The magnitude is proportional to the labour/plant cost × wastage %
- * 3. The cause is a documented engine correction (wastage-semantics fix)
- * 4. The replay is CORRECT — the DB value reflects the old (incorrect) behavior
+ * CAUSAL EQUATION (not a heuristic):
+ *
+ * For a given cost component C (labour, plant, or fee):
+ *   oldCost_C = round2(qpu * qty * (1 + w) * price)    [old engine: wastage applied]
+ *   newCost_C = round2(qpu * qty * 1 * price)           [new engine: no wastage]
+ *   expectedDiff_C = oldCost_C - newCost_C
+ *
+ * Since oldCost_C = round2(newCost_C * (1 + w)) approximately:
+ *   expectedDiff_C ≈ oldCost_C * w / (1 + w)
+ *
+ * For aggregate fields (sellPrice, unitRate, directCost), the expected
+ * difference is the SUM of the per-component differences, propagated through
+ * the deterministic cost build-up (risk, overhead, profit).
+ *
+ * We compute the expected difference from the actual DB component values
+ * and the WDV wastage, then check that the observed difference matches
+ * within a small monetary tolerance (0.50 GHS — enough for round2 drift
+ * across multiple summation steps).
  */
 function classifyAndExplainWastageFix(
   field: string,
   dbValue: number | null,
   replayedValue: number | null,
   dbLine: { labourCost: number; plantCost: number; feeCost: number },
+  wastage: number,
+  isAggregate: boolean = false,
+  policy?: { overheadPct: number; profitPct: number; contingencyPct: number },
+  quantity?: number,
 ): Variance {
   if (dbValue === null && replayedValue === null) {
     return { field, dbValue, replayedValue, difference: 0, classification: 'EXACT', explanation: 'Both null.' }
@@ -97,28 +111,84 @@ function classifyAndExplainWastageFix(
   }
   const diff = Math.abs(dbValue - replayedValue)
   if (diff <= 0.02) {
-    return { field, dbValue, replayedValue, difference: diff, classification: 'EXACT', explanation: 'Within tolerance.' }
+    return { field, dbValue, replayedValue, difference: diff, classification: 'EXACT', explanation: 'Within 2-cent tolerance.' }
   }
-  // Check if the variance is explainable by the wastage fix.
-  // The old engine applied 5% wastage to labour+plant+fee. The variance
-  // should be roughly (labourCost + plantCost + feeCost) × wastage / (1 + wastage)
-  // for the line's WDV wastage (typically 5%).
-  // We use a generous threshold: if the variance is < 10% of the DB value,
-  // and the DB value is higher, classify as EXPLAINABLE.
-  if (dbValue > replayedValue) {
-    const pctDiff = diff / dbValue
-    if (pctDiff < 0.10) { // < 10% difference
-      return {
-        field, dbValue, replayedValue, difference: diff,
-        classification: 'EXPLAINABLE',
-        explanation: `DB value is ${pctDiff.toFixed(2)}% higher than replay. This is the expected effect of the wastage-semantics fix: the old engine applied wastage to labour/plant/fee; the new engine applies wastage to materials only. The replayed value is correct; the DB value reflects the old (corrected) behavior.`,
-      }
+
+  // Compute the expected difference from the wastage correction.
+  //
+  // The old engine inflated labour, plant, and fee by (1 + wastage).
+  // The new engine does not. So the old component cost is:
+  //   oldComponentCost = round2(rawComponentCost * (1 + wastage))
+  // and the new is:
+  //   newComponentCost = round2(rawComponentCost)
+  // The difference is:
+  //   diff = oldComponentCost - newComponentCost
+  //        ≈ oldComponentCost * wastage / (1 + wastage)
+  //
+  // For aggregate fields (directCost, sellPrice), the difference propagates
+  // through the deterministic cost build-up:
+  //   directCost diff = labourDiff + plantDiff + feeDiff
+  //   sellPrice diff = directCostDiff * (1 + contingencyPct) * (1 + overheadPct) * (1 + profitPct)
+  // (approximately — exact propagation depends on rounding order)
+
+  const nonMaterialOldCost = dbLine.labourCost + dbLine.plantCost + dbLine.feeCost
+  const expectedComponentDiff = nonMaterialOldCost * wastage / (1 + wastage)
+
+  let expectedDiff: number
+  if (field.includes('unitRate') && quantity && quantity > 0) {
+    // unitRate = sellPrice / quantity. Compute the expected sellPrice diff,
+    // then divide by quantity to get the expected unitRate diff.
+    const expectedDirectDiff = expectedComponentDiff
+    const expectedRiskDiff = expectedDirectDiff * (policy?.contingencyPct ?? 0.05)
+    const expectedOverheadDiff = (expectedDirectDiff + expectedRiskDiff) * (policy?.overheadPct ?? 0.10)
+    const expectedTotalCostDiff = expectedDirectDiff + expectedRiskDiff + expectedOverheadDiff
+    const expectedProfitDiff = expectedTotalCostDiff * (policy?.profitPct ?? 0.12)
+    const expectedSellDiff = expectedTotalCostDiff + expectedProfitDiff
+    expectedDiff = expectedSellDiff / quantity
+  } else if (isAggregate && policy) {
+    // Propagate through the cost build-up: direct → risk → overhead → profit → sell
+    const expectedDirectDiff = expectedComponentDiff
+    const expectedRiskDiff = expectedDirectDiff * policy.contingencyPct
+    const expectedOverheadDiff = (expectedDirectDiff + expectedRiskDiff) * policy.overheadPct
+    const expectedTotalCostDiff = expectedDirectDiff + expectedRiskDiff + expectedOverheadDiff
+    const expectedProfitDiff = expectedTotalCostDiff * policy.profitPct
+    expectedDiff = expectedTotalCostDiff + expectedProfitDiff
+  } else if (field.includes('labour')) {
+    expectedDiff = dbLine.labourCost * wastage / (1 + wastage)
+  } else if (field.includes('plant')) {
+    expectedDiff = dbLine.plantCost * wastage / (1 + wastage)
+  } else if (field.includes('directCost')) {
+    expectedDiff = expectedComponentDiff
+  } else {
+    // For sellPrice (non-aggregate path) or other fields
+    expectedDiff = expectedComponentDiff
+  }
+
+  // Check if the observed difference matches the expected difference
+  // within a tolerance that accounts for round2 drift across summation steps.
+  // For unitRate fields, the diff is sellPriceDiff/quantity — the proportional
+  // magnitude is much smaller, so we use a larger relative tolerance.
+  const isUnitRate = field.includes('unitRate')
+  const tolerance = isUnitRate ? 0.50 : (isAggregate ? 2.00 : 0.50) // GHS
+  const diffOfDiffs = Math.abs(diff - expectedDiff)
+
+  // For unitRate, the proportional match is no longer needed since we
+  // compute the exact expected diff = expectedSellDiff / quantity.
+  const proportionalMatch = false
+
+  if (dbValue > replayedValue && (diffOfDiffs <= tolerance || proportionalMatch)) {
+    return {
+      field, dbValue, replayedValue, difference: diff,
+      classification: 'EXPLAINABLE',
+      explanation: `Observed diff ${diff.toFixed(4)} ≈ expected wastage-correction diff ${expectedDiff.toFixed(4)} (within ${tolerance} tolerance). The old engine applied ${(wastage * 100).toFixed(0)}% wastage to labour/plant/fee; the new engine applies wastage to materials only. Causal equation: nonMaterialCost × wastage / (1 + wastage) = ${nonMaterialOldCost.toFixed(2)} × ${wastage} / ${1 + wastage} = ${expectedDiff.toFixed(4)}.`,
     }
   }
+
+  // If the difference doesn't match the expected wastage-correction, it's unexplained
   return {
     field, dbValue, replayedValue, difference: diff,
     classification: 'RECONSTRUCTION_ERROR',
-    explanation: `Unexplained variance of ${diff.toFixed(4)}.`,
+    explanation: `Observed diff ${diff.toFixed(4)} ≠ expected wastage-correction diff ${expectedDiff.toFixed(4)} (diff-of-diffs: ${diffOfDiffs.toFixed(4)} > ${tolerance}). This variance is NOT explained by the wastage-semantics fix.`,
   }
 }
 
@@ -130,6 +200,8 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
   let dbLines: Array<{ id: string; description: string; quantity: number; unit: string; sellPrice: number; unitRate: number; directCost: number; materialCost: number; labourCost: number; plantCost: number; subcontractCost: number; feeCost: number; calculationStatus: string; executionStrategy: string; workDefinitionVersionId: string | null }>
   let revision: { snapshotJson: string; status: string }
   let replay: ReturnType<typeof replayRevision>
+  let wastageMap: Record<string, number> // wdvId → wastage
+  let policy: { overheadPct: number; profitPct: number; contingencyPct: number }
 
   beforeAll(async () => {
     // Load the actual historical bid from the DB
@@ -143,6 +215,8 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
       select: { id: true, status: true, overheadPct: true, profitPct: true, contingencyPct: true },
     }) as typeof estimate
 
+    policy = { overheadPct: estimate.overheadPct, profitPct: estimate.profitPct, contingencyPct: estimate.contingencyPct }
+
     dbLines = await db.estimateLine.findMany({
       where: { estimateId: 'est-office' },
       select: {
@@ -155,6 +229,17 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
       },
       orderBy: { createdAt: 'asc' },
     })
+
+    // Load WDV wastage for each line (needed for the causal variance equation)
+    const wdvIds = dbLines.map(l => l.workDefinitionVersionId).filter(Boolean) as string[]
+    const wdvs = await db.workDefinitionVersion.findMany({
+      where: { id: { in: wdvIds } },
+      select: { id: true, wastage: true },
+    })
+    wastageMap = {}
+    for (const wdv of wdvs) {
+      wastageMap[wdv.id] = wdv.wastage
+    }
 
     revision = await db.estimateRevision.findUnique({
       where: { id: 'rev-office-1' },
@@ -221,17 +306,17 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
         continue
       }
 
-      // Compare sellPrice, unitRate, directCost
-      // The DB values were computed by the OLD engine (before the wastage fix
-      // that made wastage material-only). The replay uses the NEW engine.
-      // This produces a consistent ~1% variance on lines with labour+material.
-      // This is an EXPLAINABLE variance — the engine was corrected, and the
-      // historical bid reflects the old (incorrect) calculation.
+      // Compare sellPrice, unitRate, directCost using the causal variance equation.
+      // The DB values were computed by the OLD engine (wastage on all recipe lines).
+      // The replay uses the NEW engine (wastage on materials only).
+      // The expected difference is computed from the actual wastage % and component costs.
+      const w = wastageMap[dbLine.workDefinitionVersionId ?? ''] ?? 0.05
+
       const sellPriceVariance = classifyAndExplainWastageFix(
         `${dbLine.description} — sellPrice`,
         dbLine.sellPrice,
         replayedLine.breakdown.sellPrice,
-        dbLine,
+        dbLine, w, true, policy,
       )
       variances.push(sellPriceVariance)
 
@@ -239,7 +324,7 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
         `${dbLine.description} — unitRate`,
         dbLine.unitRate,
         replayedLine.breakdown.unitRate,
-        dbLine,
+        dbLine, w, true, policy, dbLine.quantity,
       )
       variances.push(unitRateVariance)
 
@@ -247,7 +332,7 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
         `${dbLine.description} — directCost`,
         dbLine.directCost,
         replayedLine.breakdown.directCost,
-        dbLine,
+        dbLine, w, false,
       )
       variances.push(directCostVariance)
     }
@@ -282,9 +367,18 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
     const dbTotalSellPrice = dbLines.reduce((s, l) => s + l.sellPrice, 0)
     const replayedTotalSellPrice = replay.totalSellPrice
 
-    // The total variance is the sum of per-line wastage-fix variances.
-    // This is EXPLAINABLE — the DB total reflects the old engine's behaviour.
-    const variance = classifyAndExplainWastageFix('totalSellPrice', dbTotalSellPrice, replayedTotalSellPrice, { labourCost: 1, plantCost: 1, feeCost: 0 })
+    // Compute the expected total difference from all lines using their actual wastage rates.
+    const totalNonMaterialCost = dbLines.reduce((s, l) => s + l.labourCost + l.plantCost + l.feeCost, 0)
+    // Weighted average wastage across lines (weighted by non-material cost)
+    let weightedWastage = 0
+    for (const l of dbLines) {
+      const w = wastageMap[l.workDefinitionVersionId ?? ''] ?? 0.05
+      const nonMat = l.labourCost + l.plantCost + l.feeCost
+      weightedWastage += w * nonMat
+    }
+    weightedWastage = totalNonMaterialCost > 0 ? weightedWastage / totalNonMaterialCost : 0.05
+
+    const variance = classifyAndExplainWastageFix('totalSellPrice', dbTotalSellPrice, replayedTotalSellPrice, { labourCost: dbLines.reduce((s,l)=>s+l.labourCost,0), plantCost: dbLines.reduce((s,l)=>s+l.plantCost,0), feeCost: 0 }, weightedWastage, true, policy)
     expect(variance.classification).not.toBe('RECONSTRUCTION_ERROR')
   })
 
@@ -292,7 +386,17 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
     expect(replay.ok).toBe(true)
     if (!replay.ok) return
 
-    const variance = classifyAndExplainWastageFix('bid.finalPrice vs replay.totalSellPrice', bid.finalPrice, replay.totalSellPrice, { labourCost: 1, plantCost: 1, feeCost: 0 })
+    // Use weighted average wastage across all lines
+    const totalNonMaterialCost2 = dbLines.reduce((s, l) => s + l.labourCost + l.plantCost + l.feeCost, 0)
+    let weightedWastage2 = 0
+    for (const l of dbLines) {
+      const w = wastageMap[l.workDefinitionVersionId ?? ''] ?? 0.05
+      const nonMat = l.labourCost + l.plantCost + l.feeCost
+      weightedWastage2 += w * nonMat
+    }
+    weightedWastage2 = totalNonMaterialCost2 > 0 ? weightedWastage2 / totalNonMaterialCost2 : 0.05
+
+    const variance = classifyAndExplainWastageFix('bid.finalPrice vs replay.totalSellPrice', bid.finalPrice, replay.totalSellPrice, { labourCost: dbLines.reduce((s,l)=>s+l.labourCost,0), plantCost: dbLines.reduce((s,l)=>s+l.plantCost,0), feeCost: 0 }, weightedWastage2, true, policy)
     expect(variance.classification).not.toBe('RECONSTRUCTION_ERROR')
   })
 
@@ -356,8 +460,9 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
       // Material should be EXACT (wastage was already applied to material in the old engine)
       variances.push(classifyVariance(`${dbLine.description} — material`, dbLine.materialCost, b.material))
       // Labour/plant may have EXPLAINABLE variance (old engine applied wastage; new doesn't)
-      variances.push(classifyAndExplainWastageFix(`${dbLine.description} — labour`, dbLine.labourCost, b.labour, dbLine))
-      variances.push(classifyAndExplainWastageFix(`${dbLine.description} — plant`, dbLine.plantCost, b.plant, dbLine))
+      const w = wastageMap[dbLine.workDefinitionVersionId ?? ''] ?? 0.05
+      variances.push(classifyAndExplainWastageFix(`${dbLine.description} — labour`, dbLine.labourCost, b.labour, dbLine, w, false))
+      variances.push(classifyAndExplainWastageFix(`${dbLine.description} — plant`, dbLine.plantCost, b.plant, dbLine, w, false))
       variances.push(classifyVariance(`${dbLine.description} — subcontract`, dbLine.subcontractCost, b.subcontract))
       // feeCost was added after the seed — EXPLAINABLE if DB=0 but replay>0
       if (dbLine.feeCost === 0 && b.fee === 0) {
@@ -406,12 +511,13 @@ describe('Real Historical Bid Reconstruction — Office Complex (Zenith Properti
       if (!replayedLine) continue
 
       const b = replayedLine.breakdown
-      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — sellPrice`, dbLine.sellPrice, b.sellPrice, dbLine))
-      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — unitRate`, dbLine.unitRate, b.unitRate, dbLine))
-      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — directCost`, dbLine.directCost, b.directCost, dbLine))
+      const w = wastageMap[dbLine.workDefinitionVersionId ?? ''] ?? 0.05
+      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — sellPrice`, dbLine.sellPrice, b.sellPrice, dbLine, w, true, policy))
+      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — unitRate`, dbLine.unitRate, b.unitRate, dbLine, w, true, policy, dbLine.quantity))
+      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — directCost`, dbLine.directCost, b.directCost, dbLine, w, false))
       allVariances.push(classifyVariance(`${dbLine.description} — material`, dbLine.materialCost, b.material))
-      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — labour`, dbLine.labourCost, b.labour, dbLine))
-      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — plant`, dbLine.plantCost, b.plant, dbLine))
+      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — labour`, dbLine.labourCost, b.labour, dbLine, w, false))
+      allVariances.push(classifyAndExplainWastageFix(`${dbLine.description} — plant`, dbLine.plantCost, b.plant, dbLine, w, false))
       allVariances.push(classifyVariance(`${dbLine.description} — subcontract`, dbLine.subcontractCost, b.subcontract))
     }
 
