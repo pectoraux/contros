@@ -1908,3 +1908,52 @@ Stage Summary:
     Causal variance proof                               ✅
     Synthetic matrix                                    ✅
 - Next gate: Contractor Workspace.
+
+---
+Task ID: real-historical-app-boundary
+Agent: principal-engineer
+Task: REAL historical application-boundary reconstruction — clone actual Office Complex bid inputs through frozen services
+
+What was built:
+- tests/integration/real-historical-app-boundary.test.ts — NEW: 7 tests that
+  take the ACTUAL Office Complex — Zenith Properties historical bid as the
+  source of truth, clone its real commercial inputs (WDs, WDVs, recipes,
+  quantities, policy) into an isolated tenant, and run them through the
+  frozen application services.
+
+Flow:
+  Read historical inputs (WDs, WDVs, recipes, quantities, policy from est-office)
+    → clone into isolated tenant (rhab-org)
+    → EstimateService.recomputeLine() for each line (application boundary)
+    → EstimateService.finalizeRevision() (immutable snapshot)
+    → replayRevision(clone's snapshot)
+    → compare clone's replay vs original historical replay (EXACT match — same engine, same inputs)
+    → compare clone's replay vs historical DB values (causal variance — wastage fix)
+    → verify provenance completeness
+
+Key results:
+- Step 3: Clone DB state matches clone replay EXACTLY (0 variance — current engine)
+- Step 4: Clone replay matches historical replay EXACTLY (same engine, same inputs, same policy)
+- Step 5: Per-line comparison — each clone line matches its historical counterpart EXACTLY
+- Step 6: Clone replay vs historical DB values — the difference is causally explained
+  by the wastage fix (observed diff ≈ expected diff from nonMaterialCost × wastage / (1+wastage),
+  propagated through risk → overhead → profit). The observed difference matches the
+  expected difference within 5.00 GHS tolerance.
+- Step 7: Provenance is complete in the clone
+
+This is the REAL historical app-boundary reconstruction — not synthetic data,
+but the actual Office Complex bid's commercial inputs run through the frozen services.
+
+Tests Passed:
+- 7 real historical app-boundary tests (0 fail)
+- 147 unit tests (0 fail)
+- Lint clean
+
+Stage Summary:
+- Historical Bid Validation gate is now COMPLETE:
+    Synthetic matrix                          ✅
+    Real persisted-bid replay                  ✅
+    Causal variance classification             ✅
+    Synthetic app-boundary conformance         ✅
+    REAL historical app-boundary reconstruction ✅
+- Next gate: Contractor Workspace.
