@@ -4342,3 +4342,69 @@ VERIFICATION:
 - Programme integration (Neon) ........ 10 pass / 0 fail / 33 expect()
   (was 7; +3 X1/X2/X3 tests)
 - Frozen Phase 1 code ................. UNTOUCHED
+
+---
+Task ID: programme-bid-integration-correction
+Agent: principal-engineer
+Task: Y1/Y2/Y3 — make Bid.programmeRevisionId → ProgrammeRevision the sole NEW programme authority. Disconnect BidService from the legacy EstimateRevision(revisionType='programme') path. No frozen Phase 1 commercial code touched (BidService is the application layer, not the frozen domain).
+
+Y1 — Legacy programmeRevisionRepository disconnected from BidService.
+- BidService no longer imports `programmeRevisionRepository` (the legacy
+  EstimateRevision-based repo). It now imports `programmeRevisionRepo` (the
+  new ProgrammeRevision domain repo).
+- The legacy `getFinalizedForOpportunity` call is removed from submitBid().
+  No code path in BidService creates or reads EstimateRevision(revisionType=
+  'programme') for new submissions.
+- The legacy `programmeRevisionRepository` in index.ts is retained for
+  backward-read compatibility only (existing historical records).
+
+Y2 — Bid.programmeRevisionId is the sole programme authority.
+- submitBid() now validates Bid.programmeRevisionId → ProgrammeRevision via
+  programmeRevisionRepo.getForOrganization(orgId, revisionId). This verifies:
+  * the ProgrammeRevision exists
+  * it belongs to the same organization (tenant-safe)
+  * its Programme belongs to the same opportunity (if both are set)
+- The resolved programmeRevisionId is persisted on the Bid at submission.
+- The authoritative chain is:
+    Bid.programmeRevisionId → ProgrammeRevision → Programme → Organization
+
+Y3 — TenderDeliverable(kind='programme') DEPRECATED as programme authority.
+- All deliverable kinds are now 'document-backed' for gate purposes. The
+  programme deliverable's STATUS (ready/finalized) is still checked for the
+  submission gate, but its revisionId is NO LONGER consulted.
+- The DELIVERABLE_KIND_CLASS no longer has 'programme' as 'revision-backed'.
+- isRevisionBackedKind() always returns false — no kinds route through the
+  legacy revision-backed path.
+- REVISION_BACKED_KIND_TYPE has the programme entry commented out (DEPRECATED).
+- Existing TenderDeliverable(kind='programme').revisionId rows that point to
+  EstimateRevision(revisionType='programme') are retained for backward-read
+  compatibility but are NOT consulted for new submissions.
+
+TESTS (tests/unit/programme-bid-integration.test.ts — 6 source-level audits):
+1. BidService does NOT import the legacy programmeRevisionRepository.
+2. BidService does NOT call getFinalizedForOpportunity.
+3. submitBid validates via programmeRevisionRepo.getForOrganization.
+4. TenderDeliverable(kind='programme') is DEPRECATED (document-backed).
+5. REVISION_BACKED_KIND_TYPE has programme commented out.
+6. Audit JSON references ProgrammeRevision domain (not TenderDeliverable).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 295 pass / 0 fail (+6; 0 regressions)
+- Programme integration (Neon) ........ 10 pass / 0 fail (unchanged)
+- Frozen Phase 1 code ................. BidService is the application layer
+  (not the frozen domain); the changes are in the service orchestration, not
+  in PricingEngine/EstimateRevision/EstimateLine/Scope models.
+
+THE AUTHORITATIVE CHAIN (now unified):
+  Programme → finalizeProgramme() → ProgrammeRevision
+      ↓
+  Bid.programmeRevisionId (FK → ProgrammeRevision)
+      ↓
+  submitBid() validates via programmeRevisionRepo
+      ↓
+  Bid submitted with authoritative programme history
+
+LEGACY (read-only):
+  TenderDeliverable(kind='programme').revisionId → EstimateRevision(revisionType='programme')
+  Retained for historical records. Not consulted for new submissions.

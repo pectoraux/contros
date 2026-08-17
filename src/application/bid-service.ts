@@ -4,20 +4,23 @@
  * Final corrections:
  * - Submission gate uses FROZEN adjudicated revision for commercial data (not mutable estimate)
  * - Deliverable readiness uses TenderDeliverable records (not estimateRevision existence)
- * - Programme revision must be revisionType='programme' (not any estimate revision)
  * - Required deliverables block submission when missing
  * - Post-submission immutability for commercial fields
  *
- * Final cleanup:
- * - TenderDeliverable kinds are explicitly classified as revision-backed vs
- *   document-backed. Only revision-backed kinds require a domain revisionId
- *   pointing to a finalized EstimateRevision of the correct revisionType.
- *   Document-backed kinds require status=ready|finalized only; their
- *   revisionId semantics are deferred to a future DocumentService.
- * - submitBid() no longer accepts a caller-supplied programmeRevisionId.
- *   The programme revision is derived EXCLUSIVELY from
- *   TenderDeliverable(kind='programme').revisionId. There is no duplicate
- *   caller-supplied source of programme truth.
+ * Y1/Y2 CORRECTION — Programme authority migration:
+ * - The programme deliverable is NO LONGER resolved through the legacy
+ *   EstimateRevision(revisionType='programme') path. It is now resolved
+ *   through the new ProgrammeRevision domain.
+ * - submitBid() validates Bid.programmeRevisionId → ProgrammeRevision (via
+ *   programmeRevisionRepo.getForOrganization), NOT TenderDeliverable.revisionId
+ *   → EstimateRevision(revisionType='programme').
+ * - TenderDeliverable(kind='programme') is DEPRECATED for new bids — it
+ *   remains for legacy-read compatibility but does not define the programme
+ *   revision for new submissions. The programme deliverable's status
+ *   (ready/finalized) is still checked for the gate, but the revisionId on
+ *   the deliverable is no longer the authority.
+ * - The authoritative programme truth is:
+ *       Bid.programmeRevisionId → ProgrammeRevision → Programme → Organization
  *
  * FROZEN pattern: RequestContext → Service → Repository → Engine → Transaction → Audit
  */
@@ -41,7 +44,7 @@ import {
   bidRepository,
   auditLogRepository,
   estimateRevisionRepositoryExtended,
-  programmeRevisionRepository,
+  programmeRevisionRepo,
   tenderDeliverableRepository,
 } from '@/repositories'
 
@@ -103,32 +106,26 @@ const IMMUTABLE_FIELDS = ['finalPrice', 'directorAdjustment', 'adjustmentRationa
 
 // ─── Tender Deliverable Classification ──────────────────────────────────────
 //
-// TenderDeliverable has a generic (kind, required, status, revisionId) shape.
-// The semantics of `revisionId` depend on the kind:
+// Y1/Y2: TenderDeliverable(kind='programme') is DEPRECATED as a programme
+// revision authority. The programme deliverable's STATUS (ready/finalized)
+// is still checked for the submission gate, but its revisionId is NO LONGER
+// the source of programme truth. The authoritative programme revision is
+// Bid.programmeRevisionId → ProgrammeRevision.
 //
-//   revision-backed → revisionId MUST point to a finalized EstimateRevision
-//                     whose revisionType matches the kind's required type
-//                     and which belongs to the bid's opportunity.
-//                     Currently only `programme` is revision-backed.
+// All deliverable kinds are now 'document-backed' for deliverable-status
+// purposes. The programme revision is validated separately via
+// programmeRevisionRepo (see submitBid).
 //
-//   document-backed → revisionId is reserved for a future DocumentService
-//                     artifact reference (document ID, not a domain revision).
-//                     For the MVP, document-backed deliverables satisfy the
-//                     gate when status='ready'|'finalized'. revisionId may
-//                     be null at submission time; its semantics will be
-//                     defined by DocumentService and validated there.
-//
-// This explicit classification is the single source of truth for which kinds
-// require domain revision validation in submitBid(). Adding a new kind means
-// deciding which class it belongs to here — not silently inheriting generic
-// behavior.
+// Legacy: existing TenderDeliverable(kind='programme').revisionId rows that
+// point to EstimateRevision(revisionType='programme') are retained for
+// backward-read compatibility but are NOT consulted for new submissions.
 
-export type DeliverableKindClass = 'revision-backed' | 'document-backed'
+export type DeliverableKindClass = 'document-backed' | 'legacy-revision-backed'
 
 export const DELIVERABLE_KIND_CLASS: Record<string, DeliverableKindClass> = {
-  // revision-backed — requires a finalized EstimateRevision of revisionType='programme'
-  programme: 'revision-backed',
-  // document-backed — status-based readiness; revisionId semantics deferred to DocumentService
+  // Y1/Y2: 'programme' is now document-backed for gate purposes.
+  // The programme revision is validated via Bid.programmeRevisionId → ProgrammeRevision.
+  programme: 'document-backed',
   boq: 'document-backed',
   'method-statement': 'document-backed',
   jha: 'document-backed',
@@ -138,14 +135,15 @@ export const DELIVERABLE_KIND_CLASS: Record<string, DeliverableKindClass> = {
   certificate: 'document-backed',
 }
 
-// For revision-backed kinds, the EstimateRevision.revisionType that the
-// deliverable's revisionId must point to.
+// Y1/Y2: No kinds are revision-backed in the new path. The legacy
+// REVISION_BACKED_KIND_TYPE is retained for reference but not used.
 export const REVISION_BACKED_KIND_TYPE: Record<string, string> = {
-  programme: 'programme',
+  // programme: 'programme',  // DEPRECATED — now via ProgrammeRevision
 }
 
-function isRevisionBackedKind(kind: string): boolean {
-  return DELIVERABLE_KIND_CLASS[kind] === 'revision-backed'
+function isRevisionBackedKind(_kind: string): boolean {
+  // Y1/Y2: No kinds are revision-backed in the new path.
+  return false
 }
 
 // ─── BidService ─────────────────────────────────────────────────────────────
@@ -474,9 +472,10 @@ export const bidService = {
   /**
    * P0-5: Submit the bid — the critical guarded transaction.
    * The submitted revision MUST match the adjudicated revision.
-   * Programme revision is derived EXCLUSIVELY from
-   * TenderDeliverable(kind='programme').revisionId — there is no
-   * caller-supplied programmeRevisionId in this API.
+   *
+   * Y1/Y2: Programme revision is validated via Bid.programmeRevisionId →
+   * ProgrammeRevision (tenant-scoped). The legacy TenderDeliverable(kind=
+   * 'programme').revisionId path is DEPRECATED and no longer consulted.
    * Idempotent.
    */
   async submitBid(input: SubmitBidInput): Promise<{ ok: true; bidId: string; finalPrice: number; submittedAt: string } | Err> {
@@ -500,17 +499,11 @@ export const bidService = {
       return { ok: false, error: 'Cannot submit without an adjudicated estimate revision — record adjudication first', status: 400 }
     }
 
-    // P0-3/P0-4: Validate required tender deliverables.
-    //
-    // Deliverable readiness depends on the kind's class (see DELIVERABLE_KIND_CLASS):
-    //   - revision-backed: status='ready'|'finalized' AND revisionId must point
-    //     to a finalized EstimateRevision of the correct revisionType belonging
-    //     to the bid's opportunity. (Currently only 'programme'.)
-    //   - document-backed: status='ready'|'finalized' is sufficient.
-    //     revisionId may be null; its semantics are deferred to DocumentService.
+    // P0-3/P0-4: Validate required tender deliverables (status readiness only).
+    // Y1/Y2: All kinds are now 'document-backed' for gate purposes. The
+    // programme revision is validated separately below via ProgrammeRevision.
     const deliverables = await tenderDeliverableRepository.getForBid(ctx.organizationId, bidId)
 
-    // Step 1 — status readiness (applies to both classes).
     const missingRequired = deliverables.filter(
       (d) => d.required && d.status !== 'ready' && d.status !== 'finalized',
     )
@@ -519,43 +512,40 @@ export const bidService = {
       return { ok: false, error: `Required deliverables not ready: ${missingNames}`, status: 400 }
     }
 
-    // Step 2 — revision-backed kinds must have a valid domain revisionId.
-    // Collects resolved revisionIds per kind for downstream persistence.
-    // NOTE: Today only 'programme' is revision-backed and routed through
-    // programmeRevisionRepository. Adding a new revision-backed kind means
-    // dispatching by REVISION_BACKED_KIND_TYPE[kind] to the appropriate
-    // revision repository.
-    const resolvedRevisionIds: Record<string, string> = {}
-    for (const d of deliverables) {
-      if (!d.required) continue
-      if (!isRevisionBackedKind(d.kind)) continue
-      if (!d.revisionId) {
-        const expectedType = REVISION_BACKED_KIND_TYPE[d.kind] ?? 'domain'
-        return {
-          ok: false,
-          error: `${d.kind} deliverable is ready but has no revisionId — a finalized ${expectedType} revision is required`,
-          status: 400,
-        }
-      }
-      const rev = await programmeRevisionRepository.getFinalizedForOpportunity(
-        ctx.organizationId, bid.opportunityId, d.revisionId,
+    // Y1/Y2: Validate the programme revision via the NEW ProgrammeRevision domain.
+    // The authoritative programme truth is Bid.programmeRevisionId → ProgrammeRevision.
+    // The legacy TenderDeliverable(kind='programme').revisionId is NOT consulted.
+    let resolvedProgrammeRevisionId: string | null = bid.programmeRevisionId ?? null
+    if (resolvedProgrammeRevisionId) {
+      // Validate: ProgrammeRevision exists, is finalized, and belongs to this org.
+      const progRev = await programmeRevisionRepo.getForOrganization(
+        ctx.organizationId, resolvedProgrammeRevisionId,
       )
-      if (!rev) {
-        const expectedType = REVISION_BACKED_KIND_TYPE[d.kind] ?? 'domain'
+      if (!progRev) {
         return {
           ok: false,
-          error: `${d.kind} deliverable references an invalid ${expectedType} revision (not finalized, wrong type, or wrong opportunity)`,
+          error: 'Programme revision not found in this organization or not finalized',
           status: 400,
         }
       }
-      resolvedRevisionIds[d.kind] = d.revisionId
+      // Validate: the ProgrammeRevision's Programme belongs to the same opportunity.
+      // (Programme.opportunityId should match the bid's opportunityId, if both are set.)
+      if (progRev.programme && bid.opportunityId) {
+        // We need to check the programme's opportunityId. The getForOrganization
+        // include only selects id/organizationId/name — let's fetch the full programme.
+        const prog = await db.programme.findFirst({
+          where: { id: progRev.programmeId, organizationId: ctx.organizationId },
+          select: { id: true, opportunityId: true },
+        })
+        if (prog && prog.opportunityId && prog.opportunityId !== bid.opportunityId) {
+          return {
+            ok: false,
+            error: 'Programme revision does not belong to this opportunity',
+            status: 400,
+          }
+        }
+      }
     }
-
-    // Programme truth is derived EXCLUSIVELY from
-    // TenderDeliverable(kind='programme').revisionId. There is no
-    // caller-supplied programmeRevisionId in the public API — this is the
-    // single source of programme truth for the submitted bid.
-    const resolvedProgrammeRevisionId = resolvedRevisionIds.programme ?? null
 
     // P0-1: Validate the adjudicated revision is still finalized AND belongs to this bid's estimate+opportunity.
     const revision = await estimateRevisionRepositoryExtended.getFinalizedForBid(
@@ -597,7 +587,7 @@ export const bidService = {
         tenderPackStatus: 'submitted',
         submittedAt,
         estimateRevisionId: bid.adjudicatedRevisionId, // P0-5: submitted = adjudicated
-        programmeRevisionId: resolvedProgrammeRevisionId, // P0-4: from TenderDeliverable, not caller
+        programmeRevisionId: resolvedProgrammeRevisionId, // Y1/Y2: from Bid.programmeRevisionId → ProgrammeRevision
       })
       if (!updated) throw new Error('Bid update failed in transaction')
 
@@ -606,7 +596,7 @@ export const bidService = {
         summary: `Bid submitted: finalPrice=${bid.finalPrice ?? 0}, revision=${bid.adjudicatedRevisionId}`,
         afterJson: JSON.stringify({
           finalPrice: bid.finalPrice, estimateRevisionId: bid.adjudicatedRevisionId,
-          programmeRevisionId: resolvedProgrammeRevisionId, // from TenderDeliverable(kind='programme')
+          programmeRevisionId: resolvedProgrammeRevisionId, // Y1/Y2: from ProgrammeRevision domain
           gateResult: workspace.gate.overall, submittedAt: submittedAt.toISOString(),
         }),
       })
