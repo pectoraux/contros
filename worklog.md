@@ -2791,3 +2791,98 @@ for the next milestone (EstimateRevision → BOQ projection → XLSX), which
 will start with the projection CONTRACT from the immutable EstimateRevision
 (exact fields, provenance, projection version, deterministic ordering) — NOT
 with an XLSX library or workbook layout.
+
+---
+Task ID: boq-projection-contract
+Agent: principal-engineer
+Task: BOQ projection contract — the canonical→office projection. Pure domain types + deterministic function. NO XLSX library, parser, UI, or canonical mutation. Per approved milestone.
+
+ARCHITECTURE (approved):
+  EstimateRevision (immutable snapshot)
+      ↓
+  Projection contract (types)
+      ↓
+  Deterministic BOQ projection (pure function)
+      ↓
+  XLSX adapter (future — not yet)
+
+The projection is a READ-ONLY, DETERMINISTIC view of a finalized
+EstimateRevision. It exists independently of Excel — another implementation
+(CSV, PDF, a different XLSX lib) can reproduce EXACTLY the same rows from the
+same revision + projection version.
+
+CONTRACT (src/lib/boq/projection-contract.ts) establishes:
+- source: estimateRevisionId + estimateId + revisionNo + snapshotVersion
+  (cross-checked against the snapshot).
+- projectionVersion: explicit, deterministic identifier (branded number type).
+  v1 = initial field set. NOT a generation counter — every generation of the
+  same revision+version produces identical output.
+- row identity: lineId (the snapshot's frozen line id, NOT the mutable
+  EstimateLine) + rowNumber (1-based, deterministic from snapshot order).
+- fields: description, quantity, unit, workDefinition (versionId/name/version/
+  unit/wastage), commercial (unitRate/sellPrice/directCost/expectedProfit/
+  expectedMarginPct/executionStrategy).
+- ordering: deterministic — the snapshot's lines[] array order (frozen at
+  finalization). No re-sorting.
+- provenance: source + projectionVersion + contentHash + generatedBy +
+  generationContext + rowCount. contentHash is a deterministic digest of the
+  rows (NOT a timestamp). generatedBy/generationContext are audit-only.
+- commercial semantics: projection-only. The commercial fields come from the
+  REPLAYED snapshot (via replayRevision), not from mutable EstimateLine. There
+  is NO write-back path — the type has no setters, the function is pure.
+- historical rule: same revision + same projectionVersion → byte-identical
+  projection (same rows, same order, same contentHash). Enforced by making the
+  projection a PURE function of (snapshotJson, projectionVersion) — no
+  wall-clock time, no randomness, no external state.
+
+PURE FUNCTION (src/lib/boq/projection.ts):
+- projectRevision(input): BoqProjection — consumes the snapshotJson + a
+  projectionVersion, replays the snapshot (via the existing replayRevision),
+  and produces the read-only projection. Throws on invalid snapshot or
+  unsupported version.
+- projectionsMatch(a, b): boolean — verifies the historical rule for two
+  projections (same source + version + contentHash + rows).
+- computeContentHash: deterministic FNV-1a digest of the rows (stable JSON
+  stringify with sorted keys). NOT cryptographic — an equality proof.
+- No DB, no wall-clock, no randomness, no Excel concepts.
+
+FORBIDDEN patterns (documented, enforced):
+  reading mutable EstimateLine rows         (only the snapshot is read)
+  writing back to EstimateLine              (projection is read-only)
+  wall-clock timestamps in provenance       (breaks determinism)
+  randomness / external state               (breaks determinism)
+  XLSX-specific column layout in the domain (format-free)
+  a "sync projection → estimate" operation  (second truth)
+
+FILES (new — no frozen code modified):
+- src/lib/boq/projection-contract.ts — the contract types (source, version,
+  row identity, fields, provenance, the projection, input).
+- src/lib/boq/projection.ts — the pure projection function + projectionsMatch.
+- src/lib/boq/index.ts — barrel export appended.
+- tests/unit/boq-projection.test.ts — 20 tests.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 209 pass / 0 fail (was 189; +20 projection;
+  0 regressions)
+- Projection tests establish:
+  * basic shape + field coverage
+  * ordering (1-based, deterministic from snapshot)
+  * HISTORICAL RULE: same revision+version → identical rows+contentHash
+  * two generations by different actors → same rows+hash (audit-only fields
+    don't affect them)
+  * contentHash changes when revision content changes
+  * provenance carries all required fields
+  * error handling (invalid snapshot, unsupported version)
+  * projection-only semantics (mutating a row doesn't affect the source; no
+    write-back function exported)
+  * commercial fields equal the replayed breakdown (direct comparison)
+  * format independence (no Excel/XLSX concepts in the domain projection)
+- Frozen Phase 1 code ................. UNTOUCHED (zero diff on estimate/bid/
+  opportunity/pricing)
+
+NEXT (NOT started):
+- XLSX adapter: consumes BoqProjection, lays it out as cells. Cannot mutate
+  the projection or EstimateLine. This is where Excel-specific decisions
+  (column widths, number formats, sheet names) live — separate from the domain.
+- No UI yet. No canonical mutation ever.
