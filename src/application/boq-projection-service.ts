@@ -197,10 +197,17 @@ export const boqProjectionService = {
         }),
       })
     } catch (auditError) {
-      // The export succeeded; only the audit write failed. Surface as a warning.
-      auditWarning = `Export succeeded but audit write failed: ${
-        auditError instanceof Error ? auditError.message : String(auditError)
-      }`
+      // Q1: The export succeeded; only the audit write failed.
+      // Log the DETAILED error server-side (for operators/monitoring), but
+      // return a GENERIC message to the caller. Raw exception messages can
+      // contain DB/provider implementation details that should not cross the
+      // application boundary into an HTTP response.
+      console.error(
+        `[BoqProjectionService] audit write failed for revision ${revision.id}:`,
+        auditError instanceof Error ? auditError.message : String(auditError),
+        auditError instanceof Error ? auditError.stack : undefined,
+      )
+      auditWarning = 'Export completed, but audit recording failed.'
     }
 
     return {

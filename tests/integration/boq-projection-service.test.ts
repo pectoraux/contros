@@ -453,4 +453,42 @@ describe('BoqProjectionService integration tests', () => {
     // The field exists and is either null (audit succeeded) or a string (warning).
     expect(res.auditWarning === null || typeof res.auditWarning === 'string').toBe(true)
   }, 30000)
+
+  // ── Q2: FORCED audit failure — export still succeeds ──────────────────────
+
+  test('Q2: forced audit failure → export succeeds, bytes returned, generic auditWarning (no raw exception)', async () => {
+    // Force auditLogRepository.create to throw by temporarily replacing it.
+    const { auditLogRepository } = await import('../../src/repositories')
+    const originalCreate = auditLogRepository.create
+    const fakeError = new Error('SIMULATED_DB_CONNECTION_REFUSED: password authentication failed for user "neondb_owner" at ep-cold-tree-ayjbusjc.c-5.us-east-2.aws.neon.tech')
+    auditLogRepository.create = async () => {
+      throw fakeError
+    }
+
+    try {
+      const res = await boqProjectionService.exportXlsx({
+        ctx: ctxA,
+        estimateRevisionId: revisionId,
+      })
+      // Q2: the export SUCCEEDS despite the audit failure.
+      expect(res.ok).toBe(true)
+      if (!res.ok) return
+      // Bytes are still returned.
+      expect(Buffer.isBuffer(res.bytes)).toBe(true)
+      expect(res.bytes.length).toBeGreaterThan(0)
+      // The auditWarning is a GENERIC message — NOT the raw exception text.
+      expect(res.auditWarning).not.toBeNull()
+      expect(res.auditWarning).toBe('Export completed, but audit recording failed.')
+      // CRITICAL: the raw exception message must NOT leak into the result.
+      expect(res.auditWarning).not.toContain('SIMULATED_DB_CONNECTION_REFUSED')
+      expect(res.auditWarning).not.toContain('password authentication failed')
+      expect(res.auditWarning).not.toContain('neondb_owner')
+      // The sourceContentHash + fileName are still correct (deterministic).
+      expect(res.sourceContentHash).toHaveLength(64)
+      expect(res.fileName).toBe(`BOQ-${revisionId}-v1.xlsx`)
+    } finally {
+      // Restore the original audit method.
+      auditLogRepository.create = originalCreate
+    }
+  }, 30000)
 }, 300000)

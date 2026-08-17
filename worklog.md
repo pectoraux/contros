@@ -3833,3 +3833,50 @@ NEXT: the API route can be very thin:
   HTTP request → authenticated RequestContext → exportXlsx() → Buffer →
   Content-Disposition + XLSX response. No Prisma, revision lookup, replay,
   or Excel logic in the route.
+
+---
+Task ID: boq-projection-service-audit-failure-test
+Agent: principal-engineer
+Task: Actually test the audit-failure path (was implemented but unverified) + sanitize the auditWarning (no raw exception leak). Per reviewer's required correction before API route. No frozen code touched.
+
+Q1 — Sanitized auditWarning; raw error logged server-side only.
+- The catch block now logs the DETAILED error (message + stack) to console.error
+  for operators/monitoring, but returns a GENERIC message to the caller:
+  "Export completed, but audit recording failed."
+- Raw exception messages (DB connection strings, provider error text, internal
+  details) no longer cross the application boundary. The eventual HTTP route
+  will return only the generic warning.
+
+Q2 — FORCED audit-failure integration test (the gap was: P1 was implemented
+but never actually tested with a failing audit).
+- The test temporarily replaces auditLogRepository.create with a stub that
+  throws a realistic DB error (with connection details in the message), calls
+  exportXlsx, then restores the original method.
+- Proves:
+  * serialization succeeds (bytes returned, Buffer, length > 0)
+  * ok === true (export is NOT failed by the audit failure)
+  * auditWarning === "Export completed, but audit recording failed." (generic)
+  * the raw exception text does NOT leak (no "SIMULATED_DB_CONNECTION_REFUSED",
+    no "password authentication failed", no "neondb_owner" in the result)
+  * sourceContentHash + fileName are still correct (deterministic)
+- The server-side console.error log DOES show the full error details (visible
+  in the test output).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 254 pass / 0 fail (0 regressions)
+- BOQ projection integration (Neon) ... 16 pass / 0 fail / 73 expect()
+  (was 15; +1 Q2 forced-audit-failure test)
+- Frozen Phase 1 code ................. UNTOUCHED
+
+ERROR/AUDIT CONTRACT (now both implemented AND tested):
+  export succeeds, audit succeeds  → ok: true, auditWarning: null
+  export succeeds, audit fails     → ok: true, auditWarning: "Export completed, but audit recording failed."
+    (raw error logged server-side only; does NOT cross the application boundary)
+  revision missing / wrong tenant   → ok: false, status: 404
+  revision exists, not finalized    → ok: false, status: 422
+
+API ROUTE NOTE (for the next step):
+  A successful export remains HTTP 200 regardless of auditWarning.
+  auditWarning is operational metadata (e.g. an X-Audit-Warning header), NOT
+  a reason to change the HTTP status. The commercial export succeeded.
