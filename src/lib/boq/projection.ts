@@ -43,34 +43,35 @@ import type {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /**
- * A stable, deterministic digest of the projected rows. NOT cryptographic —
- * a simple structural hash sufficient to prove "same rows" across regenerations.
- * Uses the row lineId + commercial fields, JSON-stringified deterministically
- * (sorted keys) so the hash is order-independent of object key enumeration.
+ * A stable, deterministic digest of the COMPLETE canonical projection content.
+ *
+ * F1 fix: the hash input is the full projection payload — every field of every
+ * BoqProjectionRow (identity, description, quantity, unit, workDefinition
+ * INCLUDING name/unit/wastage/versionId/version, commercial breakdown) PLUS the
+ * totals PLUS the projectionVersion. Excluded are ONLY the explicitly
+ * audit-only fields: generatedBy, generationContext (and the contentHash itself).
+ *
+ * This is hashed via stableJsonStringify (sorted keys at every depth) so the
+ * digest is independent of object key enumeration order. If the row type gains
+ * a field in the future, the hash automatically covers it — there is no manual
+ * field-selection list that could drift from the type.
+ *
+ * NOT cryptographic — a structural digest sufficient to prove "same canonical
+ * content" across regenerations.
  */
-function computeContentHash(rows: BoqProjectionRow[]): string {
-  // Deterministic JSON: sort keys at every level. We build a minimal
-  // representation (only the fields that define identity + commercial state)
-  // so the hash is stable even if the row type gains audit-only fields later.
-  const compact = rows.map((r) => ({
-    i: r.identity.lineId,
-    n: r.identity.rowNumber,
-    d: r.description,
-    q: r.quantity,
-    u: r.unit,
-    wd: r.workDefinition
-      ? `${r.workDefinition.versionId}|${r.workDefinition.version}`
-      : null,
-    c: {
-      ur: r.commercial.unitRate,
-      sp: r.commercial.sellPrice,
-      dc: r.commercial.directCost,
-      ep: r.commercial.expectedProfit,
-      em: r.commercial.expectedMarginPct,
-      es: r.commercial.executionStrategy,
-    },
-  }))
-  const json = stableJsonStringify(compact)
+function computeContentHash(
+  rows: BoqProjectionRow[],
+  totals: { totalDirectCost: number; totalSellPrice: number; totalExpectedProfit: number },
+  projectionVersion: ProjectionVersion,
+): string {
+  // The complete canonical payload (everything that defines the projection's
+  // commercial/content identity). Audit-only fields are intentionally absent.
+  const payload = {
+    projectionVersion,
+    rows,
+    totals,
+  }
+  const json = stableJsonStringify(payload)
   // FNV-1a 64-bit-ish hash (deterministic, no deps). Sufficient for equality
   // proof; not a security primitive.
   let h1 = 0x811c9dc5
@@ -204,8 +205,17 @@ export function projectRevision(input: ProjectionInput): BoqProjection {
     commercial: projectCommercial(line),
   }))
 
-  // Deterministic content hash (audit-only fields excluded).
-  const contentHash = computeContentHash(rows)
+  const totals = {
+    totalDirectCost: replay.totalDirectCost,
+    totalSellPrice: replay.totalSellPrice,
+    totalExpectedProfit: replay.totalExpectedProfit,
+  }
+
+  // Deterministic content hash over the COMPLETE canonical payload (rows +
+  // totals + projectionVersion). Audit-only fields (generatedBy,
+  // generationContext) are intentionally excluded so two generations by
+  // different actors produce the same hash.
+  const contentHash = computeContentHash(rows, totals, projectionVersion)
 
   const source = buildSource(estimateRevisionId, replay.snapshot)
   const provenance: ProjectionProvenance = {
@@ -220,22 +230,31 @@ export function projectRevision(input: ProjectionInput): BoqProjection {
   return {
     provenance,
     rows,
-    totals: {
-      totalDirectCost: replay.totalDirectCost,
-      totalSellPrice: replay.totalSellPrice,
-      totalExpectedProfit: replay.totalExpectedProfit,
-    },
+    totals,
   }
 }
 
 // ─── Determinism verification (exported for tests / audit) ──────────────────
 
 /**
- * Verify the historical rule: two projections of the same revision+version
- * are byte-identical in their rows + contentHash (audit-only fields ignored).
+ * Verify the canonical-content-equivalence rule: two projections of the same
+ * revision+version have the same canonical CONTENT (rows + totals + contentHash).
  *
- * Returns true iff the projections are equivalent under the historical rule.
- * This is the function an audit/log would call to prove reproducibility.
+ * F2: this is NOT "byte-identical projection" — the full BoqProjection object
+ * includes audit-only metadata (generatedBy, generationContext, rowCount) that
+ * may legitimately differ between two generations by different actors. The
+ * historical rule is about CANONICAL CONTENT equivalence, not byte equality of
+ * the whole object.
+ *
+ * Two projections match iff:
+ *   - same source (estimateRevisionId)
+ *   - same projectionVersion
+ *   - same contentHash (the deterministic digest of rows+totals+version)
+ *   - same rows (deep equality — belt-and-braces alongside the hash)
+ *
+ * Audit-only fields (generatedBy, generationContext) are intentionally NOT
+ * compared. This is the function an audit/log would call to prove that two
+ * generations produced the same canonical commercial content.
  */
 export function projectionsMatch(
   a: BoqProjection,
@@ -246,8 +265,14 @@ export function projectionsMatch(
   if (a.provenance.projectionVersion !== b.provenance.projectionVersion) return false
   if (a.provenance.contentHash !== b.provenance.contentHash) return false
   if (a.rows.length !== b.rows.length) return false
-  // Deep equality on rows (deterministic shape).
-  return JSON.stringify(a.rows) === JSON.stringify(b.rows)
+  // Deep equality on rows (deterministic shape). The contentHash already
+  // covers rows+totals+version, but we compare rows directly as a belt-and-
+  // braces check (and to surface exactly which field differs on failure).
+  if (JSON.stringify(a.rows) !== JSON.stringify(b.rows)) return false
+  // Also compare totals — the hash covers them, but compare explicitly for
+  // audit clarity (the totals are part of canonical content).
+  if (JSON.stringify(a.totals) !== JSON.stringify(b.totals)) return false
+  return true
 }
 
 /** Re-export the version helpers for consumers. */

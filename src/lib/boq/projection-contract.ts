@@ -30,10 +30,24 @@
  *
  * HISTORICAL RULE (the core invariant of this contract):
  *   same EstimateRevision + same projectionVersion
- *       → byte-identical projection (same rows, same order, same provenance).
- *   This is enforced by making the projection a PURE function of
+ *       → canonical-content-identical projection.
+ *   I.e. the same ROWS (identity, description, quantity, unit, workDefinition,
+ *   commercial), the same ORDER, the same TOTALS, and the same contentHash.
+ *
+ *   This is NOT "byte-identical projection" — the full BoqProjection object
+ *   includes audit-only metadata (generatedBy, generationContext) that may
+ *   legitimately differ between two generations by different actors. The
+ *   historical rule is about CANONICAL CONTENT equivalence, not byte equality
+ *   of the whole object. Two projections of the same revision+version by
+ *   different actors therefore have the same rows + totals + contentHash, but
+ *   may differ in generatedBy/generationContext.
+ *
+ *   Enforced by making the projection a PURE function of
  *   (snapshotJson, projectionVersion) — no wall-clock time, no randomness,
- *   no external state. Provenance carries a content hash, not a timestamp.
+ *   no external state. The contentHash is a deterministic digest of the
+ *   complete canonical payload (rows + totals + projectionVersion), excluding
+ *   only the audit-only fields. Provenance carries the contentHash, not a
+ *   timestamp.
  *
  * This file contains ONLY types. The pure algorithm lives in projection.ts.
  */
@@ -168,17 +182,20 @@ export interface BoqProjectionRow {
  * Full provenance for a projection. Carries everything needed to prove WHAT
  * was exported and to reproduce it.
  *
- * Determinism note: `contentHash` is a deterministic SHA-256-ish hash of the
- * projected rows (not a cryptographic guarantee — a stable string digest). It
- * is NOT a wall-clock timestamp. `generatedBy` / `generationContext` describe
- * the actor/context but do NOT affect the row content. Same revision + same
- * projectionVersion → same contentHash, always.
+ * Determinism note: `contentHash` is a deterministic digest of the COMPLETE
+ * canonical projection payload — every field of every row (including
+ * workDefinition name/unit/wastage, not just versionId/version), the totals,
+ * and the projectionVersion. It is NOT a wall-clock timestamp and NOT a
+ * cryptographic guarantee — a stable structural digest sufficient to prove
+ * "same canonical content". `generatedBy` / `generationContext` describe the
+ * actor/context but are audit-only and do NOT affect the contentHash. Same
+ * revision + same projectionVersion → same contentHash, always.
  */
 export interface ProjectionProvenance {
   source: ProjectionSource
   /** The projection format version used (deterministic identifier). */
   projectionVersion: ProjectionVersion
-  /** Deterministic digest of the projected rows (stable across regenerations). */
+  /** Deterministic digest of the complete canonical payload (rows + totals + version). */
   contentHash: string
   /** Who/what requested the projection (audit only — does not affect rows). */
   generatedBy: string | null
@@ -193,10 +210,13 @@ export interface ProjectionProvenance {
 /**
  * A complete BOQ projection — the output of the pure projection function.
  *
- * INVARIANT (historical rule): for a given (estimateRevisionId, snapshotJson,
- * projectionVersion), this object is byte-identical across regenerations
- * (modulo the audit-only `generatedBy`/`generationContext` fields, which do
- * not affect `rows` or `contentHash`).
+ * INVARIANT (historical rule — canonical-content-identical): for a given
+ * (estimateRevisionId, snapshotJson, projectionVersion), the CANONICAL CONTENT
+ * (rows + totals + contentHash) is identical across regenerations. The full
+ * object is NOT byte-identical: the audit-only `generatedBy`/`generationContext`
+ * fields (in provenance) may differ between two generations by different
+ * actors, but they do not affect `rows`, `totals`, or `contentHash`. Use
+ * projectionsMatch() to verify canonical-content equivalence.
  */
 export interface BoqProjection {
   provenance: ProjectionProvenance

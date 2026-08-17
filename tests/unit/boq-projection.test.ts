@@ -148,7 +148,7 @@ describe('BOQ projection — ordering (deterministic)', () => {
 })
 
 describe('BOQ projection — HISTORICAL RULE (the core invariant)', () => {
-  test('same revision + same projectionVersion → byte-identical rows + contentHash', () => {
+  test('same revision + same projectionVersion → canonical-content-identical (rows + contentHash)', () => {
     const snap = makeSnapshot([
       makeLine({ lineId: 'l1' }),
       makeLine({ lineId: 'l2', quantity: 50 }),
@@ -157,9 +157,11 @@ describe('BOQ projection — HISTORICAL RULE (the core invariant)', () => {
     const b = projectRevision(makeInput(snap))
     // contentHash identical
     expect(a.provenance.contentHash).toBe(b.provenance.contentHash)
-    // rows byte-identical
+    // rows identical (canonical content)
     expect(JSON.stringify(a.rows)).toBe(JSON.stringify(b.rows))
-    // projectionsMatch confirms equivalence
+    // totals identical (canonical content)
+    expect(JSON.stringify(a.totals)).toBe(JSON.stringify(b.totals))
+    // projectionsMatch confirms canonical-content equivalence
     expect(projectionsMatch(a, b)).toBe(true)
   })
 
@@ -189,6 +191,62 @@ describe('BOQ projection — HISTORICAL RULE (the core invariant)', () => {
   test('contentHash changes when the revision content changes', () => {
     const snap1 = makeSnapshot([makeLine({ lineId: 'l1', quantity: 100 })])
     const snap2 = makeSnapshot([makeLine({ lineId: 'l1', quantity: 120 })])
+    const a = projectRevision(makeInput(snap1))
+    const b = projectRevision(makeInput(snap2))
+    expect(a.provenance.contentHash).not.toBe(b.provenance.contentHash)
+    expect(projectionsMatch(a, b)).toBe(false)
+  })
+
+  test('F1/F3: contentHash changes when WorkDefinition NAME changes (same versionId/version)', () => {
+    // The hash must cover the COMPLETE projection content, including the WD
+    // name/unit/wastage — not just versionId/version. Two snapshots with the
+    // same versionId/version but different WD names must produce different hashes.
+    const baseWdv = makeLine().workDefinitionVersion!
+    const snap1 = makeSnapshot([makeLine({
+      workDefinitionVersion: { ...baseWdv, name: 'PVC Conduit' },
+    })])
+    const snap2 = makeSnapshot([makeLine({
+      workDefinitionVersion: { ...baseWdv, name: 'PVC Conduit Heavy' }, // same id+version, different name
+    })])
+    const a = projectRevision(makeInput(snap1))
+    const b = projectRevision(makeInput(snap2))
+    expect(a.provenance.contentHash).not.toBe(b.provenance.contentHash)
+    expect(projectionsMatch(a, b)).toBe(false)
+  })
+
+  test('F1/F3: contentHash changes when WorkDefinition WASTAGE changes (same versionId/version)', () => {
+    const baseWdv = makeLine().workDefinitionVersion!
+    const snap1 = makeSnapshot([makeLine({
+      workDefinitionVersion: { ...baseWdv, wastage: 0.05 },
+    })])
+    const snap2 = makeSnapshot([makeLine({
+      workDefinitionVersion: { ...baseWdv, wastage: 0.10 }, // same id+version, different wastage
+    })])
+    const a = projectRevision(makeInput(snap1))
+    const b = projectRevision(makeInput(snap2))
+    expect(a.provenance.contentHash).not.toBe(b.provenance.contentHash)
+    expect(projectionsMatch(a, b)).toBe(false)
+  })
+
+  test('F1/F3: contentHash changes when WorkDefinition UNIT changes (same versionId/version)', () => {
+    const baseWdv = makeLine().workDefinitionVersion!
+    const snap1 = makeSnapshot([makeLine({
+      workDefinitionVersion: { ...baseWdv, unit: 'm' },
+    })])
+    const snap2 = makeSnapshot([makeLine({
+      workDefinitionVersion: { ...baseWdv, unit: 'm2' }, // same id+version, different unit
+    })])
+    const a = projectRevision(makeInput(snap1))
+    const b = projectRevision(makeInput(snap2))
+    expect(a.provenance.contentHash).not.toBe(b.provenance.contentHash)
+    expect(projectionsMatch(a, b)).toBe(false)
+  })
+
+  test('F1/F3: contentHash changes when totals change (e.g. a line is added)', () => {
+    // The hash covers totals, so adding a line (which changes totals) must
+    // change the hash even if the first line is identical.
+    const snap1 = makeSnapshot([makeLine({ lineId: 'l1' })])
+    const snap2 = makeSnapshot([makeLine({ lineId: 'l1' }), makeLine({ lineId: 'l2', quantity: 50 })])
     const a = projectRevision(makeInput(snap1))
     const b = projectRevision(makeInput(snap2))
     expect(a.provenance.contentHash).not.toBe(b.provenance.contentHash)

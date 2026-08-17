@@ -2886,3 +2886,82 @@ NEXT (NOT started):
   the projection or EstimateLine. This is where Excel-specific decisions
   (column widths, number formats, sheet names) live — separate from the domain.
 - No UI yet. No canonical mutation ever.
+
+---
+Task ID: boq-projection-hash-fix
+Agent: principal-engineer
+Task: Fix the two pre-XLSX correctness issues in the projection contract — complete-content hash + precise audit-equivalence language. No frozen code touched.
+
+ISSUES CLOSED (per reviewer's findings):
+
+F1 — contentHash now covers the COMPLETE canonical projection payload.
+- The previous hash only incorporated versionId|version (plus basic row fields
+  and commercial values), EXCLUDING the WorkDefinition name/unit/wastage. Two
+  projections could therefore differ visibly (e.g. "PVC Conduit" vs "PVC Conduit
+  Heavy", wastage 0.05 vs 0.10) while retaining the same contentHash —
+  contradicting "everything needed to prove WHAT was exported."
+- Fix: computeContentHash now hashes the full { projectionVersion, rows, totals }
+  payload via stableJsonStringify (sorted keys at every depth). Every field of
+  every BoqProjectionRow (identity, description, quantity, unit, workDefinition
+  INCLUDING name/unit/wastage/versionId/version, commercial breakdown) PLUS the
+  totals PLUS the projectionVersion is represented. Excluded are ONLY the
+  explicitly audit-only fields (generatedBy, generationContext, and the
+  contentHash itself).
+- Robustness: there is no manual field-selection list that could drift from the
+  type — if the row type gains a field in the future, the hash automatically
+  covers it.
+- New tests (F3): contentHash changes when WD name changes (same id+version),
+  when WD wastage changes, when WD unit changes, and when totals change (line
+  added). All prove the hash is now sensitive to the complete content.
+
+F2 — Contract language corrected from "byte-identical" to "canonical-content-
+identical."
+- The implementation intentionally includes generatedBy/generationContext in
+  provenance, so two generations by different actors produce different full
+  BoqProjection objects. The code already defined equivalence as "same rows +
+  same contentHash" (ignoring audit fields), but the contract SAID "byte-
+  identical projection" — which was technically false.
+- Fix: the HISTORICAL RULE is now documented as "canonical-content-identical" —
+  same ROWS, ORDER, TOTALS, and contentHash; audit-only metadata may differ.
+  Corrected in: projection-contract.ts (HISTORICAL RULE comment, BoqProjection
+  invariant, ProjectionProvenance.contentHash determinism note) and projection.ts
+  (projectionsMatch docstring).
+- projectionsMatch() now also compares totals explicitly (belt-and-braces
+  alongside the hash) for audit clarity.
+
+FUTURE APPLICATION-SERVICE CONDITION (documented, not yet implemented):
+- The pure projectRevision() accepts (estimateRevisionId, snapshotJson) as
+  separate inputs — correct for the pure contract. The future application
+  service must NOT accept an arbitrary (revisionId, snapshotJson) pair from the
+  client. It must: RequestContext → tenant-scoped EstimateRevision lookup →
+  authoritative revisionId + snapshotJson → projectRevision(). Otherwise the
+  pure function is correct but the application boundary could be fed a
+  mismatched snapshot. This is a requirement for the next layer, not a defect
+  in this commit.
+
+FILES MODIFIED (no frozen code):
+- src/lib/boq/projection.ts — computeContentHash signature + payload (complete),
+  projectionsMatch totals comparison + docstring, projectRevision totals-before-hash.
+- src/lib/boq/projection-contract.ts — HISTORICAL RULE, BoqProjection invariant,
+  ProjectionProvenance.contentHash comments (byte-identical → canonical-content-
+  identical; complete-payload hash documentation).
+- tests/unit/boq-projection.test.ts — +4 F3 hash-coverage tests; renamed the
+  equivalence test from "byte-identical" to "canonical-content-identical".
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 213 pass / 0 fail (was 209; +4 F3; 0 regressions)
+- Projection tests .................... 24 pass / 0 fail
+- Hash-coverage tests prove:
+  * contentHash changes when WD name changes (same id+version)
+  * contentHash changes when WD wastage changes (same id+version)
+  * contentHash changes when WD unit changes (same id+version)
+  * contentHash changes when totals change (line added)
+- Frozen Phase 1 code ................. UNTOUCHED
+
+DISPOSITION (per reviewer):
+  ✅ hash covers complete projection content (F1)
+  ✅ "byte-identical" → "canonical-content-identical" (F2)
+  → XLSX adapter is the right next step, with the narrow adapter contract:
+    BoqProjection → XLSX bytes. No DB, no EstimateLine, no PricingEngine, no
+    opportunity lookup, no binding/reconciliation, no mutation.
