@@ -31,11 +31,12 @@
 
 import { computeSchedule, type ScheduleActivity, type ScheduleResult } from '@/lib/engines/schedule-engine'
 import { stableJsonStringify, computeContentDigest } from '@/lib/canonical-json'
-import type {
-  ActivityDependency,
-  ProgrammeActivity,
-  ProgrammeSnapshot,
-  ProgrammeValidationResult,
+import {
+  extractSnapshotContent,
+  type ActivityDependency,
+  type ProgrammeActivity,
+  type ProgrammeSnapshot,
+  type ProgrammeValidationResult,
 } from './types'
 
 // ─── Validation ─────────────────────────────────────────────────────────────
@@ -166,23 +167,32 @@ export function deserializeSnapshot(json: string): ProgrammeSnapshot {
   return parsed
 }
 
-// ─── Content hash (V3: SHA-256 of canonical JSON) ───────────────────────────
+// ─── Content hash (P1: SHA-256 of schedule CONTENT, not metadata) ───────────
 
 /**
- * Compute a SHA-256 content digest of a ProgrammeSnapshot.
+ * Compute a SHA-256 content digest of a ProgrammeSnapshot's SCHEDULE CONTENT.
  *
- * V3: mirrors the BoqProjection's sourceContentHash pattern. The digest is
- * over the canonical JSON (sorted keys), so it is independent of object
- * construction order. This provides content-addressing for the immutable
- * ProgrammeRevision:
- *   same snapshot → same content hash → same historical schedule identity
+ * P1: the hash is computed from the content projection
+ * (ProgrammeSnapshotContent — programmeId, programmeName, scheduleEngineVersion,
+ * activities, dependencies), NOT from the full ProgrammeSnapshot. This means
+ * revisionNo and finalizedAt (metadata) do NOT affect the hash:
+ *
+ *   same schedule content → same snapshotContentHash
+ *   different revisionNo (same content) → same hash
+ *   different finalizedAt (same content) → same hash
+ *
+ * This makes the invariant precise and matches the XLSX contentHash discipline:
+ * hash the content, not the metadata. The persisted snapshotJson includes
+ * revisionNo + finalizedAt for human inspection, but snapshotContentHash
+ * is computed from the content projection only.
  *
  * This should be persisted as ProgrammeRevision.snapshotContentHash so the
  * revision's content identity is directly inspectable without parsing the
  * snapshot JSON.
  */
 export function computeSnapshotContentHash(snapshot: ProgrammeSnapshot): string {
-  return computeContentDigest(snapshot)
+  const content = extractSnapshotContent(snapshot)
+  return computeContentDigest(content)
 }
 
 // ─── Schedule replay (deterministic CPM) ────────────────────────────────────

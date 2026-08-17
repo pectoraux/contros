@@ -286,4 +286,61 @@ describe('ProgrammeService finalization integration tests', () => {
     )
     expect(revSection).not.toMatch(/async update|async delete/)
   })
+
+  // ── P1: Content hash is computed from the content projection ──────────────
+
+  test('P1: snapshotContentHash is independent of revisionNo and finalizedAt', async () => {
+    // Finalize twice — same workspace, different revisionNo + finalizedAt.
+    // Both should produce the SAME snapshotContentHash.
+    const res1 = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
+    const res2 = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
+    expect(res1.ok).toBe(true)
+    expect(res2.ok).toBe(true)
+    if (!res1.ok || !res2.ok) return
+    expect(res1.snapshotContentHash).toBe(res2.snapshotContentHash)
+    // But different revisionNo.
+    expect(res1.revisionNo).not.toBe(res2.revisionNo)
+  }, 30000)
+
+  test('P1: persisted snapshotJson includes revisionNo + finalizedAt, but hash does not', async () => {
+    const res = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+
+    const revision = await db.programmeRevision.findFirst({
+      where: { id: res.revisionId },
+    })
+    expect(revision).not.toBeNull()
+
+    // The persisted snapshotJson DOES include revisionNo + finalizedAt.
+    const snapshot = JSON.parse(revision!.snapshotJson)
+    expect(snapshot.revisionNo).toBe(res.revisionNo)
+    expect(snapshot.finalizedAt).toBeTruthy()
+
+    // But the snapshotContentHash is computed from the content projection
+    // (no revisionNo/finalizedAt). Verify by recomputing from the content only.
+    const { computeSnapshotContentHash } = await import('../../src/lib/programme')
+    const contentOnlyHash = computeSnapshotContentHash(snapshot)
+    expect(contentOnlyHash).toBe(res.snapshotContentHash)
+  }, 30000)
+
+  // ── P2: Concurrent finalization produces unique revision numbers ──────────
+
+  test('P2: concurrent finalizations produce unique revision numbers (row lock)', async () => {
+    // Fire two finalizations concurrently. The SELECT FOR UPDATE lock on the
+    // Programme row serializes them — the second blocks until the first commits,
+    // then sees the new revisionNo and calculates the next one.
+    const [res1, res2] = await Promise.all([
+      programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A }),
+      programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A }),
+    ])
+    expect(res1.ok).toBe(true)
+    expect(res2.ok).toBe(true)
+    if (!res1.ok || !res2.ok) return
+    // Both succeeded (not one failing with a constraint violation).
+    // Unique revision numbers.
+    expect(res1.revisionNo).not.toBe(res2.revisionNo)
+    // The difference should be exactly 1 (sequential, not random).
+    expect(Math.abs(res1.revisionNo - res2.revisionNo)).toBe(1)
+  }, 60000)
 }, 300000)

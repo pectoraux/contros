@@ -136,15 +136,11 @@ export const programmeService = {
     const snapshot: ProgrammeSnapshot = {
       programmeId: programme.id,
       programmeName: programme.name,
-      revisionNo: 0, // placeholder — the real revisionNo is assigned in the transaction
+      revisionNo: 0, // assigned in the transaction; NOT part of the content hash (P1)
       scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
       activities,
       dependencies,
-      // finalizedAt is NOT part of the content hash — it's audit metadata.
-      // Using an empty string here so the hash depends only on the schedule
-      // content (activities + dependencies + engine version + programme identity).
-      // The real finalizedAt is persisted on the ProgrammeRevision row itself.
-      finalizedAt: '',
+      finalizedAt: '', // assigned in the transaction; NOT part of the content hash (P1)
     }
 
     // 3. Validate the snapshot.
@@ -157,19 +153,26 @@ export const programmeService = {
       }
     }
 
-    // 4. Serialize + hash (pure, deterministic).
-    // The content hash is computed from the SCHEDULE CONTENT only — activities,
-    // dependencies, engine version, and programme identity. It does NOT include
-    // revisionNo or finalizedAt (those are metadata, not content). This means
-    // two finalizations of the same workspace produce the same content hash,
-    // which is the correct reproducibility invariant.
-    const snapshotJson = serializeSnapshot(snapshot)
+    // 4. Compute the content hash from the SCHEDULE CONTENT projection (P1).
+    // P1: computeSnapshotContentHash uses extractSnapshotContent internally,
+    // which strips revisionNo and finalizedAt. The hash depends only on:
+    // programmeId, programmeName, scheduleEngineVersion, activities, dependencies.
+    // Two finalizations of the same workspace produce the same content hash.
     const snapshotContentHash = computeSnapshotContentHash(snapshot)
 
-    // 5. Create the finalized revision IN A SINGLE TRANSACTION.
-    // A1: getLatestRevisionNoInTransaction + createFinalized happen atomically
-    // so two concurrent finalizations cannot both calculate the same revisionNo.
+    // 5. Create the finalized revision IN A SINGLE TRANSACTION with row-level
+    //    locking (P2).
+    // P2: We take a SELECT FOR UPDATE lock on the Programme row BEFORE reading
+    // the latest revisionNo. This serializes concurrent finalizations on the
+    // same Programme — the second transaction blocks until the first commits,
+    // at which point it sees the new revisionNo and calculates the next one.
+    // This is stronger than relying on the unique constraint alone (which
+    // would cause one transaction to fail with a constraint violation).
     const result = await dbTx.$transaction(async (tx) => {
+      // P2: Lock the Programme row to serialize concurrent finalizations.
+      // $queryRaw with SELECT ... FOR UPDATE acquires a row-level lock.
+      await tx.$queryRaw`SELECT id FROM "Programme" WHERE id = ${programmeId} FOR UPDATE`
+
       const latestRevisionNo = await programmeRevisionRepo.getLatestRevisionNoInTransaction(
         tx,
         ctx.organizationId,
@@ -177,12 +180,13 @@ export const programmeService = {
       )
       const revisionNo = latestRevisionNo + 1
 
-      // The persisted snapshot carries the real revisionNo (for human inspection),
-      // but the content hash was computed from the content-only snapshot above.
-      // The hash identifies the schedule CONTENT; the revisionNo is metadata.
+      // The persisted snapshot carries the real revisionNo (for human inspection).
+      // The content hash was computed from the content projection (P1) — it does
+      // NOT include revisionNo or finalizedAt.
       const finalSnapshot: ProgrammeSnapshot = {
         ...snapshot,
         revisionNo,
+        finalizedAt: new Date().toISOString(),
       }
       const finalSnapshotJson = serializeSnapshot(finalSnapshot)
 
@@ -190,7 +194,7 @@ export const programmeService = {
         programmeId,
         revisionNo,
         snapshotJson: finalSnapshotJson,
-        snapshotContentHash, // from the content-only hash (step 4)
+        snapshotContentHash, // from the content projection (P1) — independent of revisionNo
         scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
         finalizedById: ctx.userId,
       })

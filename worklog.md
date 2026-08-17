@@ -4528,3 +4528,59 @@ Two historical truths:
   EstimateRevision  = commercial history (immutable)
   ProgrammeRevision = schedule history (immutable)
   The graph connects them without collapsing them into one source of truth.
+
+---
+Task ID: programme-finalization-p1-p2
+Agent: principal-engineer
+Task: P1 — define explicit schedule-content hash projection. P2 — concurrency-safe revision allocation via SELECT FOR UPDATE. No frozen code touched.
+
+P1 — Content hash computed from schedule CONTENT, not placeholder metadata.
+- New type: ProgrammeSnapshotContent (programmeId, programmeName,
+  scheduleEngineVersion, activities, dependencies — NO revisionNo, NO
+  finalizedAt).
+- New function: extractSnapshotContent(snapshot) → ProgrammeSnapshotContent.
+- computeSnapshotContentHash() now hashes the CONTENT PROJECTION, not the
+  full snapshot. This means:
+  * same schedule content → same snapshotContentHash (regardless of
+    revisionNo or finalizedAt)
+  * the persisted snapshotJson includes revisionNo + finalizedAt for human
+  inspection, but the hash is computed from the content projection only
+  * hash(snapshotJson) may differ from snapshotContentHash (because
+    snapshotJson includes metadata) — this is correct and intentional
+- This mirrors the XLSX contentHash discipline: hash the content, not the
+  metadata. No more placeholder-based hashing.
+
+P2 — Concurrency-safe revision allocation via SELECT FOR UPDATE.
+- The transaction now takes a row-level lock on the Programme row BEFORE
+  reading the latest revisionNo:
+    SELECT id FROM "Programme" WHERE id = ${programmeId} FOR UPDATE
+- This serializes concurrent finalizations on the same Programme: the second
+  transaction blocks until the first commits, then sees the new revisionNo
+  and calculates the next one. Both transactions SUCCEED with unique
+  revision numbers — neither fails with a constraint violation.
+- This is stronger than relying on the @@unique constraint alone (which
+  would cause one transaction to fail).
+
+TESTS (3 new, 15 total):
+- P1: snapshotContentHash is independent of revisionNo and finalizedAt
+  (two finalizations of the same workspace → same hash, different revisionNo).
+- P1: persisted snapshotJson includes revisionNo + finalizedAt, but the hash
+  is recomputable from the content projection only (hash matches when
+  recomputed from the full snapshot via computeSnapshotContentHash, which
+  internally extracts the content).
+- P2: concurrent finalizations (Promise.all) produce unique revision numbers
+  with a difference of exactly 1 (sequential, not random). Both succeed.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Programme finalization (Neon) ....... 15 pass / 0 fail (was 12; +3 P1/P2)
+- Frozen Phase 1 code ................. UNTOUCHED
+
+PROGRAMME FINALIZATION IS NOW ON THE SAME ARCHITECTURAL STANDARD AS THE
+COMMERCIAL REVISION SYSTEM:
+  - Content hash from a formal content projection (not placeholder metadata).
+  - Concurrency-safe revision allocation via PostgreSQL row-level locking.
+  - Immutable revision (create-finalized-only, no update/delete).
+  - schedule content ≠ revision metadata (hash is content, snapshotJson is
+    content + metadata).

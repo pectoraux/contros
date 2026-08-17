@@ -261,6 +261,43 @@ export interface ProgrammeSnapshot {
   finalizedAt: string
 }
 
+/**
+ * P1: The schedule-content projection — the subset of ProgrammeSnapshot that
+ * defines the schedule's commercial/scheduling identity. Used for the
+ * snapshotContentHash so that:
+ *
+ *   same schedule content → same snapshotContentHash
+ *
+ * regardless of revisionNo or finalizedAt (which are metadata, not content).
+ *
+ * This mirrors the XLSX contentHash discipline: hash the content, not the
+ * metadata. The persisted snapshotJson includes revisionNo + finalizedAt for
+ * human inspection, but snapshotContentHash is computed from this projection.
+ */
+export interface ProgrammeSnapshotContent {
+  programmeId: string
+  programmeName: string
+  scheduleEngineVersion: number
+  activities: ProgrammeActivity[]
+  dependencies: ActivityDependency[]
+}
+
+/**
+ * Extract the content projection from a full snapshot (strips revisionNo +
+ * finalizedAt). Used by computeSnapshotContentHash.
+ */
+export function extractSnapshotContent(
+  snapshot: ProgrammeSnapshot,
+): ProgrammeSnapshotContent {
+  return {
+    programmeId: snapshot.programmeId,
+    programmeName: snapshot.programmeName,
+    scheduleEngineVersion: snapshot.scheduleEngineVersion,
+    activities: snapshot.activities,
+    dependencies: snapshot.dependencies,
+  }
+}
+
 // ─── Validation result ──────────────────────────────────────────────────────
 
 /**
