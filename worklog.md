@@ -2965,3 +2965,95 @@ DISPOSITION (per reviewer):
   → XLSX adapter is the right next step, with the narrow adapter contract:
     BoqProjection → XLSX bytes. No DB, no EstimateLine, no PricingEngine, no
     opportunity lookup, no binding/reconciliation, no mutation.
+
+---
+Task ID: boq-projection-pre-xlsx-fixes
+Agent: principal-engineer
+Task: Close the 3 pre-XLSX issues — stale byte-identical docs, non-cryptographic hash, lossy quantity rounding. No frozen code touched.
+
+ISSUES CLOSED (per reviewer's findings):
+
+G1 — Removed stale "byte-identical" claims from projection.ts.
+- The contract file (projection-contract.ts) was corrected in the prior commit
+  to say "canonical-content-identical," but projection.ts still said "byte-
+  identical projection" in two places: the top-level HISTORICAL RULE comment
+  and the projectRevision() docstring. These directly contradicted the corrected
+  contract.
+- Fix: both now say "canonical-content-identical" and explicitly note that the
+  full object is NOT byte-identical (audit-only generatedBy/generationContext
+  may differ). Documentation now matches the contract and the implementation.
+
+G2 — Upgraded contentHash from FNV-1a 16-hex to SHA-256.
+- The prior 16-hex FNV-1a digest was explicitly "not cryptographic" — acceptable
+  for an in-process equality shortcut, but insufficient for a value whose
+  stated purpose is durable provenance / artifact identity ("everything needed
+  to prove WHAT was exported"). A 64-bit-ish structural digest has a materially
+  higher collision risk than a standard cryptographic digest.
+- Fix: computeContentHash now uses node:crypto's createHash('sha256') over the
+  same stable-JSON payload. The digest is a 64-char hex string (256 bits).
+  node:crypto is a runtime standard; no new deps.
+- The distinction is now explicit: structural hash → equality check;
+  cryptographic content digest → durable provenance. The contentHash is the
+  latter.
+- Test updated: contentHash length assertion 16 → 64.
+
+G3 — Made the projection lossless (rounding moves to presentation).
+- projectRevision() previously applied round2() to quantity AND to every
+  commercial field. This meant snapshot quantity 1.2375 → projection 1.24,
+  so the office projection was no longer an exact representation of the
+  canonical quantity. The rounding rule was inherited from round2, not
+  established as a projection semantic.
+- Decision (per reviewer's architectural preference): the domain projection is
+  LOSSLESS. Rounding belongs in the office-formatting layer (XLSX adapter),
+  not the canonical projection.
+    EstimateRevision → exact domain projection → XLSX formatting/display precision
+- Fix: removed round2 from quantity (carried verbatim) and from all commercial
+  fields (carried exactly as the replayed breakdown produced them). The
+  PricingEngine already rounds at computation time (establishing canonical
+  money precision); the projection carries those exact values without re-rounding.
+- The contentHash now reflects the EXACT (lossless) content. Two snapshots with
+  quantities that round to the same 2dp but differ exactly (1.2375 vs 1.2376)
+  now produce DIFFERENT contentHashes — proving losslessness at the hash level.
+- Money vs quantity semantics documented: money values are canonical at the
+  engine's precision; quantity is NOT a money field and is carried verbatim.
+- New tests (4): lossless quantity (1.2375 preserved, 123.456789 preserved),
+  commercial values equal replayed breakdown exactly (no re-rounding),
+  contentHash reflects exact quantity not rounded.
+
+FILES MODIFIED (no frozen code):
+- src/lib/boq/projection.ts — SHA-256 hash, lossless projection, corrected
+  docstrings (G1+G2+G3).
+- src/lib/boq/projection-contract.ts — (no change this commit; contract was
+  already correct from the prior commit).
+- tests/unit/boq-projection.test.ts — hash length 16→64, +4 lossless tests,
+  test-file top comment updated.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 217 pass / 0 fail (was 213; +4 lossless;
+  0 regressions)
+- Projection tests .................... 28 pass / 0 fail
+- Lossless tests prove:
+  * quantity 1.2375 → projection 1.2375 (NOT 1.24)
+  * quantity 123.456789 → projection 123.456789
+  * commercial values === replayed breakdown (no re-rounding)
+  * contentHash differs for 1.2375 vs 1.2376 (lossless at hash level)
+- contentHash is now SHA-256 (64 hex chars) — durable provenance digest
+- Frozen Phase 1 code ................. UNTOUCHED
+
+DISPOSITION (per reviewer):
+  ✅ complete-content hash input
+  ✅ canonical-content-equivalence semantics
+  ✅ immutable revision source
+  ✅ replay-backed commercial values
+  ✅ deterministic ordering
+  ✅ format-independent projection
+  ✅ stale byte-identical comments removed (G1)
+  ✅ durable cryptographic content digest (G2)
+  ✅ projection is lossless; rounding moves to presentation (G3)
+
+All three pre-XLSX issues are resolved. The XLSX adapter is the right next
+step, with the narrow contract: BoqProjection → XLSX bytes. No DB, no
+EstimateLine, no PricingEngine, no opportunity lookup, no binding/reconciliation,
+no mutation. Presentation precision (rounding for display) is an adapter
+concern and will never alter the canonical projection or its contentHash.

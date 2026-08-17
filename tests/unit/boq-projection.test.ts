@@ -2,9 +2,15 @@
  * Unit tests for the deterministic BOQ projection.
  *
  * These establish the projection contract invariants:
- *   - HISTORICAL RULE: same revision + same projectionVersion → byte-identical
- *     projection (rows + contentHash), regardless of who/when generates it.
+ *   - HISTORICAL RULE (canonical-content-identical): same revision + same
+ *     projectionVersion → identical rows + order + totals + contentHash.
+ *     Audit-only metadata (generatedBy/generationContext) may differ.
  *   - DETERMINISM: no wall-clock time, no randomness, no external state.
+ *   - LOSSLESS: quantity + commercial values are carried EXACTLY as the
+ *     replayed snapshot produced them — NO rounding (G3). Rounding belongs in
+ *     the office-formatting layer, not the canonical projection.
+ *   - DURABLE DIGEST: contentHash is a SHA-256 hex digest (64 chars), not a
+ *     non-cryptographic structural shortcut (G2).
  *   - FIELD COVERAGE: every contracted field is present and correctly sourced
  *     from the snapshot (NOT from mutable state).
  *   - ORDERING: rowNumber is 1-based and follows the snapshot's line order.
@@ -264,7 +270,7 @@ describe('BOQ projection — provenance', () => {
     expect(p.source.revisionNo).toBe(1)
     expect(p.source.snapshotVersion).toBe(2) // v2 snapshot format
     expect(p.projectionVersion).toBe(CURRENT_PROJECTION_VERSION)
-    expect(p.contentHash).toHaveLength(16) // 8+8 hex
+    expect(p.contentHash).toHaveLength(64) // G2: SHA-256 hex digest (64 chars)
     expect(p.rowCount).toBe(2)
     expect(p.generatedBy).toBe('test')
     expect(p.generationContext).toBe('unit-test')
@@ -353,6 +359,52 @@ describe('BOQ projection — commercial fields come from the replayed snapshot',
     // Totals must match the replay totals.
     expect(proj.totals.totalSellPrice).toBe(replay.totalSellPrice)
     expect(proj.totals.totalDirectCost).toBe(replay.totalDirectCost)
+  })
+})
+
+describe('BOQ projection — G3: lossless (no rounding in the domain projection)', () => {
+  test('quantity is carried EXACTLY from the snapshot — no round2', () => {
+    // A quantity with >2 decimal places must survive projection unchanged.
+    // The projection is lossless; rounding belongs in the XLSX presentation layer.
+    const snap = makeSnapshot([makeLine({ quantity: 1.2375 })])
+    const proj = projectRevision(makeInput(snap))
+    expect(proj.rows[0].quantity).toBe(1.2375) // NOT 1.24
+  })
+
+  test('quantity with many decimals is preserved', () => {
+    const snap = makeSnapshot([makeLine({ quantity: 123.456789 })])
+    const proj = projectRevision(makeInput(snap))
+    expect(proj.rows[0].quantity).toBe(123.456789)
+  })
+
+  test('commercial values equal the replayed breakdown EXACTLY (no re-rounding)', async () => {
+    // The PricingEngine rounds at computation time (establishing canonical money
+    // precision). The projection carries those exact values — it does NOT re-round.
+    // Prove by direct comparison to the replayed breakdown.
+    const { replayRevision } = await import('../../src/lib/engines/revision-service')
+    const snap = makeSnapshot([makeLine({ quantity: 1.2375 }), makeLine({ lineId: 'l2', quantity: 2.5 })])
+    const replay = replayRevision(snap)
+    expect(replay.ok).toBe(true)
+    if (!replay.ok) return
+    const proj = projectRevision(makeInput(snap))
+    // Each commercial value must be === the replayed value (no re-rounding).
+    expect(proj.rows[0].commercial.unitRate).toBe(replay.lines[0].breakdown.unitRate)
+    expect(proj.rows[0].commercial.sellPrice).toBe(replay.lines[0].breakdown.sellPrice)
+    expect(proj.rows[0].commercial.directCost).toBe(replay.lines[0].breakdown.directCost)
+    expect(proj.rows[0].commercial.expectedProfit).toBe(replay.lines[0].breakdown.expectedProfit)
+    expect(proj.rows[0].commercial.expectedMarginPct).toBe(replay.lines[0].breakdown.expectedMarginPct)
+  })
+
+  test('contentHash reflects the EXACT (lossless) quantity, not a rounded one', () => {
+    // Two snapshots with quantities that round to the same 2dp but differ
+    // exactly (1.2375 vs 1.2376) must produce DIFFERENT contentHashes.
+    // This proves the projection is lossless at the hash level.
+    const snap1 = makeSnapshot([makeLine({ quantity: 1.2375 })])
+    const snap2 = makeSnapshot([makeLine({ quantity: 1.2376 })]) // rounds to same 1.24
+    const a = projectRevision(makeInput(snap1))
+    const b = projectRevision(makeInput(snap2))
+    expect(a.provenance.contentHash).not.toBe(b.provenance.contentHash)
+    expect(projectionsMatch(a, b)).toBe(false)
   })
 })
 
