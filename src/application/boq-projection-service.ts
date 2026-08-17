@@ -18,11 +18,24 @@
  * XlsxArtifact. The service NEVER accepts snapshotJson from the caller; the
  * authoritative revision comes from the repository using ctx.organizationId.
  *
- * AUDIT SEMANTICS: this is a READ/EXPORT, not a commercial mutation. The
+ * AUDIT SEMANTICS (P1): this is a READ/EXPORT, not a commercial mutation. The
  * BOQ_XLSX_EXPORTED event records export provenance (who exported what
  * revision + projection) but does NOT imply the XLSX became authoritative.
  * The sourceContentHash is the authoritative identity; the XLSX is a
  * presentation artifact.
+ *
+ * P1 — audit is a SIDE EFFECT, not a commercial condition. The export is a
+ * pure read of immutable state. If serialization succeeds but the audit write
+ * fails, the export STILL succeeds — the result carries an `auditWarning`
+ * field so the caller can surface the operational issue without pretending the
+ * commercial export itself failed. A retry generates the same artifact (same
+ * sourceContentHash, same fileName) and attempts the audit again.
+ *
+ * P2 — error semantics:
+ *   revision missing / inaccessible (wrong tenant)  → 404 not found
+ *   revision exists but not finalized               → 422 not exportable
+ * A caller cannot infer "doesn't exist" (404) when the revision actually
+ * exists but is not exportable (422). These are distinct domain errors.
  *
  * INVARIANT: the export leaves Estimate / EstimateLine / EstimateRevision
  * unchanged. No canonical mutation occurs. The projection derives from the
@@ -68,6 +81,14 @@ export type ExportXlsxResult =
       /** Deterministic: BOQ-{revisionId}-v{revisionNo}.xlsx (no timestamp). */
       fileName: string
       bytes: Buffer
+      /**
+       * P1: audit is a side effect, not a commercial condition. If the audit
+       * write failed, the export still succeeds (it's a pure read of immutable
+       * state). This field carries the audit failure reason (null = audit
+       * succeeded) so the caller/route can surface it as an operational warning
+       * without pretending the export itself failed.
+       */
+      auditWarning: string | null
     }
   | {
       ok: false
@@ -149,24 +170,38 @@ export const boqProjectionService = {
     const fileName = `BOQ-${revision.id}-v${revision.revisionNo}.xlsx`
 
     // 7. Audit: BOQ_XLSX_EXPORTED. This is a READ/EXPORT event — it records
-    //    provenance but does NOT imply the XLSX became authoritative. The
-    //    sourceContentHash is the authoritative identity.
-    await auditLogRepository.create(ctx.organizationId, ctx.userId, {
-      action: 'boq.xlsx.exported',
-      entityType: 'EstimateRevision',
-      entityId: revision.id,
-      summary: `BOQ XLSX exported: revision ${revision.revisionNo} (${revision.id})`,
-      afterJson: JSON.stringify({
-        estimateRevisionId: revision.id,
-        revisionNo: revision.revisionNo,
-        projectionVersion: CURRENT_PROJECTION_VERSION,
-        sourceContentHash: projection.provenance.contentHash,
-        adapterVersion: CURRENT_XLSX_ADAPTER_VERSION,
-        formattingVersion: formatting.formattingVersion,
-        fileName,
-        byteLength: bytes.length,
-      }),
-    })
+    //    provenance but does NOT imply the XLSX became authoritative.
+    //
+    //    P1: audit is a SIDE EFFECT, not a commercial condition. The export is
+    //    a pure read of immutable state. If the audit write fails, the export
+    //    still succeeds — the audit failure is an operational error, not a
+    //    commercial failure. The caller receives the bytes + an `auditWarning`
+    //    so it can surface the operational issue without pretending the export
+    //    itself failed.
+    let auditWarning: string | null = null
+    try {
+      await auditLogRepository.create(ctx.organizationId, ctx.userId, {
+        action: 'boq.xlsx.exported',
+        entityType: 'EstimateRevision',
+        entityId: revision.id,
+        summary: `BOQ XLSX exported: revision ${revision.revisionNo} (${revision.id})`,
+        afterJson: JSON.stringify({
+          estimateRevisionId: revision.id,
+          revisionNo: revision.revisionNo,
+          projectionVersion: CURRENT_PROJECTION_VERSION,
+          sourceContentHash: projection.provenance.contentHash,
+          adapterVersion: CURRENT_XLSX_ADAPTER_VERSION,
+          formattingVersion: formatting.formattingVersion,
+          fileName,
+          byteLength: bytes.length,
+        }),
+      })
+    } catch (auditError) {
+      // The export succeeded; only the audit write failed. Surface as a warning.
+      auditWarning = `Export succeeded but audit write failed: ${
+        auditError instanceof Error ? auditError.message : String(auditError)
+      }`
+    }
 
     return {
       ok: true,
@@ -176,6 +211,7 @@ export const boqProjectionService = {
       sourceContentHash: projection.provenance.contentHash,
       fileName,
       bytes,
+      auditWarning,
     }
   },
 }

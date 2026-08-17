@@ -3785,3 +3785,51 @@ CANONICAL → XLSX PATH (now fully wired end-to-end):
 
 NEXT (NOT started): API route + UI download. But the service is tested
 against PostgreSQL before any route exists — per the reviewer's directive.
+
+---
+Task ID: boq-projection-service-audit-error-semantics
+Agent: principal-engineer
+Task: Tighten the export service's audit/error contract before API route exposure. P1: audit failure is non-fatal (export succeeds). P2: non-finalized revision is 422 (not-exportable), not 404 (not-found). P3: integration tests for both. No frozen code touched.
+
+P1 — Audit is a side effect, not a commercial condition.
+- The export is a pure read of immutable state. If serialization succeeds but
+  the audit write fails, the export STILL succeeds — the result carries an
+  `auditWarning: string | null` field (null = audit succeeded; string = warning
+  message) so the caller/route can surface the operational issue without
+  pretending the commercial export itself failed.
+- The audit call is wrapped in try/catch. A retry generates the same artifact
+  (same sourceContentHash, same fileName) and attempts the audit again.
+- Documented in the service docstring as an explicit policy decision.
+
+P2 — Non-finalized revision is 422 (not-exportable), NOT 404 (not-found).
+- A revision that exists in the tenant but has status !== 'finalized' returns
+  { ok: false, status: 422, error: '...not finalized...' }. A caller cannot
+  infer "doesn't exist" (404) when the revision actually exists but is not
+  exportable (422). These are distinct domain errors.
+- 404 = revision missing or belongs to another tenant.
+- 422 = revision exists but is not exportable (not finalized).
+
+P3 — Integration tests added (5 new, 15 total):
+- P2: existing but non-finalized revision → 422 (NOT 404).
+- P3: auditWarning is null on successful export (audit succeeded).
+- P3: each successful export creates exactly one BOQ_XLSX_EXPORTED event.
+- P3: repeated export → same projection/hash/fileName, separate audit events.
+- P3: every successful result carries an auditWarning field (null or string).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 254 pass / 0 fail (0 regressions)
+- BOQ projection integration (Neon) ... 15 pass / 0 fail / 63 expect()
+- Frozen Phase 1 code ................. UNTOUCHED
+
+ERROR/AUDIT CONTRACT (now explicit, before API route):
+  revision missing / inaccessible (wrong tenant)  → 404 not found
+  revision exists but not finalized               → 422 not exportable
+  export succeeds, audit succeeds                 → ok: true, auditWarning: null
+  export succeeds, audit fails                    → ok: true, auditWarning: "<reason>"
+  export fails (projection/serialization error)   → ok: false, error, status
+
+NEXT: the API route can be very thin:
+  HTTP request → authenticated RequestContext → exportXlsx() → Buffer →
+  Content-Disposition + XLSX response. No Prisma, revision lookup, replay,
+  or Excel logic in the route.

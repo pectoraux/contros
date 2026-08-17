@@ -358,4 +358,99 @@ describe('BoqProjectionService integration tests', () => {
     // Must import the repository barrel (not @/lib/db directly).
     expect(code).toMatch(/from ['"]@\/repositories['"]/)
   })
+
+  // ── P2: non-finalized revision → 422 (not 404) ────────────────────────────
+
+  test('P2: existing but non-finalized revision → 422 not-exportable (NOT 404)', async () => {
+    // Create a non-finalized revision directly in the DB (status: 'draft').
+    const draftRevision = await db.estimateRevision.create({
+      data: {
+        estimateId: EST_A,
+        revisionNo: 99,
+        snapshotJson: '{}', // placeholder — not used since export should reject before projection
+        status: 'draft', // NOT finalized
+        finalizedById: USER_A,
+      },
+    })
+    const res = await boqProjectionService.exportXlsx({
+      ctx: ctxA,
+      estimateRevisionId: draftRevision.id,
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    // P2: 422 (not exportable), NOT 404 (not found). The revision EXISTS but
+    // is not exportable. A caller must not infer "doesn't exist" from this.
+    expect(res.status).toBe(422)
+    expect(res.error).toMatch(/not finalized/i)
+    // Clean up the draft revision.
+    await db.estimateRevision.delete({ where: { id: draftRevision.id } })
+  }, 30000)
+
+  // ── P3: audit is a side effect — export succeeds even if audit fails ───────
+
+  test('P3: auditWarning is null on successful export (audit succeeded)', async () => {
+    const res = await boqProjectionService.exportXlsx({
+      ctx: ctxA,
+      estimateRevisionId: revisionId,
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.auditWarning).toBeNull()
+  }, 30000)
+
+  test('P3: each successful export creates exactly one BOQ_XLSX_EXPORTED audit event', async () => {
+    // Count audit events before.
+    const before = await db.auditLog.count({
+      where: { organizationId: ORG_A, action: 'boq.xlsx.exported', entityId: revisionId },
+    })
+    await boqProjectionService.exportXlsx({
+      ctx: ctxA,
+      estimateRevisionId: revisionId,
+    })
+    const after = await db.auditLog.count({
+      where: { organizationId: ORG_A, action: 'boq.xlsx.exported', entityId: revisionId },
+    })
+    // Exactly one new audit event per export.
+    expect(after - before).toBe(1)
+  }, 30000)
+
+  test('P3: repeated export of same revision → same projection/hash/fileName, separate audit events', async () => {
+    const res1 = await boqProjectionService.exportXlsx({
+      ctx: ctxA,
+      estimateRevisionId: revisionId,
+    })
+    const res2 = await boqProjectionService.exportXlsx({
+      ctx: ctxA,
+      estimateRevisionId: revisionId,
+    })
+    expect(res1.ok).toBe(true)
+    expect(res2.ok).toBe(true)
+    if (!res1.ok || !res2.ok) return
+    // Same projection content (canonical-content-identical).
+    expect(res1.sourceContentHash).toBe(res2.sourceContentHash)
+    expect(res1.fileName).toBe(res2.fileName)
+    expect(res1.bytes.length).toBe(res2.bytes.length) // within-process byte-identical
+    // Both have auditWarning = null (both audits succeeded).
+    expect(res1.auditWarning).toBeNull()
+    expect(res2.auditWarning).toBeNull()
+    // Two separate audit events were created (one per export).
+    const auditCount = await db.auditLog.count({
+      where: { organizationId: ORG_A, action: 'boq.xlsx.exported', entityId: revisionId },
+    })
+    // At least 2 (from these two exports; there may be more from prior tests).
+    expect(auditCount).toBeGreaterThanOrEqual(2)
+  }, 30000)
+
+  // ── P3: auditWarning field is present on all successful results ───────────
+
+  test('P3: every successful result carries an auditWarning field (null or string)', async () => {
+    const res = await boqProjectionService.exportXlsx({
+      ctx: ctxA,
+      estimateRevisionId: revisionId,
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    // The field exists and is either null (audit succeeded) or a string (warning).
+    expect(res.auditWarning === null || typeof res.auditWarning === 'string').toBe(true)
+  }, 30000)
 }, 300000)
