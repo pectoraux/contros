@@ -3453,3 +3453,95 @@ DISPOSITION (per reviewer):
   🔶 current probe does not test full artifact fidelity  ← next gate
   🔶 write-excel-file not yet approved as production serializer
   🔶 no timestamp-normalization layer (agreed)
+
+---
+Task ID: boq-xlsx-fidelity-evaluation
+Agent: principal-engineer
+Task: Serializer fidelity evaluation — map EVERY XlsxArtifact concern through each candidate → .xlsx → independent read-back → canonical assertion. Per reviewer: fidelity is the primary gate, not byte determinism.
+
+METHODOLOGY (per reviewer's directive):
+  XlsxArtifact → candidate serializer adapter (full mapping) → .xlsx
+      → independent read-back (read-excel-file, a DIFFERENT library)
+      → canonical workbook assertion.
+
+The read-back uses read-excel-file@9.3.10 (independent of both writers) so the
+assertion is genuinely independent, not the same library validating itself.
+
+FULL-FIDELITY MAPPING (both adapters map every XlsxArtifact concern):
+  - worksheet name
+  - column order (from the artifact's columns[])
+  - column width
+  - number format (per column, applied to numeric cells only)
+  - header row (row 0, from config.includeHeader)
+  - data rows (display-rounded values, projection order)
+  - totals row (from config.includeTotalsRow, "TOTAL" label)
+
+HARNESS: scripts/xlsx-fidelity-eval.ts (evaluation, not production).
+
+RESULTS (independent read-back, 6 asserted concerns):
+
+  write-excel-file@4.1.1: 6/6 ✅
+    ✅ worksheet name: "BOQ"
+    ✅ row count: 4 (header + 2 data + totals)
+    ✅ column count: 9
+    ✅ header row values: all 9 match
+    ✅ data row values: all cells match (display-rounded, projection order)
+    ✅ totals row "TOTAL" label
+    Note: required the single-sheet form { sheet: name } — the multi-sheet form
+    [{ data, name }] ignores `name` and writes "Sheet1" (a library quirk).
+
+  exceljs@4.4.0: 6/6 ✅
+    ✅ worksheet name: "BOQ"
+    ✅ row count: 4
+    ✅ column count: 9
+    ✅ header row values: all 9 match
+    ✅ data row values: all cells match
+    ✅ totals row "TOTAL" label
+
+  NOT YET ASSERTED (independent-reader limitation):
+    - number formats (read-excel-file does not expose per-cell numFmt)
+    - column widths (read-excel-file does not expose column width)
+    These concerns ARE mapped through the writers (the adapters set them), but
+    the independent reader cannot verify them. Verifying them would require a
+    richer reader (e.g. parsing xl/styles.xml + xl/worksheets/sheet1.xml
+    directly) — a future evaluation step if needed.
+
+COMBINED EVIDENCE (determinism + fidelity):
+  write-excel-file@4.1.1:
+    - fidelity: 6/6 ✅ (independent read-back)
+    - within-process bytes: ✅ identical
+    - cross-process XML content: ✅ identical (per-entry hashes stable)
+    - cross-process whole-file bytes: ❌ drifts (ZIP container timestamps)
+  exceljs@4.4.0:
+    - fidelity: 6/6 ✅
+    - within-process bytes: ✅ identical
+    - cross-process XML content: ❌ drifts (docProps/core.xml timestamps)
+    - cross-process whole-file bytes: ❌ drifts
+
+CONCLUSION:
+- Both candidates faithfully round-trip the complete asserted XlsxArtifact
+  contract via independent read-back. Fidelity is established for: sheet name,
+  row count, column count, header values, data values, totals label.
+- write-excel-file has a STRONGER determinism profile: its XML content is
+  cross-process byte-identical (only the ZIP wrapper drifts). exceljs's XML
+  content itself drifts (docProps/core.xml timestamps).
+- Number formats + column widths are mapped but not yet independently verified
+  (reader limitation).
+- No timestamp-normalization layer added (per reviewer). The XlsxArtifact's
+  sourceContentHash provides provenance; byte identity is not a product guarantee.
+
+FILES:
+- scripts/xlsx-fidelity-eval.ts — the fidelity evaluation harness (NEW).
+- package.json + bun.lock — read-excel-file@9.3.10 added as devDependency
+  (independent reader, evaluation only).
+
+DISPOSITION (per reviewer):
+  ✅ fidelity evaluation using the complete XlsxArtifact (6/6 both candidates)
+  ✅ independent read-back (read-excel-file, not the writer itself)
+  ✅ no timestamp-normalization layer
+  ✅ dev-only dependencies
+  🔶 number formats + column widths mapped but not independently verified
+     (reader limitation — future step if needed)
+  → write-excel-file@4.1.1 remains the preferred candidate (fidelity 6/6 +
+    cross-process XML determinism). Production integration still pending the
+    product decision on whether canonical-only provenance is sufficient.
