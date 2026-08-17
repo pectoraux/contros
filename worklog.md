@@ -3715,3 +3715,73 @@ NEXT QUESTION (per reviewer): how the application service obtains the
 authoritative EstimateRevision before invoking projectRevision → buildXlsxArtifact
 → serializeXlsxArtifact. That is the application-layer wiring, not the office
 boundary itself.
+
+---
+Task ID: boq-projection-service
+Agent: principal-engineer
+Task: BoqProjectionService — the application-layer bridge between authenticated tenant context and the pure office pipeline. Per approved milestone: RequestContext → tenant-scoped revision lookup → projectRevision → buildXlsxArtifact → serializeXlsxArtifact → bytes + audit. No UI, no route. No frozen code touched.
+
+SERVICE (src/application/boq-projection-service.ts):
+- exportXlsx({ ctx, estimateRevisionId, formattingConfig? }) →
+  { ok: true, revisionId, revisionNo, projectionVersion, sourceContentHash,
+    fileName, bytes } | { ok: false, error, status }
+- Tenant-scoped revision lookup via the EXISTING estimateRevisionRepository.
+  getForOrganization(orgId, revisionId) — verifies revision.estimate.
+  organizationId === ctx.organizationId. No new repository needed.
+- NEVER accepts snapshotJson from the caller. The authoritative revision comes
+  from the repository. There is NO path where revisionId from tenant A +
+  snapshot from tenant B can reach the projection function.
+- Verifies the revision is 'finalized' (immutable) before exporting.
+- Builds the projection from the immutable snapshotJson (not mutable
+  EstimateLine state) via projectRevision → buildXlsxArtifact →
+  serializeXlsxArtifact.
+- Deterministic file name: BOQ-{revisionId}-v{revisionNo}.xlsx (no timestamp).
+- Audit: BOQ_XLSX_EXPORTED event (read/export, NOT a commercial mutation).
+  Carries: orgId, actorId, revisionId, revisionNo, projectionVersion,
+  sourceContentHash, adapterVersion, formattingVersion, fileName, byteLength.
+  Does NOT imply the XLSX became authoritative — sourceContentHash is the
+  authoritative identity.
+
+INTEGRATION TESTS (tests/integration/boq-projection-service.test.ts):
+10 tests against Neon PostgreSQL, all passing:
+1. exportXlsx returns ok with bytes, fileName, provenance (ZIP magic, SHA-256 hash)
+2. tenant isolation: Org B cannot export Org A revision → 404
+3. nonexistent revision → 404
+4. fileName is deterministic (no timestamp): same revision → same fileName
+5. determinism: same revision → same sourceContentHash
+6. formatting isolation: changing display formatting → projection hash unchanged
+7. CRITICAL: export reflects the immutable revision, NOT mutable current
+   EstimateLine (mutate unitRate 10→25 after finalization; export still
+   reflects 10; snapshot unchanged)
+8. no canonical mutation: export leaves EstimateLine/EstimateRevision unchanged
+9. audit: successful export records BOQ_XLSX_EXPORTED with full provenance
+10. serializer isolation: service module has no direct Prisma calls (uses
+    repository barrel only)
+
+The CRITICAL test (#7) is the strongest practical test of the entire
+architecture: mutable current state ≠ historical export truth. The revision
+snapshot is immutable; the export derives from it, not from mutable
+EstimateLine values.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 254 pass / 0 fail (0 regressions)
+- BOQ projection integration (Neon) ... 10 pass / 0 fail / 47 expect()
+- Frozen Phase 1 code ................. UNTOUCHED (no estimate/bid/opportunity/
+  pricing changes; the service uses existing repository methods)
+
+CANONICAL → XLSX PATH (now fully wired end-to-end):
+  RequestContext + estimateRevisionId
+      ↓ tenant-scoped EstimateRevision lookup (repository)
+  authoritative snapshotJson (immutable)
+      ↓ projectRevision() (pure, lossless, SHA-256)
+  BoqProjection
+      ↓ buildXlsxArtifact() (pure, frozen, display-rounded)
+  XlsxArtifact (immutable)
+      ↓ serializeXlsxArtifact() (thin production serializer)
+  .xlsx bytes (write-excel-file@4.1.1)
+      ↓ + BOQ_XLSX_EXPORTED audit
+  response (bytes + fileName + provenance)
+
+NEXT (NOT started): API route + UI download. But the service is tested
+against PostgreSQL before any route exists — per the reviewer's directive.
