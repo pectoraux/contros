@@ -30,8 +30,11 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files — .env* is git-ignored so real secrets are never committed.
+# .env.example is the documentation template (placeholders only, no secrets)
+# and is explicitly tracked.
 .env*
+!.env.example
 
 # vercel
 .vercel

@@ -2292,11 +2292,15 @@ tests were not reached due to wall-clock time, NOT failures):
 
 Unit tests: 147 pass / 0 fail (full unit suite, verified via serial runner)
 
-AGGREGATE: 261 tests verified PASSING (147 unit + 114 integration), 0 FAILURES.
-No test has failed in any run. The 7 partial files all show 0 failures — every
-test that executed passed. The partial status is a documented sandbox/tool-
-deadline constraint (remote Neon latency × the Bash tool's ~190s practical
-deadline), not a code defect.
+AGGREGATE (precise evidence — corrected from earlier "261 fully verified" wording):
+- 147 unit tests: FULLY passed (0 failures).
+- 114 integration tests: executed and passed (0 failures).
+- 7 integration suites: NOT exhaustively completed in the sandbox run — they
+  were killed by the Bash tool's ~190s practical deadline (remote Neon latency
+  × query count) before every test ran. Every test that DID execute passed.
+  They can be fully verified in a CI environment with a longer per-test budget.
+No test has failed in any run. The partial status is a documented sandbox/tool-
+deadline constraint, NOT a code defect.
 
 Neon reachability: confirmed (schema + seed data present, org count = 5).
 Test isolation: integration tests use scoped test-* IDs with beforeAll/afterAll
@@ -2305,9 +2309,8 @@ cleanup; seed data (incl. Office Complex historical bid) untouched.
 PHASE 1 HONEST STATUS:
 - Implementation ........................ COMPLETE (frozen)
 - Unit tests (147) ........................ PASS
-- Integration tests ....................... 0 FAILURES across 261 verified tests
-  (8 files fully verified; 7 files partially verified due to Neon latency ×
-  tool deadline; every executed test passed)
+- Integration tests ....................... 114 executed & passed (0 failures);
+  8 files fully verified, 7 files NOT exhaustively completed (sandbox deadline)
 - Lint .................................... CLEAN
 - Build ................................... SUCCEEDS (per cf990f5)
 - Vercel deployment ....................... GREEN (per user, on 414bceb)
@@ -2385,5 +2388,79 @@ Minor cosmetic note (NOT a freeze blocker):
 
 Conclusion:
 - The browser E2E golden path is VERIFIED against Neon PostgreSQL.
-- Combined with the 261 tests verified passing (147 unit + 114 integration, 0
-  failures), Phase 1 is now fully verified: code + tests + deployment + browser.
+- Combined evidence: 147 unit tests fully passed + 114 integration tests
+  executed and passed (7 suites not exhaustive) + browser golden path verified
+  against Neon + build/lint clean + Vercel deploy green. Phase 1 is code-complete
+  and verified to the extent the sandbox allows; full integration-suite
+  exhaustion remains a CI-environment task, not a code gate.
+
+---
+Task ID: security-remediation-p0
+Agent: principal-engineer
+Task: P0 security remediation — remove committed .env from tracking, document credential rotation, correct test-evidence wording. Phase 1 code untouched.
+
+P0 ISSUE (identified by user, verified by principal-engineer):
+- A real .env containing live credentials was committed to git history (since
+  the initial commit 665d8b3) and was STILL tracked on remote HEAD (fbf85eb).
+- .gitignore already contained `.env*`, but .gitignore does NOT untrack a file
+  that is already tracked — so the rule was ineffective for the existing file.
+- Exposed secret-bearing keys (values redacted here, but present in history):
+    DATABASE_URL            (Neon PostgreSQL pooled connection)
+    DIRECT_DATABASE_URL     (Neon PostgreSQL direct connection)
+    NEXTAUTH_SECRET         (JWT signing secret)
+    NEXTAUTH_URL
+    NEXT_PUBLIC_APP_URL
+    ZAI_BASE_URL
+    ZAI_API_KEY
+    ZAI_CHAT_ID
+    ZAI_TOKEN
+    ZAI_USER_ID
+- Conclusion: Phase 1 is frozen, but the repository was NOT security-clean.
+
+REMEDIATION APPLIED (this commit — Phase 1 code untouched):
+- `git rm --cached .env` — .env removed from git tracking. The local file is
+  preserved (via --cached) so the running dev server still has its connection.
+- .gitignore's existing `.env*` rule now actually takes effect (file untracked).
+- Added .env.example — a template documenting every required env var with
+  placeholder values and a SECURITY section listing the mandatory rotation
+  steps. No real secrets in the template.
+- Corrected the earlier over-strong "261 tests fully verified" wording in this
+  worklog to the precise evidence:
+    147 unit tests: fully passed
+    114 integration tests: executed and passed
+    7 integration suites: not exhaustively completed in the sandbox run
+    Browser golden path: verified against Neon
+    Build/lint: verified
+
+MANDATORY OPERATOR ACTIONS (cannot be done by this agent — requires console
+access to Neon, Vercel, and Z.ai). The repository is NOT security-clean until
+ALL of these are complete:
+  1. Neon PostgreSQL — rotate the database password, OR (preferred) create a
+     fresh Neon project/branch and re-point DATABASE_URL / DIRECT_DATABASE_URL.
+     The old connection strings in git history are compromised.
+  2. NEXTAUTH_SECRET — generate a new secret (`openssl rand -base64 32`) and
+     update it in every environment (local .env, Vercel, CI). Rotation
+     invalidates all existing JWT sessions — expected and acceptable.
+  3. Z.ai credentials — revoke/rotate ZAI_API_KEY and ZAI_TOKEN in the Z.ai
+     console. Reissue ZAI_CHAT_ID / ZAI_USER_ID if sensitive in the tenant.
+  4. Update the rotated secrets in the Vercel project dashboard and any CI
+     environment — never re-commit them to the repo.
+  5. (Optional, recommended) Purge .env from git history using git filter-repo
+     or BFG Repo-Cleaner, then force-push. This is NOT a substitute for
+     rotation (anyone who already cloned/forked still has the old secrets) but
+     stops future exposure. Coordinate with collaborators before force-pushing.
+
+IMPORTANT CAVEAT (per user directive):
+- Removing .env from tracking does NOT remove it from git history. The secrets
+  remain recoverable from history until steps 1-3 (rotation) are complete.
+  Rotation is the actual remediation; untracking prevents future exposure only.
+- This agent can certify the remote `main` state, not the operator's local
+  working tree or external consoles.
+
+Stage Summary:
+- Phase 1: REMAINS FROZEN. No domain/service/repository/route code modified.
+- Repository tracking: .env is now untracked; .env.example added.
+- Security posture: improved (no future commits of .env), but NOT clean until
+  the operator completes credential rotation (steps 1-4 above).
+- Next stage (BOQ / XLSX) remains BLOCKED on operator confirmation that
+  credential rotation is complete, per the user's architectural directive.
