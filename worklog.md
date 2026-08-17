@@ -4408,3 +4408,48 @@ THE AUTHORITATIVE CHAIN (now unified):
 LEGACY (read-only):
   TenderDeliverable(kind='programme').revisionId → EstimateRevision(revisionType='programme')
   Retained for historical records. Not consulted for new submissions.
+
+---
+Task ID: programme-bid-boundary-fix
+Agent: principal-engineer
+Task: Z1/Z2/Z3 — move Programme↔Opportunity validation from BidService into the repository; require exact opportunity equality; remove direct db.programme access; add boundary audit test. No frozen code touched.
+
+Z1 — programmeRevisionRepo.getForBid(orgId, revisionId, opportunityId).
+- New repository method that validates the FULL chain atomically in one query:
+  * ProgrammeRevision.id === requested
+  * ProgrammeRevision.status === 'finalized'
+  * Programme.organizationId === organizationId
+  * Programme.opportunityId === opportunityId (EXACT match — null is rejected)
+- The Prisma `where` clause uses `opportunityId` directly (not `?? null`), so
+  a Programme with null opportunityId will NOT match a bid with a real
+  opportunityId. This is stricter than the previous service-level check.
+- Returns null if ANY link is broken.
+
+Z2 — BidService no longer touches db.programme directly.
+- The `db.programme.findFirst(...)` call is removed from submitBid().
+- The service now calls `programmeRevisionRepo.getForBid(ctx.organizationId,
+  resolvedProgrammeRevisionId, bid.opportunityId)` — one repository call,
+  zero direct Prisma access.
+- The Application Service → Repository → Database boundary is restored.
+
+Z3 — Boundary audit test.
+- New test: strips comments from BidService source, then asserts no
+  `db.programme.` call exists in the actual code.
+- New test: asserts `programmeRevisionRepo.getForBid(` is used (not the
+  old getForOrganization + separate db lookup pattern).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (+2 Z3 tests; 0 regressions)
+- Programme integration (Neon) ........ 10 pass / 0 fail (unchanged)
+- Frozen Phase 1 code ................. UNTOUCHED (BidService is the application layer)
+
+THE AUTHORITATIVE CHAIN (now with proper boundary):
+  Bid.programmeRevisionId
+      ↓ programmeRevisionRepo.getForBid(orgId, revisionId, opportunityId)
+  ProgrammeRevision (finalized, same org, EXACT opportunity match)
+      ↓
+  Bid submitted with authoritative programme history
+
+NEXT: ProgrammeService finalization — the schedule analogue of
+EstimateService → EstimateRevision.

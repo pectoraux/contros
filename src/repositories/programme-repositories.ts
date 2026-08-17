@@ -142,6 +142,48 @@ export const programmeRevisionRepo = {
     })
   },
 
+  /**
+   * Z1: Get a finalized ProgrammeRevision for a bid submission — validates the
+   * FULL chain atomically in one tenant/opportunity-scoped lookup:
+   *
+   *   ProgrammeRevision.id === requested
+   *   ProgrammeRevision.status === 'finalized'
+   *   Programme.organizationId === organizationId
+   *   Programme.opportunityId === opportunityId (EXACT match — null is rejected)
+   *
+   * This replaces the previous BidService pattern of calling getForOrganization
+   * then doing a separate db.programme.findFirst. All validation is now in the
+   * repository; the service never touches Prisma directly for this operation.
+   *
+   * Returns null if ANY link is broken.
+   */
+  async getForBid(
+    orgId: string,
+    programmeRevisionId: string,
+    opportunityId: string,
+  ) {
+    return db.programmeRevision.findFirst({
+      where: {
+        id: programmeRevisionId,
+        status: 'finalized',
+        programme: {
+          organizationId: orgId,
+          opportunityId, // EXACT match — null opportunityId on the Programme will not match
+        },
+      },
+      include: {
+        programme: {
+          select: {
+            id: true,
+            organizationId: true,
+            opportunityId: true,
+            name: true,
+          },
+        },
+      },
+    })
+  },
+
   async getLatestRevisionNo(orgId: string, programmeId: string): Promise<number> {
     const prog = await db.programme.findFirst({
       where: { id: programmeId, organizationId: orgId },

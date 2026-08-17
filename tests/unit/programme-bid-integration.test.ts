@@ -57,4 +57,19 @@ describe('Programme/Bid integration — Y1/Y2 corrections', () => {
     expect(bidServiceSrc).toMatch(/Y1\/Y2: from ProgrammeRevision domain/)
     expect(bidServiceSrc).not.toMatch(/from TenderDeliverable\(kind='programme'\)/)
   })
+
+  test('Z2/Z3: BidService has no direct db.programme.* calls (after stripping comments)', () => {
+    // Strip comments so forbidden patterns in docstring prose don't trigger false positives.
+    const code = bidServiceSrc
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/.*$/gm, '')
+    // Must NOT call db.programme.* directly — goes through the repository.
+    expect(code).not.toMatch(/\bdb\.programme\./)
+  })
+
+  test('Z1: BidService uses programmeRevisionRepo.getForBid (not getForOrganization + separate db lookup)', () => {
+    expect(bidServiceSrc).toMatch(/programmeRevisionRepo\.getForBid\(/)
+    // The old pattern (getForOrganization + db.programme.findFirst) should be gone.
+    expect(bidServiceSrc).not.toMatch(/db\.programme\.findFirst/)
+  })
 })

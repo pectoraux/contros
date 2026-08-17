@@ -512,37 +512,23 @@ export const bidService = {
       return { ok: false, error: `Required deliverables not ready: ${missingNames}`, status: 400 }
     }
 
-    // Y1/Y2: Validate the programme revision via the NEW ProgrammeRevision domain.
-    // The authoritative programme truth is Bid.programmeRevisionId → ProgrammeRevision.
-    // The legacy TenderDeliverable(kind='programme').revisionId is NOT consulted.
+    // Y1/Y2/Z1: Validate the programme revision via the NEW ProgrammeRevision domain.
+    // Z1: all validation is in the repository — no direct db.programme access in the service.
+    // The repository method validates: finalized + same org + EXACT opportunity match
+    // (null opportunityId on the Programme is rejected — a bid-associated programme
+    // must belong to the same opportunity).
     let resolvedProgrammeRevisionId: string | null = bid.programmeRevisionId ?? null
     if (resolvedProgrammeRevisionId) {
-      // Validate: ProgrammeRevision exists, is finalized, and belongs to this org.
-      const progRev = await programmeRevisionRepo.getForOrganization(
-        ctx.organizationId, resolvedProgrammeRevisionId,
+      const progRev = await programmeRevisionRepo.getForBid(
+        ctx.organizationId,
+        resolvedProgrammeRevisionId,
+        bid.opportunityId,
       )
       if (!progRev) {
         return {
           ok: false,
-          error: 'Programme revision not found in this organization or not finalized',
+          error: 'Programme revision not found for this bid (not finalized, wrong org, or wrong opportunity)',
           status: 400,
-        }
-      }
-      // Validate: the ProgrammeRevision's Programme belongs to the same opportunity.
-      // (Programme.opportunityId should match the bid's opportunityId, if both are set.)
-      if (progRev.programme && bid.opportunityId) {
-        // We need to check the programme's opportunityId. The getForOrganization
-        // include only selects id/organizationId/name — let's fetch the full programme.
-        const prog = await db.programme.findFirst({
-          where: { id: progRev.programmeId, organizationId: ctx.organizationId },
-          select: { id: true, opportunityId: true },
-        })
-        if (prog && prog.opportunityId && prog.opportunityId !== bid.opportunityId) {
-          return {
-            ok: false,
-            error: 'Programme revision does not belong to this opportunity',
-            status: 400,
-          }
         }
       }
     }
