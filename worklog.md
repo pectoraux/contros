@@ -4015,3 +4015,102 @@ NEXT ARCHITECTURAL FRONTIER (per reviewer):
 Stop spending disproportionate effort on Excel. Move toward the
 Project/Programme + construction information graph that connects:
   plans → quantities → BOQ → estimate → programme
+
+---
+Task ID: smoke-test-secret-fix + programme-reconnaissance
+Agent: principal-engineer
+Task: (T1) Fix smoke-test .env reading — require externally supplied TEST_DATABASE_URL. (T4) Programme domain reconnaissance. No frozen code touched.
+
+T1 — Smoke test no longer reads .env.
+- scripts/boq-route-smoke-test.ts previously used readFileSync('.env') to
+  extract DATABASE_URL. Now requires TEST_DATABASE_URL (or DATABASE_URL) from
+  the environment and fails closed if absent or not postgresql://.
+- Verified: 14/14 assertions pass with TEST_DATABASE_URL exported from the
+  shell. The script does NOT touch the developer's secret file.
+- Run: TEST_DATABASE_URL=postgresql://... bun run scripts/boq-route-smoke-test.ts
+
+T2 — Vercel env vars confirmed.
+- The Vercel project "contros" has DATABASE_URL, DIRECT_DATABASE_URL,
+  NEXTAUTH_SECRET, NEXTAUTH_URL, and all ZAI_* vars set as encrypted
+  environment variables for production/preview/development. The Vercel
+  deployment uses them automatically. Values were not decrypted or exposed.
+
+T4 — PROGRAMME DOMAIN RECONNAISSANCE.
+
+Existing foundations (already in the repository):
+1. Schedule Engine (src/lib/engines/schedule-engine.ts):
+   - Pure CPM scheduler: FS/SS/FF/SF precedence relationships with lag.
+   - Forward/backward pass, critical path, total/free float.
+   - Tested (tests/unit/schedule.test.ts).
+   - generateProgrammeFromEstimate: generates activities from estimate lines.
+
+2. EstimateRevision.revisionType = 'estimate' | 'programme':
+   - The schema already distinguishes commercial vs programme revisions.
+   - But there is NO Programme/Activity/Dependency model yet — the field
+     exists but has no dedicated domain model behind it.
+
+3. Bid.programmeRevisionId (nullable String):
+   - References a programme revision when submitting a bid. Currently unused
+     at the model level (no FK relation).
+
+4. ProjectActual (model):
+   - Ties to EstimateLine (not to an Activity).
+   - Captures: quantityCompleted, daysTaken, crewSize, materialConsumed,
+     materialCost, subcontractFinalCost.
+   - Computes: plannedProductivity, actualProductivity, productivityVariance,
+     plannedCost, actualCost, costVariance.
+   - This is the execution-evidence primitive.
+
+5. Opportunity.programmeImpact (Float, days):
+   - Records programme impact on an opportunity.
+
+6. Document.kind = 'programme':
+   - Documents can be programme-type (but no Programme document structure).
+
+What's MISSING (the Programme domain gap):
+- Programme model (the container — like Estimate is to EstimateRevision)
+- ProgrammeRevision model (immutable schedule snapshot — parallel to
+  EstimateRevision; carries the frozen activity/dependency graph)
+- WorkPackage model (groups activities by construction zone/level/trade)
+- Activity model (plannedStart, plannedFinish, duration, calendar, status,
+  baseline, percentComplete; references EstimateLine/WorkDefinitionVersion
+  as RELATIONSHIPS, not by copying quantities/prices)
+- ActivityDependency model (FS/SS/FF/SF + lag — the CPM edges)
+- Calendar model (working days, holidays, non-working periods)
+- ResourceAssignment model (crew/equipment assigned to activities)
+
+KEY ARCHITECTURAL DECISIONS (per reviewer's directive):
+1. ProgrammeRevision = immutable historical schedule snapshot, just as
+   EstimateRevision is an immutable commercial snapshot.
+     EstimateRevision = historical commercial truth
+     ProgrammeRevision = historical schedule truth
+2. Activity connects to construction work via RELATIONSHIPS (EstimateLine,
+   WorkDefinitionVersion, WorkPackage), NOT by copying quantities/prices.
+   The activity should not become another price authority.
+3. planned ≠ actual. Actual execution remains evidence.
+   ProjectActual already has quantities/days/crew/cost variance tied to
+   EstimateLine. Determine whether ProjectActual becomes the execution-
+   evidence primitive that the Programme layer references, or whether it
+   needs a carefully justified evolution.
+4. The construction information graph:
+   Design/Document Evidence → ModelElement/QuantityObservation → BoqItem →
+   binding → EstimateLine → commercial → EstimateRevision → work package →
+   ProgrammeActivity → execution → ProjectActual.
+   EstimateRevision and ProgrammeRevision remain SEPARATE sources of truth.
+   The graph provides relationships between them. It does not turn everything
+   into one giant mutable construction object.
+
+NEXT STEPS (per reviewer's recommended sequence):
+1. ✅ Fix smoke-test secret handling (DONE — this commit)
+2. ✅ Perform Programme domain reconnaissance (DONE — this entry)
+3. Define ProgrammeRevision / Activity / Dependency contracts (types first)
+4. Validate those contracts against existing EstimateRevision, ProjectActual,
+   Bid, WorkDefinitionVersion and Scope models
+5. Only then migrate the schema
+
+Do NOT start with: Gantt chart, drag-and-drop dates, critical-path UI,
+resource histogram, 3D viewer, CAD editor. Those are views over the domain.
+The first thing to establish is the schedule truth and its relationship to
+commercial truth.
+
+BOQ/XLSX STATUS: COMPLETE (pending this .env cleanup, which is now done).

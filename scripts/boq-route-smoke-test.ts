@@ -5,23 +5,25 @@
 // tests the real NextAuth credentials flow → real route → real service → real
 // XLSX bytes, end-to-end.
 //
-// Run: bun run scripts/boq-route-smoke-test.ts
-// (Requires the Neon DATABASE_URL from .env; the script forces it past the
-//  shell SQLite override.)
+// Run: TEST_DATABASE_URL=postgresql://... bun run scripts/boq-route-smoke-test.ts
+//
+// T1: does NOT read .env directly. Requires an externally supplied
+// TEST_DATABASE_URL (or DATABASE_URL) environment variable. Fails closed if
+// absent. This follows the secret-hygiene rule: test infrastructure should not
+// depend on reading a developer's secret file from the repository.
 
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
-
-// Force the Neon URL from .env (bypassing the shell SQLite override).
-const envFile = readFileSync(resolve(process.cwd(), '.env'), 'utf8')
-const env: Record<string, string> = {}
-for (const line of envFile.split('\n')) {
-  const m = line.match(/^([A-Z_]+)=(.*)$/)
-  if (m) env[m[1]] = m[2]
+const NEON_URL = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL
+if (!NEON_URL || !NEON_URL.startsWith('postgresql://')) {
+  console.error(
+    'FATAL: TEST_DATABASE_URL (or DATABASE_URL) must be a postgresql:// URL.\n' +
+    'Set it in the environment before running this script. Do NOT read .env.\n' +
+    'Example: TEST_DATABASE_URL=postgresql://... bun run scripts/boq-route-smoke-test.ts',
+  )
+  process.exit(1)
 }
-const NEON_URL = env.DATABASE_URL!
+// Force the Neon URL past the shell's SQLite DATABASE_URL override.
 process.env.DATABASE_URL = NEON_URL
-process.env.DIRECT_DATABASE_URL = env.DIRECT_DATABASE_URL || NEON_URL
+process.env.DIRECT_DATABASE_URL = process.env.DIRECT_DATABASE_URL || NEON_URL
 
 const SEED_REVISION_ID = 'rev-office-1'
 const DEMO_EMAIL = 'kwesi@adomconstruction.gh'
