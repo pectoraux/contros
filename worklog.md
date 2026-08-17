@@ -4114,3 +4114,73 @@ The first thing to establish is the schedule truth and its relationship to
 commercial truth.
 
 BOQ/XLSX STATUS: COMPLETE (pending this .env cleanup, which is now done).
+
+---
+Task ID: programme-domain-contract
+Agent: principal-engineer
+Task: Programme domain contract — Programme → ProgrammeRevision → Activity + Dependency. Pure types + validation/snapshot functions. No Prisma, no DB, no Gantt, no UI. Per approved milestone. No frozen code touched.
+
+CONTRACT (src/lib/programme/types.ts):
+- Programme: mutable planning workspace (owned by org, linked to opportunity).
+  status: draft | baseline | superseded.
+- ProgrammeRevision: immutable schedule snapshot (mirrors EstimateRevision).
+  snapshotJson, revisionType='programme', status: draft | finalized.
+- ProgrammeSnapshot: the complete schedule graph (activities + dependencies +
+  scheduling inputs/version). scheduleEngineVersion is part of the
+  reproducibility story: same snapshot + same engine version → same result.
+- ProgrammeActivity: id, name, duration, constructionRefs (relationships to
+  EstimateLine?/WDV?/WorkPackage?), plannedQuantity (OPTIONAL — NOT auto-
+  copied from EstimateLine.quantity), status (planned/in-progress/complete),
+  predecessorDependencies[].
+- ActivityDependency: predecessorActivityId, successorActivityId, type
+  (FS/SS/FF/SF), lag. Mirrors the schedule engine's SchedulePredecessor.
+- ProgrammeValidationResult: ok, errors[], duplicateActivityIds[],
+  danglingDependencyRefs[], hasCycle.
+
+KEY ARCHITECTURAL RULES (enforced by contract + tests):
+1. Activity references construction identity via RELATIONSHIPS (IDs), NOT by
+   copying commercial values (unitRate, sellPrice, directCost). The schedule
+   layer is NOT another price authority. (Tested: ProgrammeActivity has no
+   commercial fields; the contract source is audited.)
+2. plannedQuantity is OPTIONAL and NOT auto-copied from EstimateLine.quantity.
+   The activity may carry its own planned execution quantity or none at all.
+3. planned ≠ actual. The Programme domain carries planned truth only;
+   actuals remain in ProjectActual (the execution-evidence layer).
+4. CPM dates are deterministic OUTPUTS of replaying the snapshot through
+   computeSchedule() — never stored as mutable state in the snapshot.
+5. Calendar and ResourceAssignment are deliberately DEFERRED from v1.
+
+PURE FUNCTIONS (src/lib/programme/snapshot.ts):
+- validateProgrammeSnapshot(snapshot): catches duplicate IDs, dangling deps,
+  cycles (via the schedule engine), negative durations, self-references.
+- serializeSnapshot(snapshot) → JSON (deterministic).
+- deserializeSnapshot(json) → ProgrammeSnapshot.
+- replaySchedule(snapshot) → ScheduleResult (deterministic CPM).
+- schedulesMatch(a, b) → boolean (reproducibility verification).
+
+FAITHFUL BRIDGE: the Programme→ScheduleActivity mapping preserves id/name/
+duration/predecessors without losing or inventing scheduling data. The
+Programme domain adds construction-identity refs + planned quantities + status;
+the schedule engine consumes only the CPM inputs. Tested: replay matches
+direct computeSchedule for the same logical schedule.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 279 pass / 0 fail (+18 programme;
+  0 regressions)
+- Programme tests establish:
+  * schedule reproducibility (same snapshot → same result; matches direct engine)
+  * no commercial duplication (ProgrammeActivity has no price fields)
+  * plannedQuantity optional + not auto-copied
+  * validation (duplicates, dangling, cycles, negative, self-ref)
+  * serialization round-trips faithfully
+  * scheduleEngineVersion is part of the snapshot
+  * no Excel/spreadsheet concepts in the domain
+- Frozen Phase 1 code ................. UNTOUCHED
+
+NEXT (per reviewer's sequence):
+- Validate these contracts against existing EstimateRevision, ProjectActual,
+  Bid, WorkDefinitionVersion and Scope models.
+- Only then migrate the schema.
+- Do NOT start: Gantt chart, drag-and-drop dates, critical-path UI,
+  resource histogram, calendars, resources.
