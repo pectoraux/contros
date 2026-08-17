@@ -182,20 +182,24 @@ export interface BoqProjectionRow {
  * Full provenance for a projection. Carries everything needed to prove WHAT
  * was exported and to reproduce it.
  *
- * Determinism note: `contentHash` is a deterministic digest of the COMPLETE
- * canonical projection payload — every field of every row (including
- * workDefinition name/unit/wastage, not just versionId/version), the totals,
- * and the projectionVersion. It is NOT a wall-clock timestamp and NOT a
- * cryptographic guarantee — a stable structural digest sufficient to prove
- * "same canonical content". `generatedBy` / `generationContext` describe the
- * actor/context but are audit-only and do NOT affect the contentHash. Same
- * revision + same projectionVersion → same contentHash, always.
+ * `contentHash` is a SHA-256 digest of the complete canonical projection
+ * payload — every field of every row (including workDefinition
+ * name/unit/wastage, not just versionId/version), the totals, and the
+ * projectionVersion. It provides cryptographic content-addressing for the
+ * projection: any change to the canonical content produces a different hash.
+ *
+ * IMPORTANT distinction: SHA-256 gives INTEGRITY / CONTENT IDENTITY, not
+ * provenance of WHO generated the artifact. It does not itself establish
+ * authorship, authorization, or authenticity. The actor/context fields
+ * (`generatedBy` / `generationContext`) and the eventual audit record handle
+ * that separate concern. Same revision + same projectionVersion → same
+ * contentHash, always; the audit-only fields do NOT affect the contentHash.
  */
 export interface ProjectionProvenance {
   source: ProjectionSource
   /** The projection format version used (deterministic identifier). */
   projectionVersion: ProjectionVersion
-  /** Deterministic digest of the complete canonical payload (rows + totals + version). */
+  /** SHA-256 digest of the complete canonical payload (rows + totals + version). Provides content identity, not authorship. */
   contentHash: string
   /** Who/what requested the projection (audit only — does not affect rows). */
   generatedBy: string | null

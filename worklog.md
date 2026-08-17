@@ -3057,3 +3057,45 @@ step, with the narrow contract: BoqProjection → XLSX bytes. No DB, no
 EstimateLine, no PricingEngine, no opportunity lookup, no binding/reconciliation,
 no mutation. Presentation precision (rounding for display) is an adapter
 concern and will never alter the canonical projection or its contentHash.
+
+---
+Task ID: boq-projection-provenance-wording
+Agent: principal-engineer
+Task: Fix the final documentation contradiction — the contentHash provenance comment still said "NOT a cryptographic guarantee" after the SHA-256 upgrade. No code/behavior change; documentation only.
+
+ISSUE (per reviewer):
+- The implementation correctly uses SHA-256 (64-hex digest) for contentHash,
+  but the ProjectionProvenance.contentHash docstring in projection-contract.ts
+  still said "NOT a cryptographic guarantee — a stable structural digest."
+  That directly contradicted the code and the surrounding docs which call it a
+  "cryptographic content digest."
+
+FIX:
+- ProjectionProvenance docstring now states precisely:
+  * contentHash is a SHA-256 digest of the complete canonical payload.
+  * It provides cryptographic content-addressing (any content change → different hash).
+  * IMPORTANT distinction: SHA-256 gives INTEGRITY / CONTENT IDENTITY, not
+    provenance of WHO generated the artifact. It does not establish authorship,
+    authorization, or authenticity. The actor/context fields (generatedBy /
+    generationContext) and the eventual audit record handle that separate
+    concern. Content identity ≠ authorship.
+- The contentHash field comment now reads: "SHA-256 digest of the complete
+  canonical payload. Provides content identity, not authorship."
+- computeContentHash docstring in projection.ts carries the same scope
+  clarification for implementers.
+
+No behavioral change. No test change (the SHA-256 length + lossless behavior
+are already proven by the existing tests).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Projection tests .................... 28 pass / 0 fail (unchanged)
+- No stale "not a cryptographic guarantee" / "structural digest" wording remains.
+
+DISPOSITION:
+  ✅ stale provenance comment corrected
+  → XLSX adapter approved as the next milestone, with the adapter invariant:
+    same BoqProjection + same adapter version + same formatting configuration
+      → same XLSX bytes/content
+    (pure/deterministic, no DB/Prisma/EstimateLine/PricingEngine/opportunity/
+     binding/reconciliation/canonical mutation).

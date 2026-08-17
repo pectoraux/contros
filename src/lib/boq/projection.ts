@@ -67,6 +67,12 @@ import type {
  * risk than a standard cryptographic digest, which is unacceptable for a value
  * whose purpose is durable provenance / artifact identity.
  *
+ * Scope: SHA-256 here provides INTEGRITY / CONTENT IDENTITY (any content
+ * change produces a different hash). It does NOT establish authorship,
+ * authorization, or authenticity of the artifact — that is the job of the
+ * audit-only `generatedBy`/`generationContext` fields and the eventual audit
+ * record. Content identity ≠ authorship.
+ *
  * The hash input is the full projection payload — every field of every
  * BoqProjectionRow (identity, description, quantity, unit, workDefinition
  * INCLUDING name/unit/wastage/versionId/version, commercial breakdown) PLUS the
