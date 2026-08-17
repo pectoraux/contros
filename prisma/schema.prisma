@@ -39,6 +39,7 @@ model Organization {
   documents      Document[]
   productivityObservations ProductivityObservation[]
   boqImports     BoqImport[]
+  programmes     Programme[]
 }
 
 model User {
@@ -253,6 +254,7 @@ model WorkDefinitionVersion {
   estimateLines       EstimateLine[]
   priceObservations   ResourcePriceObservation[] @relation("PriceObservationWDV")
   productivityObservations ProductivityObservation[]
+  programmeActivities Activity[]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -401,6 +403,7 @@ model EstimateLine {
   commercialExceptions  CommercialException[]
   actuals               ProjectActual[]
   boqBindings           BoqBinding[]
+  programmeActivities   Activity[]
 }
 
 // P0-5 fix: hybrid execution needs explicit allocation, never a 50% heuristic.
@@ -544,6 +547,7 @@ model Bid {
   organization        Organization @relation(fields: [organizationId], references: [id])
   opportunity         Opportunity  @relation(fields: [opportunityId], references: [id])
   estimate            Estimate    @relation(fields: [estimateId], references: [id])
+  programmeRevision   ProgrammeRevision? @relation(fields: [programmeRevisionId], references: [id])
   deliverables        TenderDeliverable[]
 }
 
@@ -842,4 +846,102 @@ model BoqBinding {
   estimateLine        EstimateLine? @relation(fields: [estimateLineId], references: [id])
 
   @@index([estimateLineId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Programme Domain — schedule truth (parallel to EstimateRevision commercial truth)
+//
+//   Programme = mutable planning workspace
+//   ProgrammeRevision = immutable schedule snapshot
+//   Activity = planned work with construction-identity relationships
+//   ActivityDependency = CPM edge (FS/SS/FF/SF + lag)
+//
+// INVARIANTS:
+//   - ProgrammeRevision is tenant-safe via Programme.organizationId.
+//   - Activity references EstimateLine/WorkDefinitionVersion as RELATIONSHIPS,
+//     not by copying commercial values.
+//   - ProjectActual remains anchored to EstimateLine (not Activity) for v1.
+//   - Bid.programmeRevisionId is a real FK to ProgrammeRevision (historical
+//     schedule submitted with the bid).
+//   - No Calendar, ResourceAssignment, WorkPackage, or ActivityActual yet.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Programme {
+  id              String   @id @default(cuid())
+  organizationId  String
+  opportunityId   String?
+  name            String
+  status          String   @default("draft") // draft | baseline | superseded
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  revisions       ProgrammeRevision[]
+  activities      Activity[]
+  dependencies    ActivityDependency[]
+
+  @@index([organizationId])
+  @@index([organizationId, opportunityId])
+}
+
+model ProgrammeRevision {
+  id                   String   @id @default(cuid())
+  programmeId          String
+  revisionNo           Int
+  snapshotJson         String   // immutable schedule-graph snapshot (canonical JSON)
+  snapshotContentHash  String   // SHA-256 of the canonical JSON (content identity)
+  scheduleEngineVersion Int     // the CPM engine version that computes the schedule
+  status               String   @default("draft") // draft | finalized
+  finalizedAt          DateTime?
+  finalizedById        String?
+  createdAt            DateTime @default(now())
+
+  programme            Programme @relation(fields: [programmeId], references: [id])
+  bids                 Bid[]
+
+  @@unique([programmeId, revisionNo])
+  @@index([programmeId])
+}
+
+model Activity {
+  id                       String   @id @default(cuid())
+  programmeId              String
+  name                     String
+  duration                 Float    // planned duration in days (finite, >= 0)
+  plannedQuantity          Float?   // optional; NOT auto-copied from EstimateLine.quantity
+  status                   String   @default("planned") // planned | in-progress | complete
+  estimateLineId           String?  // relationship — does NOT carry commercial values
+  workDefinitionVersionId  String?  // relationship — construction work identity
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  programme                Programme @relation(fields: [programmeId], references: [id])
+  estimateLine             EstimateLine? @relation(fields: [estimateLineId], references: [id])
+  workDefinitionVersion    WorkDefinitionVersion? @relation(fields: [workDefinitionVersionId], references: [id])
+
+  // Dependencies where this activity is the predecessor or successor.
+  predecessorDependencies  ActivityDependency[] @relation("SuccessorActivity")
+  successorDependencies    ActivityDependency[] @relation("PredecessorActivity")
+
+  @@index([programmeId])
+  @@index([estimateLineId])
+  @@index([workDefinitionVersionId])
+}
+
+model ActivityDependency {
+  id                    String   @id @default(cuid())
+  programmeId           String
+  predecessorActivityId String
+  successorActivityId   String
+  type                  String   // FS | SS | FF | SF
+  lag                   Float    @default(0) // days (can be negative = lead)
+
+  programme             Programme @relation(fields: [programmeId], references: [id])
+  predecessorActivity   Activity  @relation("PredecessorActivity", fields: [predecessorActivityId], references: [id])
+  successorActivity     Activity  @relation("SuccessorActivity", fields: [successorActivityId], references: [id])
+
+  @@unique([predecessorActivityId, successorActivityId, type])
+  @@index([programmeId])
+  @@index([predecessorActivityId])
+  @@index([successorActivityId])
 }

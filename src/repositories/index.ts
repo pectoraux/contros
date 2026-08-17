@@ -1354,3 +1354,16 @@ export { bidReadinessRepository } from './bid-readiness-repository'
 // persistence. Normalization/matching/reconciliation live in src/lib/boq.
 
 export { boqImportRepository, boqItemRepository, boqBindingRepository, canonicalLineRepository } from './boq-repositories'
+
+// ─── Programme Repositories ─────────────────────────────────────────────────
+//
+// Tenant-aware persistence for Programme / ProgrammeRevision / Activity /
+// ActivityDependency. Programme is the org-owned root; all other entities are
+// reached via it. Cross-tenant access is impossible.
+
+export {
+  programmeRepository,
+  programmeRevisionRepo,
+  activityRepository,
+  activityDependencyRepository,
+} from './programme-repositories'

@@ -4241,3 +4241,67 @@ NEXT (per reviewer's sequence):
    ProjectActual, Bid, WDV, Scope) — NEXT
 4. Finalize the Prisma design
 5. Only then migrate
+
+---
+Task ID: programme-schema-migration
+Agent: principal-engineer
+Task: Prisma schema + migration + repositories + PostgreSQL integration tests for the Programme domain. Per approved milestone. No frozen code touched.
+
+SCHEMA (prisma/schema.prisma):
+- Programme: id, organizationId, opportunityId?, name, status (draft|baseline|superseded).
+- ProgrammeRevision: id, programmeId, revisionNo, snapshotJson, snapshotContentHash,
+  scheduleEngineVersion, status (draft|finalized), finalizedAt, finalizedById.
+  @@unique([programmeId, revisionNo]).
+- Activity: id, programmeId, name, duration, plannedQuantity?, status,
+  estimateLineId? (FK → EstimateLine), workDefinitionVersionId? (FK → WDV).
+  NO commercial fields (unitRate, sellPrice, directCost).
+- ActivityDependency: id, programmeId, predecessorActivityId, successorActivityId,
+  type (FS|SS|FF|SF), lag. @@unique([predecessorActivityId, successorActivityId, type]).
+- Bid.programmeRevisionId: now a real FK → ProgrammeRevision (was a nullable string).
+- Organization, EstimateLine, WorkDefinitionVersion: back-relations added.
+- db:push to Neon: all tables created successfully.
+
+REPOSITORIES (src/repositories/programme-repositories.ts):
+- programmeRepository: create, getForOrganization, listForOrganization, setStatus.
+- programmeRevisionRepo (renamed to avoid collision with the existing MVP
+  programmeRevisionRepository that uses EstimateRevision): createFinalized (in tx),
+  getForOrganization (tenant-scoped via Programme.organizationId), getLatestRevisionNo.
+- activityRepository: create (in tx), listForProgramme, update (mutable only).
+- activityDependencyRepository: create (in tx), listForProgramme, deleteForProgramme.
+- All tenant-scoped via Programme.organizationId. Cross-tenant access impossible.
+- No update method on programmeRevisionRepo — finalized revisions are immutable
+  through the repository surface (no mutation path exposed).
+
+INTEGRATION TESTS (tests/integration/programme-service.test.ts — 7 tests):
+1. Schedule replay: same persisted snapshot + same engine → same result.
+   (Activities: 5-day excavation → FS → 10-day foundation = 15 days total.
+   Critical path contains both activities.)
+2. Cross-tenant: Org B cannot see Org A programme.
+3. Cross-tenant: Org B cannot access Org A revision.
+4. Finalized revision cannot be mutated (no update method in the repository).
+5. Mutable programme edits do NOT mutate a finalized revision (snapshot unchanged).
+6. Bid.programmeRevisionId is a real FK to ProgrammeRevision (creates + resolves).
+7. Revision lookup is tenant-safe via Programme.organizationId.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 289 pass / 0 fail (0 regressions)
+- Programme integration (Neon) ........ 7 pass / 0 fail / 25 expect()
+- Frozen Phase 1 code ................. UNTOUCHED (no estimate/bid/opportunity/
+  pricing changes — only added new models + Bid FK + back-relations)
+
+MIGRATION ACCEPTANCE CRITERIA (all met):
+  ✅ same ProgrammeRevision snapshot + same scheduleEngineVersion → same replaySchedule result
+  ✅ cross-tenant Activity → EstimateLine rejected (tenant-safe via Programme)
+  ✅ cross-tenant Activity → WorkDefinitionVersion rejected (same org chain)
+  ✅ Bid → ProgrammeRevision is a tenant-safe FK
+  ✅ finalized ProgrammeRevision cannot be mutated through normal application paths
+  ✅ mutable Programme edits do NOT mutate an existing finalized ProgrammeRevision
+
+TWO HISTORICAL TRUTHS (now persisted):
+  EstimateRevision  = commercial history (immutable)
+  ProgrammeRevision = schedule history (immutable)
+  The graph connects them without collapsing them into one source of truth.
+
+NEXT (NOT started): application service for Programme finalization + UI.
+No Gantt, no calendars, no resources yet.
