@@ -3099,3 +3099,94 @@ DISPOSITION:
       → same XLSX bytes/content
     (pure/deterministic, no DB/Prisma/EstimateLine/PricingEngine/opportunity/
      binding/reconciliation/canonical mutation).
+
+---
+Task ID: boq-xlsx-adapter-contract
+Agent: principal-engineer
+Task: XLSX adapter — define the (BoqProjection, adapterVersion, formattingConfig) → XlsxArtifact contract + pure adapter function. Per approved milestone. The bytes serializer step is deferred to a follow-up; the contract is the approved first artifact.
+
+ARCHITECTURE (approved, with two-level invariant refinement):
+  BoqProjection (lossless, SHA-256 content-addressed)
+      ↓
+  XlsxAdapterVersion + XlsxFormattingConfig
+      ↓
+  XlsxArtifact (office representation, display-rounded)
+      ↓
+  XLSX bytes (ZIP container — deterministic only if serializer is; TESTED later)
+
+TWO-LEVEL REPRODUCIBILITY INVARIANT:
+- Canonical adapter invariant (ALWAYS holds — guaranteed):
+    same BoqProjection + same adapterVersion + same formatting config
+        → same XlsxArtifact content (sheets, rows, cells, formats, order).
+- Strong reproducibility invariant (TESTED, not assumed — depends on serializer):
+    same inputs → byte-identical XLSX bytes.
+  XLSX is a ZIP container; "same logical workbook" ≠ "same bytes" unless the
+  serializer is deliberately deterministic (no timestamps, stable ordering).
+  The strong invariant will be tested when the serializer is wired.
+
+DISPLAY ROUNDING (critical):
+- The projection is LOSSLESS (quantity 1.2375 stays 1.2375). The adapter
+  formats that as 1.24 for DISPLAY by producing a NEW cell value — the
+  projection is never mutated, and its contentHash is carried unchanged in
+  the artifact for traceability. Proven by tests.
+
+VERSIONING:
+- Formatting rules live in an EXPLICIT, VERSIONED XlsxFormattingConfig (not
+  scattered constants). formattingVersion bumps on any formatting change.
+- adapterVersion bumps on adapter code changes. Separate concerns.
+
+CONTRACT (src/lib/boq/xlsx-adapter-contract.ts):
+- XlsxAdapterVersion (branded), CURRENT_XLSX_ADAPTER_VERSION = 1.
+- XlsxFormattingConfig: formattingVersion, worksheetName, columns[], money/
+  quantityDisplayDecimals, includeHeader, includeTotalsRow.
+- XlsxColumn: field (typed XlsxColumnField), header, width, numberFormat.
+- DEFAULT_XLSX_FORMATTING (v1): single "BOQ" sheet, 10 columns
+  [No, Code, Description, Unit, Qty, Unit Rate, Sell Price, Direct Cost,
+  Exp. Profit, Margin %], 2dp money/quantity display, header + totals row.
+- XlsxArtifact: adapterVersion, formatting, sourceContentHash, worksheets[].
+- XlsxWorksheet: name, columns, rows (header + data + totals).
+- XlsxRow/XlsxCell: display-rounded values + numberFormat.
+- Forbidden patterns documented (no DB/engine/repository/lookup/mutation).
+
+PURE ADAPTER (src/lib/boq/xlsx-adapter.ts):
+- buildXlsxArtifact(input) → XlsxArtifact. Pure, deterministic.
+- renderCell: per-field rendering with display rounding (roundForDisplay).
+  Margin % kept as fraction; the '0.00%' number format renders it.
+- renderTotalsRow: sums sellPrice/directCost/expectedProfit from projection
+  totals; labels Description as "TOTAL".
+- artifactsMatch(a, b): structural equality for the canonical invariant.
+- Exhaustiveness guard on XlsxColumnField (new field → compile error).
+- No DB, no Prisma, no engines, no repositories, no lookups, no mutation.
+
+FILES (new — no frozen code modified):
+- src/lib/boq/xlsx-adapter-contract.ts — the contract types.
+- src/lib/boq/xlsx-adapter.ts — the pure adapter function + artifactsMatch.
+- src/lib/boq/index.ts — barrel export appended.
+- tests/unit/boq-xlsx-adapter.test.ts — 20 tests.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 237 pass / 0 fail (was 217; +20 adapter;
+  0 regressions)
+- Adapter tests establish:
+  * basic shape (1 sheet, header + data + totals, carries version/config/hash)
+  * CANONICAL INVARIANT: same inputs → identical artifact; changing projection
+    / config / version changes the artifact
+  * DISPLAY ROUNDING: quantity 1.2375 → cell 1.24, projection stays 1.2375;
+    building the artifact does NOT mutate the projection; many-decimal quantities
+    preserved in projection
+  * ORDERING: data rows follow projection order (frozen snapshot order, no
+    re-sort); columns follow config order
+  * totals row: sums from projection totals, labels "TOTAL", toggle off
+  * includeHeader toggle
+  * BOUNDARY: adapter + contract modules import no DB/engine/repository symbols
+- Frozen Phase 1 code ................. UNTOUCHED
+
+NEXT (NOT started — deferred to a follow-up after the contract is reviewed):
+- Select + wire an XLSX library for the FINAL bytes step ONLY (XlsxArtifact → bytes).
+  The serializer must be deterministic (no timestamps, stable ZIP entry order,
+  stable relationship ordering). The strong byte-identity invariant will be
+  TESTED: repeated serialization of the same artifact must produce byte-identical
+  output. If the chosen library is non-deterministic, document the strong
+  invariant as NOT holding (the canonical invariant still holds).
+- No UI yet. No canonical mutation ever.
