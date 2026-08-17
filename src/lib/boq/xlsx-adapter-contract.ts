@@ -123,7 +123,6 @@ export interface XlsxColumn {
 /** The set of projection fields that can be rendered as columns. */
 export type XlsxColumnField =
   | 'rowNumber'
-  | 'workDefinitionCode' // uses workDefinition.versionId as the code proxy
   | 'description'
   | 'unit'
   | 'quantity'
@@ -136,13 +135,18 @@ export type XlsxColumnField =
 /**
  * The default v1 formatting configuration. Explicit and versioned.
  * Centralized here so formatting rules are not scattered constants.
+ *
+ * J2: no "Code" column. The projection contract does not define a canonical
+ * business code — workDefinition.versionId is an immutable DB identifier, NOT
+ * a contractor-facing code. Exposing it under a "Code" header would manufacture
+ * business vocabulary without domain support. The Code column is omitted until
+ * the domain projection carries an actual canonical code.
  */
 export const DEFAULT_XLSX_FORMATTING: XlsxFormattingConfig = {
   formattingVersion: 1,
   worksheetName: 'BOQ',
   columns: [
     { field: 'rowNumber', header: 'No.', width: 6, numberFormat: null },
-    { field: 'workDefinitionCode', header: 'Code', width: 14, numberFormat: null },
     { field: 'description', header: 'Description', width: 40, numberFormat: null },
     { field: 'unit', header: 'Unit', width: 8, numberFormat: null },
     { field: 'quantity', header: 'Qty', width: 10, numberFormat: '#,##0.00' },

@@ -3190,3 +3190,69 @@ NEXT (NOT started — deferred to a follow-up after the contract is reviewed):
   output. If the chosen library is non-deterministic, document the strong
   invariant as NOT holding (the canonical invariant still holds).
 - No UI yet. No canonical mutation ever.
+
+---
+Task ID: boq-xlsx-adapter-immutability-codefix
+Agent: principal-engineer
+Task: Close the 2 pre-serializer issues — artifact immutability + remove invented Code mapping. No frozen code touched.
+
+ISSUES CLOSED (per reviewer's findings):
+
+J1 — XlsxArtifact now owns immutable deep-copied data.
+- The prior buildXlsxArtifact returned the input `formatting` object and its
+  `columns` array BY REFERENCE. The adapter didn't mutate them, but a caller
+  could mutate the original input config after build and the already-built
+  artifact would change too — weakening the stable-artifact claim. A Readonly<>
+  type alone would not prevent runtime mutation.
+- Fix: buildXlsxArtifact now deep-copies the formatting config (and its columns
+  array + each column object) via deepCopyFormatting(). The artifact OWNS its
+  formatting/columns; mutating the input config after build has NO effect on
+  the already-built artifact.
+- New tests (3): mutating input config header doesn't change built artifact;
+  mutating input columns array doesn't change artifact columns; the artifact
+  formatting is a different object reference (deep copy) but structurally equal.
+
+J2 — Removed the invented workDefinitionCode mapping (option B).
+- The adapter defined workDefinitionCode → workDefinition.versionId and
+  presented it under a "Code" header. But the projection contract defines
+  versionId as an immutable WorkDefinitionVersion DB identifier, NOT a
+  contractor-facing business code. Exposing a UUID under "Code" would
+  manufacture business vocabulary without domain support.
+- Fix (option B — omit until the domain has a canonical code): removed
+  'workDefinitionCode' from XlsxColumnField and removed the Code column from
+  DEFAULT_XLSX_FORMATTING. The renderCell case is removed. Documented the
+  decision in the contract.
+- New tests (3): default v1 formatting has no Code column; XlsxColumnField has
+  no workDefinitionCode member; the built artifact does not expose versionId
+  under any header.
+
+FILES MODIFIED (no frozen code):
+- src/lib/boq/xlsx-adapter-contract.ts — removed workDefinitionCode from
+  XlsxColumnField + DEFAULT_XLSX_FORMATTING; documented the decision.
+- src/lib/boq/xlsx-adapter.ts — removed the workDefinitionCode render case;
+  added deepCopyFormatting; buildXlsxArtifact now owns its data.
+- tests/unit/boq-xlsx-adapter.test.ts — updated column indices (Code removed
+  → shifted by one); +6 J1/J2 tests.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 243 pass / 0 fail (was 237; +6 J1/J2;
+  0 regressions)
+- Adapter tests .................... 26 pass / 0 fail
+- J1 tests prove: mutating input config after build does NOT change the
+  artifact; the artifact formatting is a deep copy (different reference).
+- J2 tests prove: no Code column; versionId not exposed under any header.
+- Frozen Phase 1 code ................. UNTOUCHED
+
+DISPOSITION (per reviewer):
+  ✅ pure projection → office-content boundary
+  ✅ explicit adapter version + formatting version
+  ✅ display rounding isolated from projection
+  ✅ no persistence/commercial dependencies
+  ✅ two-level reproducibility model
+  ✅ artifact owns immutable data (J1)
+  ✅ invented Code mapping removed (J2)
+  → Proceed to library selection and serializer evaluation, with the serializer
+    milestone proving: same XlsxArtifact + same serializer version/config →
+    same workbook content; and where achievable: same inputs → byte-identical
+    XLSX. The strong byte-identity invariant will be TESTED, not assumed.

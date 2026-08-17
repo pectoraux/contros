@@ -152,8 +152,8 @@ describe('XLSX adapter — DISPLAY ROUNDING preserves the projection', () => {
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
     const sheet = artifact.worksheets[0]
     const dataRow = sheet.rows.find((r) => !r.isHeader && !r.isTotals)!
-    // Find the Qty column (index 4 in default config: No, Code, Desc, Unit, Qty).
-    const qtyCell = dataRow.cells[4]
+    // Find the Qty column (index 3 in v1 default config: No, Desc, Unit, Qty).
+    const qtyCell = dataRow.cells[3]
     expect(qtyCell.value).toBe(1.24) // display-rounded
     // The PROJECTION is unchanged — its quantity is still the exact 1.2375.
     expect(proj.rows[0].quantity).toBe(1.2375)
@@ -167,7 +167,7 @@ describe('XLSX adapter — DISPLAY ROUNDING preserves the projection', () => {
     const sheet = artifact.worksheets[0]
     const dataRow = sheet.rows.find((r) => !r.isHeader && !r.isTotals)!
     // sellPrice cell is display-rounded to 2dp.
-    const sellCell = dataRow.cells[6] // Sell Price column
+    const sellCell = dataRow.cells[5] // Sell Price column (v1: No,Desc,Unit,Qty,UnitRate,Sell)
     expect(typeof sellCell.value).toBe('number')
     // The projection value equals the replayed breakdown (exact, no re-round).
     // The cell value is round2 of that. Verify the cell is a 2dp number.
@@ -189,7 +189,7 @@ describe('XLSX adapter — DISPLAY ROUNDING preserves the projection', () => {
     const proj = makeProjection([makeLine({ quantity: 123.456789 })])
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
     const dataRow = artifact.worksheets[0].rows.find((r) => !r.isHeader && !r.isTotals)!
-    expect(dataRow.cells[4].value).toBe(123.46) // display-rounded to 2dp
+    expect(dataRow.cells[3].value).toBe(123.46) // display-rounded to 2dp
     expect(proj.rows[0].quantity).toBe(123.456789) // projection exact
   })
 })
@@ -226,18 +226,18 @@ describe('XLSX adapter — totals row', () => {
     const proj = makeProjection([makeLine({ quantity: 100 }), makeLine({ lineId: 'l2', quantity: 50 })])
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
     const totalsRow = artifact.worksheets[0].rows.find((r) => r.isTotals)!
-    // Sell Price column (index 6), Direct Cost (7), Exp Profit (8).
-    expect(totalsRow.cells[6].value).toBe(Math.round(proj.totals.totalSellPrice * 100) / 100)
-    expect(totalsRow.cells[7].value).toBe(Math.round(proj.totals.totalDirectCost * 100) / 100)
-    expect(totalsRow.cells[8].value).toBe(Math.round(proj.totals.totalExpectedProfit * 100) / 100)
+    // v1 columns: No(0), Desc(1), Unit(2), Qty(3), UnitRate(4), Sell(5), Direct(6), Profit(7), Margin(8).
+    expect(totalsRow.cells[5].value).toBe(Math.round(proj.totals.totalSellPrice * 100) / 100)
+    expect(totalsRow.cells[6].value).toBe(Math.round(proj.totals.totalDirectCost * 100) / 100)
+    expect(totalsRow.cells[7].value).toBe(Math.round(proj.totals.totalExpectedProfit * 100) / 100)
   })
 
   test('totals row labels the Description column as TOTAL', () => {
     const proj = makeProjection()
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
     const totalsRow = artifact.worksheets[0].rows.find((r) => r.isTotals)!
-    // Description column is index 2.
-    expect(totalsRow.cells[2].value).toBe('TOTAL')
+    // Description column is index 1 (v1: No, Desc, ...).
+    expect(totalsRow.cells[1].value).toBe('TOTAL')
   })
 
   test('includeTotalsRow=false omits the totals row', () => {
@@ -279,6 +279,77 @@ describe('XLSX adapter — BOUNDARY (no DB / engine / repository access)', () =>
     expect(src).not.toMatch(/from ['"]@\/lib\/db['"]/)
     expect(src).not.toMatch(/from ['"]@\/lib\/engines['"]/)
     expect(src).not.toMatch(/from ['"]@\/repositories['"]/)
+  })
+})
+
+describe('XLSX adapter — J1: artifact owns immutable data (no shared mutable refs)', () => {
+  test('mutating the input config after build does NOT affect the built artifact', () => {
+    const proj = makeProjection()
+    const config: XlsxFormattingConfig = {
+      ...DEFAULT_XLSX_FORMATTING,
+      columns: [...DEFAULT_XLSX_FORMATTING.columns],
+    }
+    const artifact = buildXlsxArtifact(makeAdapterInput(proj, { formatting: config }))
+    // Snapshot the artifact's header before mutating the input config.
+    const headerBefore = artifact.worksheets[0].rows[0].cells.map((c) => c.value)
+    // Now mutate the ORIGINAL input config — change a column header.
+    config.columns[0] = { ...config.columns[0], header: 'CHANGED' }
+    // The already-built artifact must NOT change — it owns its own data.
+    const headerAfter = artifact.worksheets[0].rows[0].cells.map((c) => c.value)
+    expect(headerAfter).toEqual(headerBefore)
+    expect(headerAfter[0]).not.toBe('CHANGED')
+  })
+
+  test('mutating the input config columns array does NOT affect the artifact columns', () => {
+    const proj = makeProjection()
+    const config: XlsxFormattingConfig = {
+      ...DEFAULT_XLSX_FORMATTING,
+      columns: [...DEFAULT_XLSX_FORMATTING.columns],
+    }
+    const artifact = buildXlsxArtifact(makeAdapterInput(proj, { formatting: config }))
+    const artifactColumnCount = artifact.formatting.columns.length
+    // Mutate the input config's columns array (push a new column).
+    config.columns.push({ field: 'description', header: 'Extra', width: 10, numberFormat: null })
+    // The artifact's columns are unchanged.
+    expect(artifact.formatting.columns.length).toBe(artifactColumnCount)
+    expect(artifact.worksheets[0].columns.length).toBe(artifactColumnCount)
+  })
+
+  test('the artifact formatting is a deep copy, not the same reference', () => {
+    const proj = makeProjection()
+    const config: XlsxFormattingConfig = { ...DEFAULT_XLSX_FORMATTING }
+    const artifact = buildXlsxArtifact(makeAdapterInput(proj, { formatting: config }))
+    // The artifact's formatting must be a different object reference than the input.
+    expect(artifact.formatting).not.toBe(config)
+    expect(artifact.formatting.columns).not.toBe(config.columns)
+    expect(artifact.formatting.columns[0]).not.toBe(config.columns[0])
+    // But structurally equal.
+    expect(JSON.stringify(artifact.formatting)).toBe(JSON.stringify(config))
+  })
+})
+
+describe('XLSX adapter — J2: no invented Code column', () => {
+  test('the default v1 formatting has NO Code column', () => {
+    const fields = DEFAULT_XLSX_FORMATTING.columns.map((c) => c.field)
+    expect(fields).not.toContain('workDefinitionCode')
+    const headers = DEFAULT_XLSX_FORMATTING.columns.map((c) => c.header)
+    expect(headers).not.toContain('Code')
+  })
+
+  test('the XlsxColumnField type has no workDefinitionCode member', async () => {
+    const fs = await import('node:fs')
+    const src = fs.readFileSync('src/lib/boq/xlsx-adapter-contract.ts', 'utf8')
+    // The invented mapping is removed — versionId is not exposed as a "Code".
+    expect(src).not.toMatch(/workDefinitionCode/)
+  })
+
+  test('the built artifact does not expose versionId under any header', () => {
+    const proj = makeProjection([makeLine()])
+    const artifact = buildXlsxArtifact(makeAdapterInput(proj))
+    const dataRow = artifact.worksheets[0].rows.find((r) => !r.isHeader && !r.isTotals)!
+    // No cell should contain the WDV versionId ('wdv-1').
+    const allValues = dataRow.cells.map((c) => c.value)
+    expect(allValues).not.toContain('wdv-1')
   })
 })
 

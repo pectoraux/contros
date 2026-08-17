@@ -81,9 +81,6 @@ function renderCell(
   switch (field) {
     case 'rowNumber':
       return { value: row.identity.rowNumber, numberFormat }
-    case 'workDefinitionCode':
-      // Use the WDV versionId as the code proxy (the snapshot's WD identity).
-      return { value: row.workDefinition?.versionId ?? null, numberFormat }
     case 'description':
       return { value: row.description, numberFormat }
     case 'unit':
@@ -188,6 +185,34 @@ function renderTotalsRow(
   return { rowIndex, isHeader: false, isTotals: true, cells }
 }
 
+// ─── Deep-copy helper (J1: artifact owns immutable data) ────────────────────
+
+/**
+ * Deep-copy a formatting config (and its columns array) so the produced
+ * XlsxArtifact owns its own data and is insulated from later mutation of the
+ * input config. A `Readonly<>` type alone does not prevent runtime mutation;
+ * the artifact must own its data.
+ *
+ * This is a structured clone (not JSON.parse/stringify) to preserve types and
+ * avoid edge cases with undefined. The shape is plain data (no functions/Dates).
+ */
+function deepCopyFormatting(config: XlsxFormattingConfig): XlsxFormattingConfig {
+  return {
+    formattingVersion: config.formattingVersion,
+    worksheetName: config.worksheetName,
+    columns: config.columns.map((c) => ({
+      field: c.field,
+      header: c.header,
+      width: c.width,
+      numberFormat: c.numberFormat,
+    })),
+    moneyDisplayDecimals: config.moneyDisplayDecimals,
+    quantityDisplayDecimals: config.quantityDisplayDecimals,
+    includeHeader: config.includeHeader,
+    includeTotalsRow: config.includeTotalsRow,
+  }
+}
+
 // ─── The pure adapter function ──────────────────────────────────────────────
 
 /**
@@ -196,38 +221,45 @@ function renderTotalsRow(
  * Pure: same inputs → identical artifact, always. No DB, no wall-clock, no
  * randomness. Display rounding produces NEW cell values; the projection is
  * never mutated, and its contentHash is carried unchanged.
+ *
+ * J1: the artifact OWNS its formatting + column structures (deep-copied from
+ * the input). Mutating the input config after buildXlsxArtifact returns does
+ * NOT affect the already-built artifact. The artifact is immutable in practice.
  */
 export function buildXlsxArtifact(input: XlsxAdapterInput): XlsxArtifact {
   const { projection, adapterVersion, formatting } = input
 
+  // J1: deep-copy the formatting so the artifact owns its own data.
+  const ownedFormatting = deepCopyFormatting(formatting)
+
   const rows: XlsxRow[] = []
   let rowIndex = 0
 
-  if (formatting.includeHeader) {
-    rows.push(renderHeaderRow(formatting.columns, rowIndex))
+  if (ownedFormatting.includeHeader) {
+    rows.push(renderHeaderRow(ownedFormatting.columns, rowIndex))
     rowIndex++
   }
 
   // Data rows in PROJECTION ORDER (frozen snapshot order). No re-sorting.
   for (const projRow of projection.rows) {
-    rows.push(renderDataRow(projRow, formatting.columns, formatting, rowIndex))
+    rows.push(renderDataRow(projRow, ownedFormatting.columns, ownedFormatting, rowIndex))
     rowIndex++
   }
 
-  if (formatting.includeTotalsRow) {
-    rows.push(renderTotalsRow(projection, formatting.columns, formatting, rowIndex))
+  if (ownedFormatting.includeTotalsRow) {
+    rows.push(renderTotalsRow(projection, ownedFormatting.columns, ownedFormatting, rowIndex))
     rowIndex++
   }
 
   const worksheet: XlsxWorksheet = {
-    name: formatting.worksheetName,
-    columns: formatting.columns,
+    name: ownedFormatting.worksheetName,
+    columns: ownedFormatting.columns,
     rows,
   }
 
   return {
     adapterVersion,
-    formatting,
+    formatting: ownedFormatting,
     sourceContentHash: projection.provenance.contentHash,
     worksheets: [worksheet],
   }
