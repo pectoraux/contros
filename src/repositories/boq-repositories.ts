@@ -47,6 +47,63 @@ export const boqImportRepository = {
     })
   },
 
+  /**
+   * Validate the import↔opportunity↔document graph BEFORE creating an import.
+   * R2: encapsulates all Prisma access so the application service stays free
+   * of direct db calls (preserves Application Service → Repository → Database).
+   *
+   * Verifies (all tenant-scoped to orgId):
+   *   - if opportunityId is supplied, it exists in this org.
+   *   - if documentId is supplied, it exists in this org, kind === 'boq', and
+   *     is consistent with the supplied opportunityId (or supplies one).
+   * Returns the RESOLVED opportunityId (inferred from the document when only
+   * documentId is supplied). Throws on any invalid reference.
+   *
+   * Returns { opportunityId, documentId } — the resolved values to persist.
+   */
+  async validateImportContext(
+    orgId: string,
+    opportunityId: string | null,
+    documentId: string | null,
+  ): Promise<{ opportunityId: string | null; documentId: string | null }> {
+    // Validate the opportunity reference (tenant-owned).
+    if (opportunityId) {
+      const opp = await db.opportunity.findFirst({
+        where: { id: opportunityId, organizationId: orgId },
+        select: { id: true },
+      })
+      if (!opp) {
+        throw new Error('Invalid opportunity: not found in this organization')
+      }
+    }
+
+    // Validate the document reference (tenant-owned + opportunity-consistent + kind=boq).
+    let resolvedOpportunityId = opportunityId
+    if (documentId) {
+      const doc = await db.document.findFirst({
+        where: { id: documentId, organizationId: orgId },
+        select: { id: true, opportunityId: true, kind: true },
+      })
+      if (!doc) {
+        throw new Error('Invalid document: not found in this organization')
+      }
+      if (doc.kind !== 'boq') {
+        throw new Error(`Invalid document: kind must be 'boq', got '${doc.kind}'`)
+      }
+      if (opportunityId && doc.opportunityId !== opportunityId) {
+        throw new Error(
+          'Invalid document: does not belong to the supplied opportunity',
+        )
+      }
+      // If only documentId was supplied, infer the opportunityId from the doc.
+      if (!opportunityId && doc.opportunityId) {
+        resolvedOpportunityId = doc.opportunityId
+      }
+    }
+
+    return { opportunityId: resolvedOpportunityId, documentId }
+  },
+
   /** Get a single import, tenant-scoped. Returns null if cross-tenant. */
   async getForOrganization(orgId: string, importId: string) {
     return db.boqImport.findFirst({
@@ -216,6 +273,8 @@ export const canonicalLineRepository = {
    * Load a single canonical EstimateLine for reconciliation, scoped to the
    * BoqItem's import opportunity (tenant + opportunity verified).
    * H5: replaces the reconciliation service's direct db.estimateLine calls.
+   * R1: if the import has NO opportunity, returns null — an opportunity-less
+   * import is not bindable, so there is no canonical line to reconcile against.
    */
   async getForBoqItem(
     orgId: string,
@@ -238,14 +297,15 @@ export const canonicalLineRepository = {
     })
     if (!item || !item.binding || !item.binding.estimateLineId) return null
     if (item.binding.status !== 'MATCHED') return null
+    // R1: no opportunity → no canonical line (opportunity-less imports are
+    // not bindable, so reconciliation has nothing to compare against).
+    if (!item.boqImport.opportunityId) return null
     const line = await db.estimateLine.findFirst({
       where: {
         id: item.binding.estimateLineId,
         estimate: {
           organizationId: orgId,
-          ...(item.boqImport.opportunityId
-            ? { opportunityId: item.boqImport.opportunityId }
-            : {}),
+          opportunityId: item.boqImport.opportunityId,
         },
       },
       select: { id: true, quantity: true, unit: true, unitRate: true },
@@ -305,17 +365,26 @@ export const boqBindingRepository = {
     if (!item) {
       throw new Error('BoqItem not found in this organization')
     }
-    // If an estimateLineId is provided, verify it belongs to this org AND to the
-    // import's opportunity (same org is not enough — wrong-opportunity binding
-    // is a domain-identity violation even within one org).
+    // If an estimateLineId is provided (a MATCHED binding), the import MUST have
+    // an opportunity. R1: an opportunity-less import may remain an external
+    // observation, but it is NOT bindable to canonical commercial state —
+    // binding requires an opportunity-resolvable import.
     if (data.estimateLineId) {
-      const opportunityFilter = item.boqImport.opportunityId
-        ? { opportunityId: item.boqImport.opportunityId }
-        : {}
+      if (!item.boqImport.opportunityId) {
+        throw new Error(
+          'Cannot bind: the BoqImport has no opportunity. Binding to a canonical EstimateLine requires an opportunity-resolvable import.',
+        )
+      }
+      // Verify the EstimateLine belongs to this org AND to the import's
+      // opportunity (same org is not enough — wrong-opportunity binding is a
+      // domain-identity violation even within one org).
       const line = await db.estimateLine.findFirst({
         where: {
           id: data.estimateLineId,
-          estimate: { organizationId: orgId, ...opportunityFilter },
+          estimate: {
+            organizationId: orgId,
+            opportunityId: item.boqImport.opportunityId,
+          },
         },
         select: { id: true },
       })

@@ -2706,3 +2706,88 @@ rates into EstimateLine, and reconciliation remains non-authoritative. The
 application boundary is now authoritative: canonical lines are loaded by the
 service (not the caller), the import↔opp↔doc graph is validated, and the
 reconciliation service goes through the repository boundary.
+
+---
+Task ID: boq-phase1-hardening-2
+Agent: principal-engineer
+Task: Close the 2 remaining architectural gaps from the second review. Harden, not revert. No frozen Phase 1 code touched.
+
+GAPS CLOSED:
+
+R1 — Prevent binding for opportunity-less imports.
+- The reviewer identified that boqBindingRepository.upsert() fell back to
+  org-only scoping when the import had no opportunityId, allowing an
+  opportunity-less BOQ to be manually bound to ANY same-tenant EstimateLine.
+  This created an inconsistent state: suggestBindings() returned no candidates
+  but confirmBinding() could still bind.
+- Fix: when an estimateLineId is supplied (a MATCHED binding), the repository
+  now REQUIRES item.boqImport.opportunityId to be non-null. If null, the
+  binding is rejected with "Cannot bind: the BoqImport has no opportunity."
+  An opportunity-less import may remain an external observation, but it is
+  NOT bindable to canonical commercial state.
+- canonicalLineRepository.getForBoqItem() now returns null when the import has
+  no opportunity (no fallback to org-wide). Reconciliation of an
+  opportunity-less import therefore has nothing to compare against.
+- New integration tests:
+  * R3: opportunity-less import cannot be bound to a same-tenant EstimateLine.
+  * R3: suggestBindings returns no candidates for an opportunity-less import.
+
+R2 — Remove direct Prisma access from BoqImportService.
+- The reviewer noted that H2 (import graph validation) introduced direct
+  db.opportunity.findFirst() and db.document.findFirst() calls inside the
+  application service, violating the Application Service → Repository →
+  Database boundary that H5 had just fixed for the reconciliation service.
+- Fix: new repository method boqImportRepository.validateImportContext(
+  orgId, opportunityId, documentId) encapsulates all opportunity+document
+  validation (tenant-owned, kind==='boq', opportunity-consistent, and
+  opportunity inference from the document). Returns the RESOLVED opportunityId.
+- BoqImportService.createImport now orchestrates validate → create → audit
+  via the repository, with NO direct Prisma calls. The `db` import was removed
+  from the service (only `dbTx` remains, for parseImport's transaction).
+- New integration test:
+  * R4: import service source has zero db.opportunity/db.document calls and
+    calls validateImportContext.
+
+H4 NUANCE — adapter contract documented.
+- The reviewer accepted rawCellJson as audit-grade IF the future XLSX adapter
+  supplies the original cell representation. The normalize.ts RawBoqRow.cells
+  type already documents the contract: cell.value (required), cell.formula?
+  (optional), cell.formatted? (optional), supplied BEFORE coercion. The
+  fallback (deriving from semantic fields) cannot reconstruct formatting/
+  formulas — that is by design and documented in the code.
+
+FILES MODIFIED (no frozen Phase 1 code):
+- src/repositories/boq-repositories.ts — validateImportContext (new),
+  opportunity-required binding, no-opportunity → null canonical line.
+- src/application/boq-import-service.ts — removed direct db calls; delegates
+  to validateImportContext; removed the `db` import.
+- tests/integration/boq-service.test.ts — +3 R3/R4 tests.
+- worklog.md — this entry.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 189 pass / 0 fail (0 regressions)
+- BOQ integration tests (Neon) ........ 26 pass / 0 fail / 89 expect()
+  (was 23; +3 R3/R4 tests — all green against PostgreSQL)
+- Frozen Phase 1 code ................. UNTOUCHED (zero diff on estimate/bid/
+  opportunity/pricing)
+
+ARCHITECTURAL DISPOSITION (per reviewer):
+  Hardened:
+    ✅ authoritative canonical loading (H1)
+    ✅ cross-opportunity protection (H1)
+    ✅ import graph validation behavior (H2)
+    ✅ explicit duplicate-hash semantics (H3)
+    ✅ cell-level raw evidence field (H4)
+    ✅ reconciliation repository boundary (H5)
+    ✅ strengthened architecture audits (H6)
+    ✅ cross-opportunity + invalid-reference tests (H7)
+    ✅ opportunity-less imports are NOT bindable (R1)  ← NEW
+    ✅ import service has zero direct Prisma (R2)      ← NEW
+    ✅ boundary audit for import service (R4)          ← NEW
+
+All findings from both reviews are now closed. The BOQ foundation is ready
+for the next milestone (EstimateRevision → BOQ projection → XLSX), which
+will start with the projection CONTRACT from the immutable EstimateRevision
+(exact fields, provenance, projection version, deterministic ordering) — NOT
+with an XLSX library or workbook layout.

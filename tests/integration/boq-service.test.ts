@@ -474,6 +474,64 @@ describe('BOQ integration tests', () => {
     expect(imp!.opportunityId).toBe(OPP_A)
   }, 30000)
 
+  // ── R3: opportunity-less imports are NOT bindable ──────────────────────────
+
+  test('R3: opportunity-less import cannot be bound to a same-tenant EstimateLine', async () => {
+    // Create an import with NO opportunityId (and no document to infer one from).
+    // This is a valid external observation, but it must NOT be bindable to a
+    // canonical EstimateLine — binding requires an opportunity-resolvable import.
+    const res = await boqImportService.createImport({
+      ctx: ctxA,
+      // no opportunityId, no documentId
+      fileReference: '/tmp/opp-less.xlsx',
+      fileName: 'opp-less.xlsx',
+      fileHash: 'opp-less-hash',
+    })
+    expect(res.ok).toBe(true)
+    const oppLessImportId = res.import.id
+    // Parse it (so there are items to attempt binding on).
+    await boqImportService.parseImport({
+      ctx: ctxA,
+      importId: oppLessImportId,
+      parseRows: fakeParser,
+    })
+    const imp = await boqImportService.getImport(ctxA, oppLessImportId)
+    const firstItem = imp!.items[0]
+    // Attempt to bind to a same-tenant (Org A) line. Must be REJECTED.
+    await expect(
+      boqBindingService.confirmBinding({
+        ctx: ctxA,
+        boqItemId: firstItem.id,
+        estimateLineId: LINE_A, // same-tenant, but import has no opportunity
+        matchMethod: 'MANUAL',
+      }),
+    ).rejects.toThrow(/no opportunity/i)
+  }, 30000)
+
+  test('R3: suggestBindings returns no candidates for an opportunity-less import', async () => {
+    // Create + parse an opportunity-less import.
+    const res = await boqImportService.createImport({
+      ctx: ctxA,
+      fileReference: '/tmp/opp-less2.xlsx',
+      fileName: 'opp-less2.xlsx',
+      fileHash: 'opp-less2-hash',
+    })
+    await boqImportService.parseImport({
+      ctx: ctxA,
+      importId: res.import.id,
+      parseRows: fakeParser,
+    })
+    const sugg = await boqBindingService.suggestBindings({
+      ctx: ctxA,
+      importId: res.import.id,
+    })
+    // Every suggestion must be UNMATCHED (no canonical candidates loaded).
+    for (const s of sugg.suggestions) {
+      expect(s.suggestedStatus).toBe('UNMATCHED')
+      expect(s.candidates).toHaveLength(0)
+    }
+  }, 30000)
+
   // ── H6: Strengthened architecture audits (runtime behavior, not just regex) ──
 
   test('H6: reconciliation service has zero direct db.estimateLine calls (boundary)', async () => {
@@ -497,6 +555,23 @@ describe('BOQ integration tests', () => {
     expect(src).not.toMatch(/db\./)
     // Must use canonicalLineRepository for authoritative line loading.
     expect(src).toMatch(/canonicalLineRepository/)
+  }, 30000)
+
+  test('R4: import service has zero direct db.opportunity/db.document calls (boundary)', async () => {
+    // R2: the import service must delegate opportunity/document validation to
+    // boqImportRepository.validateImportContext — it must NOT call
+    // db.opportunity.* or db.document.* directly. The service orchestrates
+    // validate → create → audit without knowing Prisma query syntax.
+    const fs = await import('node:fs')
+    const src = fs.readFileSync('src/application/boq-import-service.ts', 'utf8')
+    // Must NOT import db (the only allowed @/lib/db import is dbTx for transactions).
+    // dbTx is a separate client for interactive transactions; db is the pooled one.
+    // The import service uses dbTx.$transaction in parseImport — that's allowed.
+    // But it must NOT call db.opportunity or db.document directly.
+    expect(src).not.toMatch(/\bdb\.opportunity\.(find|create|update|upsert|delete|count)/)
+    expect(src).not.toMatch(/\bdb\.document\.(find|create|update|upsert|delete|count)/)
+    // Must call validateImportContext (the repository method).
+    expect(src).toMatch(/validateImportContext/)
   }, 30000)
 
   test('H6: BOQ services + repositories never mutate EstimateLine (runtime + regex)', async () => {

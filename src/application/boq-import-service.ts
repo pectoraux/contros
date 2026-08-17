@@ -17,7 +17,7 @@
  * INVARIANT 9: the XLSX is a working copy, not canonical state.
  */
 
-import { dbTx, db } from '@/lib/db'
+import { dbTx } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
 import { auditLogRepository, boqImportRepository, boqItemRepository } from '@/repositories'
 import { normalizeRows, type RawBoqRow, type NormalizedBoqItem } from '@/lib/boq'
@@ -121,70 +121,38 @@ export const boqImportService = {
    * stored at fileReference; this records its existence and hash.
    *
    * H2 hardening: validates the import↔opportunity↔document graph and tenant
-   * ownership BEFORE creating the record:
-   *   - if opportunityId is supplied, it must belong to ctx.organizationId.
-   *   - if documentId is supplied, it must belong to ctx.organizationId AND
-   *     to the supplied opportunityId, AND its kind must be 'boq'.
-   *   - opportunityId and documentId must be consistent (document.opportunityId
-   *     === opportunityId when both are supplied).
-   * Invalid references are rejected with 422, not silently stored.
+   * ownership BEFORE creating the record.
+   * R2: the validation is delegated to boqImportRepository.validateImportContext
+   * so this service contains NO direct Prisma calls (preserves Application
+   * Service → Repository → Database). The service orchestrates validate →
+   * create → audit without knowing Prisma query syntax.
    */
   async createImport(input: CreateImportInput): Promise<CreateImportResult> {
     const { ctx } = input
     const opportunityId = input.opportunityId ?? null
     const documentId = input.documentId ?? null
 
-    // Validate the opportunity reference (tenant-owned).
-    if (opportunityId) {
-      const opp = await db.opportunity.findFirst({
-        where: { id: opportunityId, organizationId: ctx.organizationId },
-        select: { id: true },
-      })
-      if (!opp) {
-        const err = new Error(
-          'Invalid opportunity: not found in this organization',
-        ) as Error & { status: number }
-        err.status = 422
-        throw err
-      }
-    }
-
-    // Validate the document reference (tenant-owned + opportunity-consistent + kind=boq).
-    if (documentId) {
-      const doc = await db.document.findFirst({
-        where: { id: documentId, organizationId: ctx.organizationId },
-        select: { id: true, opportunityId: true, kind: true },
-      })
-      if (!doc) {
-        const err = new Error(
-          'Invalid document: not found in this organization',
-        ) as Error & { status: number }
-        err.status = 422
-        throw err
-      }
-      if (doc.kind !== 'boq') {
-        const err = new Error(
-          `Invalid document: kind must be 'boq', got '${doc.kind}'`,
-        ) as Error & { status: number }
-        err.status = 422
-        throw err
-      }
-      if (opportunityId && doc.opportunityId !== opportunityId) {
-        const err = new Error(
-          'Invalid document: does not belong to the supplied opportunity',
-        ) as Error & { status: number }
-        err.status = 422
-        throw err
-      }
-      // If only documentId was supplied, infer the opportunityId from the doc.
-      if (!opportunityId && doc.opportunityId) {
-        input = { ...input, opportunityId: doc.opportunityId }
-      }
+    // R2: validate the import↔opportunity↔document graph via the repository.
+    // Returns the RESOLVED opportunityId (inferred from the document when only
+    // documentId is supplied). Throws on invalid references (we attach 422).
+    let resolved: { opportunityId: string | null; documentId: string | null }
+    try {
+      resolved = await boqImportRepository.validateImportContext(
+        ctx.organizationId,
+        opportunityId,
+        documentId,
+      )
+    } catch (e) {
+      const err = new Error(
+        e instanceof Error ? e.message : String(e),
+      ) as Error & { status: number }
+      err.status = 422
+      throw err
     }
 
     const record = await boqImportRepository.create(ctx.organizationId, {
-      opportunityId: input.opportunityId ?? null,
-      documentId,
+      opportunityId: resolved.opportunityId,
+      documentId: resolved.documentId,
       fileReference: input.fileReference,
       fileName: input.fileName,
       fileHash: input.fileHash,
