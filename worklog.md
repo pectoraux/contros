@@ -2464,3 +2464,53 @@ Stage Summary:
   the operator completes credential rotation (steps 1-4 above).
 - Next stage (BOQ / XLSX) remains BLOCKED on operator confirmation that
   credential rotation is complete, per the user's architectural directive.
+
+---
+Task ID: ancestry-verification
+Agent: principal-engineer
+Task: Prove origin/main actually contains 9a81e11 (per user directive), then wait for operator-side credential rotation. No code changes.
+
+Verification performed (the exact commands the user specified, plus the full chain):
+
+1. git fetch origin ........................................ OK (up to date)
+2. git rev-parse origin/main ............................... 9a81e11b06b9a4e02d605c6a0e55a189493233fc
+3. git merge-base --is-ancestor 9a81e11 origin/main ........ EXIT 0 → 9a81e11 IS an ancestor ✅
+
+Full ancestry chain (additionally confirmed):
+- origin/main HEAD resolves to 9a81e11b06b9a4e02d605c6a0e55a189493233fc ✅
+- .env is ABSENT from the current origin/main tree ✅
+- .env.example is PRESENT in the origin/main tree ✅
+- local HEAD == origin/main (9a81e11) ✅
+
+Conclusion:
+- The repository-side remediation (commit 9a81e11) is VERIFIED present on
+  origin/main via the authoritative git ancestry check, not just the push
+  output. GitHub's web index may be stale (it still rendered fbf85eb as
+  latest in the user's browser), but the git object graph is authoritative
+  and confirms 9a81e11 is the current HEAD.
+- The old secret-bearing .env remains in HISTORY (commits 665d8b3, c37dba6,
+  60a041c) — deletion from the current tree does NOT erase historical objects.
+
+Security incident status (corrected, honest):
+- Repository tracking remediation ......... ✅ DONE (9a81e11 verified on origin/main)
+- .env removed from current tree .......... ✅ DONE
+- .env.example documented ................. ✅ DONE
+- Phase 1 code untouched .................. ✅ CONFIRMED (no app/domain files in 9a81e11)
+- Test evidence wording corrected ......... ✅ DONE
+- Credential rotation (Neon, NEXTAUTH, Z.ai)  ❌ PENDING (operator)
+- Vercel/CI secret replacement ............ ❌ PENDING (operator)
+- Historical secret purge (BFG/filter-repo)  ⚠️ OPTIONAL, AFTER rotation
+- origin/main ancestry verification ....... ✅ DONE (this entry)
+
+Directive honored:
+- BOQ / XLSX stage remains BLOCKED until the operator confirms credential
+  rotation is complete. No BOQ work has begun.
+- Phase 1 domain foundations remain FROZEN and untouched.
+
+The unblock sequence remains:
+  origin/main contains 9a81e11 ✅
+      → no .env in current tree ✅
+      → credentials rotated/revoked ❌ PENDING
+      → deployment secrets updated ❌ PENDING
+      → security incident closed ❌ PENDING
+      → BOQ architecture review may begin ⏳ BLOCKED
