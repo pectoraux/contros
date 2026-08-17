@@ -69,9 +69,11 @@ export type XlsxAdapterVersion = number & { readonly __brand: 'XlsxAdapterVersio
  * The current adapter version. Bump when adapter code changes (column set,
  * ordering, format strings, sheet structure). Document the change in worklog.
  *
- * v1 — initial: single "BOQ" sheet, columns [No, Code, Description, Unit, Qty,
+ * v1 — initial: single "BOQ" sheet, columns [No, Description, Unit, Qty,
  * Unit Rate, Sell Price, Direct Cost, Expected Profit, Margin %], header row,
  * data rows in projection order, totals row. Display rounding per config.
+ * (J2: the invented "Code" column was removed — the projection carries no
+ * canonical business code, only the WDV versionId which is a DB identifier.)
  */
 export const CURRENT_XLSX_ADAPTER_VERSION = 1 as XlsxAdapterVersion
 

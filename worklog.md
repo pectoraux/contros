@@ -3642,3 +3642,76 @@ DISPOSITION (per reviewer's 6-step final pass):
   ✅ M6 exceljs + read-excel-file removed
   → Approved for production integration. GenOffice owns the projection;
     write-excel-file owns Excel.
+
+---
+Task ID: boq-xlsx-production-serializer
+Agent: principal-engineer
+Task: Thin production serializer — XlsxArtifact → Promise<Buffer>. Fix stale Code comment, move write-excel-file to production deps, add production tests. Per reviewer's 5-step required change. No DB/service deps.
+
+N1 — Stale v1 column comment fixed.
+- The CURRENT_XLSX_ADAPTER_VERSION docstring said "columns [No, Code,
+  Description, ...]" even though Code was removed in J2. Now reads
+  "[No, Description, Unit, Qty, ...]" with a J2 note explaining the removal.
+
+N2 — Thin production serializer implemented (src/lib/boq/xlsx-serializer.ts).
+- serializeXlsxArtifact(artifact: XlsxArtifact): Promise<Buffer>
+- Maps the frozen artifact's single worksheet to write-excel-file's single-sheet
+  API: sheet name, column widths, number formats (numeric cells only), rows in
+  projection order. Returns the .xlsx bytes.
+- BORING: no workbook abstraction, no ZIP manipulation, no timestamp
+  normalization, no DB lookup. Reads the artifact only (never mutates).
+- Boundary enforced + tested: no @/lib/db, @/lib/engines, @/repositories,
+  @/application imports; no db.*/priceLine/finalizeRevision/replayRevision calls.
+
+N3 — write-excel-file moved from devDependencies → dependencies.
+- It is now a PRODUCTION dependency (was incorrectly left in devDependencies
+  in the prior commit). The serializer executes in the deployed application,
+  so it must be present under production-only installation.
+
+N4 — Production unit tests added (tests/unit/boq-xlsx-serializer.test.ts).
+- 8 tests:
+  * returns a Buffer (not null/undefined)
+  * bytes are valid XLSX (ZIP magic PK\x03\x04)
+  * within-process determinism (same artifact → identical bytes)
+  * does not mutate the artifact (frozen + read-only)
+  * artifact still frozen after serialization
+  * BOUNDARY: no forbidden imports (comments stripped to avoid false positives)
+  * BOUNDARY: function signature takes ONLY an XlsxArtifact (no ctx/ids/lookups)
+  * single-sheet (M4): artifact.worksheet is singular, not an array
+- The fidelity of the produced workbook content was established by the
+  evaluation harness (54/54 checks); these tests guard the production boundary.
+
+N5 — Retained harnesses classified.
+- scripts/xlsx-fidelity-eval.ts + scripts/xlsx-determinism-probe.ts are
+  archived evaluation records (not repeatable CI tests — their eval deps were
+  removed). Headers document this. They are NOT part of the test suite.
+
+FILES:
+- src/lib/boq/xlsx-serializer.ts — the thin production serializer (NEW).
+- src/lib/boq/xlsx-adapter-contract.ts — stale Code comment fixed (N1).
+- src/lib/boq/index.ts — barrel export for the serializer.
+- tests/unit/boq-xlsx-serializer.test.ts — 8 production tests (NEW).
+- package.json + bun.lock — write-excel-file → dependencies (production).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 254 pass / 0 fail (+8 serializer;
+  0 regressions)
+- Serializer tests: output shape, ZIP magic, determinism, no-mutation,
+  frozen-after, boundary (imports + signature), single-sheet.
+- Frozen Phase 1 code ................. UNTOUCHED
+
+CANONICAL → XLSX PATH (architecturally complete):
+  BoqProjection (lossless, SHA-256 content-addressed)
+      ↓ pure projection function
+  XlsxArtifact (frozen, display-rounded, sourceContentHash)
+      ↓ thin production serializer (THIS COMMIT)
+  .xlsx bytes (write-excel-file@4.1.1)
+
+  The serializer is the office boundary: GenOffice owns the projection;
+  write-excel-file owns Excel. No DB, no service, no mutation.
+
+NEXT QUESTION (per reviewer): how the application service obtains the
+authoritative EstimateRevision before invoking projectRevision → buildXlsxArtifact
+→ serializeXlsxArtifact. That is the application-layer wiring, not the office
+boundary itself.
