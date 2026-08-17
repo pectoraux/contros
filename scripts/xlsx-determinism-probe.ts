@@ -25,7 +25,7 @@
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
-import { unzipSync, inflateSync } from 'node:zlib'
+import { unzipSync, inflateRawSync } from 'node:zlib'
 import { Buffer } from 'node:buffer'
 import {
   finalizeRevision,
@@ -138,8 +138,9 @@ function parseZipEntries(buf: Buffer): Map<string, Buffer> {
     if (compMethod === 0) {
       content = compData // stored, no compression
     } else if (compMethod === 8) {
-      // deflate — use zlib.inflate (raw deflate; may need raw-inflate for some entries)
-      content = inflateSync(compData)
+      // deflate (raw) — ZIP entries use raw deflate (no zlib header).
+      // inflateRawSync handles this; inflateSync expects a zlib wrapper.
+      content = inflateRawSync(compData)
     } else {
       content = Buffer.from(`[unsupported compression method ${compMethod}]`)
     }
@@ -333,6 +334,14 @@ async function main() {
     }
     console.log(`  ZIP entries (run 1): ${[...r.zipEntries1.keys()].length} entries`)
     console.log(`  ZIP entry order identical: ${r.zipDiff.sameOrder ? 'YES' : 'NO'}`)
+    // Per-entry SHA dump (so cross-process comparison is possible by eye —
+    // run the probe twice and diff the per-entry hashes to find the drift).
+    console.log(`  Per-entry SHA-256 (run 1):`)
+    for (const [name, content] of r.zipEntries1) {
+      const hash = sha256(content).substring(0, 12)
+      const size = content.length
+      console.log(`    ${name.padEnd(32)} ${hash}  (${size} bytes)`)
+    }
     if (!r.byteIdentical) {
       console.log(`  Differing entries: ${r.zipDiff.differingEntries.length === 0 ? '(none at XML level — diff is in binary/metadata)' : r.zipDiff.differingEntries.join(', ')}`)
       if (r.zipDiff.differingEntries.length > 0) {

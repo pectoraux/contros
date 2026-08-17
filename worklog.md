@@ -3402,3 +3402,54 @@ DISPOSITION (per reviewer's two-level model):
     invariant. The honest status is: same artifact → same workbook CONTENT
     (guaranteed); same artifact → byte-identical XLSX (within-process only,
     candidate-dependent).
+
+---
+Task ID: boq-xlsx-probe-fix-and-root-cause
+Agent: principal-engineer
+Task: Fix the ZIP parser (raw deflate) + establish (not suspect) the cross-process drift root cause. Per reviewer: the harness proved less than claimed; root cause was "suspected" not "established"; fidelity not yet tested.
+
+L1 — ZIP parser fixed; root cause ESTABLISHED.
+- The probe's inflateSync failed on ZIP entries because ZIP uses raw deflate
+  (no zlib header), not zlib-wrapped deflate. Switched to inflateRawSync.
+  Per-entry diff now works.
+- ExcelJS root cause PROVEN: docProps/core.xml contains
+  <dcterms:created>2026-08-17T08:43:00Z</dcterms:created> and <dcterms:modified>
+  — second-granularity timestamps. Runs within the same second match; runs
+  crossing a second boundary differ. This is the established cause, not a guess.
+- write-excel-file root cause PROVEN (different): it writes NO docProps/core.xml
+  (8 entries, none metadata). The per-entry XML hashes are IDENTICAL across 8
+  process runs, but the whole-file SHA still drifts (2dfa476f → 55df1a97 →
+  6439f4cb → 6e81d140). The drift is purely in the ZIP CONTAINER layer
+  (ZIP central-directory timestamps, which are separate from the XML content).
+  The workbook XML CONTENT is byte-identical across processes.
+
+CORRECTION to the prior worklog entry (boq-xlsx-serializer-evaluation):
+- "suspected timestamp metadata" is now ESTABLISHED for exceljs (docProps/
+  core.xml created/modified) and ESTABLISHED-but-different for write-excel-file
+  (ZIP container timestamps, not XML content).
+- write-excel-file's XML content is fully cross-process deterministic. Only the
+  ZIP wrapper drifts. This is a stronger result than the prior entry implied.
+
+NEXT GATE (per reviewer): fidelity, not determinism.
+- The current probe tests a PARTIAL mapping (cell values + sheet name for
+  write-excel-file; + column width + number format for exceljs). It does NOT
+  test the full XlsxArtifact contract (header/totals semantics, column order,
+  display rounding, all formats).
+- The next step is a fidelity evaluation: map EVERY XlsxArtifact concern through
+  each candidate serializer → .xlsx → independent read-back → canonical workbook
+  assertion (structure, sheet name, column order, values, formats, widths,
+  header/totals rows).
+- Byte determinism becomes a SECONDARY measurement. No timestamp-normalization
+  layer will be added (per reviewer — that would be spreadsheet machinery we're
+  trying to avoid; the XlsxArtifact's sourceContentHash already provides
+  provenance).
+
+DISPOSITION (per reviewer):
+  ✅ useful serializer experiment
+  ✅ cross-process byte drift observed
+  ✅ no premature production serializer
+  ✅ dev-only dependencies
+  ✅ root cause ESTABLISHED (was: suspected)  ← corrected
+  🔶 current probe does not test full artifact fidelity  ← next gate
+  🔶 write-excel-file not yet approved as production serializer
+  🔶 no timestamp-normalization layer (agreed)
