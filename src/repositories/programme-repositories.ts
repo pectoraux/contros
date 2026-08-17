@@ -9,8 +9,23 @@
  * ProgrammeRevision is tenant-safe via:
  *   revision → programme → organizationId === ctx.organizationId
  *
- * Activity → EstimateLine / WorkDefinitionVersion cross-references should be
- * additionally validated at the application-service level (same org).
+ * X1 — LEGACY DEPRECATION: EstimateRevision.revisionType='programme' is
+ * DEPRECATED. All NEW programme history must go to ProgrammeRevision. The
+ * existing `programmeRevisionRepository` in index.ts (which uses
+ * EstimateRevision with revisionType='programme') is retained for reading
+ * legacy records ONLY. No new code path should create
+ * EstimateRevision(revisionType='programme'). This repository
+ * (programmeRevisionRepo) is the sole authority for new programme revisions.
+ *
+ * X2 — IMMUTABILITY: ProgrammeRevision is create-finalized-only. There is no
+ * 'draft' status, no update method, and no delete method. A revision is
+ * created as 'finalized' and is then read-only. The mutable workspace is
+ * Programme (and its Activities/Dependencies); the revision is the frozen
+ * snapshot.
+ *
+ * X3 — SAME-PROGRAMME DEPENDENCY EDGES: ActivityDependency creation enforces
+ * that predecessor.programmeId === successor.programmeId === dependency.
+ * programmeId. This is validated transactionally before insert.
  */
 
 import { db, dbTx } from '@/lib/db'
@@ -66,16 +81,23 @@ export const programmeRepository = {
   },
 }
 
-// ─── Programme Revision Repository ──────────────────────────────────────────
-// NOTE: this is the DEDICATED ProgrammeRevision repository (the new
-// Programme domain). The existing `programmeRevisionRepository` in index.ts
-// (which uses EstimateRevision with revisionType='programme') is the MVP
-// approach and remains for backward compatibility. This new repository is
-// named `programmeRevisionRepo` to avoid a naming collision.
+// ─── Programme Revision Repository (X2: create-finalized-only, immutable) ───
+//
+// X1: This is the SOLE authority for new programme revisions. The legacy
+// `programmeRevisionRepository` in index.ts (which uses EstimateRevision with
+// revisionType='programme') is DEPRECATED — retained for reading legacy
+// records only. No new code should create EstimateRevision(revisionType=
+// 'programme').
+//
+// X2: ProgrammeRevision has NO 'draft' status. It is created as 'finalized'
+// and is then immutable. There is no update method and no delete method on
+// this repository. The mutable workspace is Programme + Activities +
+// Dependencies; the revision is the frozen snapshot.
 
 export const programmeRevisionRepo = {
   /**
-   * Create a finalized revision within a transaction.
+   * Create a finalized revision within a transaction. X2: the ONLY creation
+   * path. The revision is born 'finalized' — there is no draft state.
    * Tenant-safe: the caller must have already verified programme.organizationId.
    */
   async createFinalized(
@@ -96,7 +118,7 @@ export const programmeRevisionRepo = {
         snapshotJson: data.snapshotJson,
         snapshotContentHash: data.snapshotContentHash,
         scheduleEngineVersion: data.scheduleEngineVersion,
-        status: 'finalized',
+        status: 'finalized', // X2: always finalized at creation — no draft state
         finalizedAt: new Date(),
         finalizedById: data.finalizedById,
       },
@@ -106,6 +128,7 @@ export const programmeRevisionRepo = {
   /**
    * Get a finalized revision, tenant-scoped via Programme.organizationId.
    * Returns null if the revision doesn't exist OR belongs to another org.
+   * X2: there is no update method — revisions are read-only after creation.
    */
   async getForOrganization(orgId: string, revisionId: string) {
     return db.programmeRevision.findFirst({
@@ -192,9 +215,16 @@ export const activityRepository = {
   },
 }
 
-// ─── Activity Dependency Repository ─────────────────────────────────────────
+// ─── Activity Dependency Repository (X3: same-Programme enforcement) ────────
 
 export const activityDependencyRepository = {
+  /**
+   * Create a dependency within a transaction.
+   * X3: enforces that predecessor.programmeId === successor.programmeId ===
+   * dependency.programmeId. Throws if any activity belongs to a different
+   * programme. This is a domain-identity invariant — a dependency edge cannot
+   * cross programme boundaries.
+   */
   async create(
     tx: Tx,
     programmeId: string,
@@ -205,6 +235,30 @@ export const activityDependencyRepository = {
       lag?: number
     },
   ) {
+    // X3: Verify both activities belong to the SAME programme.
+    const [pred, succ] = await Promise.all([
+      tx.activity.findFirst({
+        where: { id: data.predecessorActivityId, programmeId },
+        select: { id: true, programmeId: true },
+      }),
+      tx.activity.findFirst({
+        where: { id: data.successorActivityId, programmeId },
+        select: { id: true, programmeId: true },
+      }),
+    ])
+    if (!pred) {
+      throw new Error(
+        `Cannot create dependency: predecessor "${data.predecessorActivityId}" not found in programme "${programmeId}"`,
+      )
+    }
+    if (!succ) {
+      throw new Error(
+        `Cannot create dependency: successor "${data.successorActivityId}" not found in programme "${programmeId}"`,
+      )
+    }
+    // Both activities are confirmed to belong to programmeId (the query
+    // filtered by programmeId). The dependency's programmeId matches.
+
     return tx.activityDependency.create({
       data: {
         programmeId,

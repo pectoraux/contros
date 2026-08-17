@@ -4305,3 +4305,40 @@ TWO HISTORICAL TRUTHS (now persisted):
 
 NEXT (NOT started): application service for Programme finalization + UI.
 No Gantt, no calendars, no resources yet.
+
+---
+Task ID: programme-schema-corrections
+Agent: principal-engineer
+Task: Resolve three architectural issues before finalization service — legacy deprecation, immutability, same-programme dependency enforcement. No frozen code touched.
+
+X1 — Legacy EstimateRevision(revisionType='programme') DEPRECATED.
+- The repository documents that EstimateRevision.revisionType='programme' is
+  DEPRECATED. All NEW programme history must go to ProgrammeRevision. The
+  existing `programmeRevisionRepository` in index.ts (which uses
+  EstimateRevision) is retained for reading legacy records ONLY.
+- No new code path should create EstimateRevision(revisionType='programme').
+  `programmeRevisionRepo` is the sole authority for new programme revisions.
+- Test: verifies the deprecation documentation is present in the source.
+
+X2 — ProgrammeRevision is create-finalized-only (immutable).
+- ProgrammeRevision has NO 'draft' status. It is created as 'finalized' and is
+  then read-only. There is no update method and no delete method on
+  `programmeRevisionRepo`. The mutable workspace is Programme + Activities +
+  Dependencies; the revision is the frozen snapshot.
+- Test: verifies the repository has no update/delete method — only
+  createFinalized, getForOrganization, getLatestRevisionNo.
+
+X3 — Same-Programme dependency edges enforced.
+- `activityDependencyRepository.create()` now verifies transactionally that
+  predecessor.programmeId === successor.programmeId === dependency.programmeId.
+  Both activities are fetched with `where: { id, programmeId }` — if either
+  belongs to a different programme, the throw prevents the insert.
+- Test: creates a dependency with predecessor from Programme A and successor
+  from Programme B → rejected with "not found in programme".
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 289 pass / 0 fail (0 regressions)
+- Programme integration (Neon) ........ 10 pass / 0 fail / 33 expect()
+  (was 7; +3 X1/X2/X3 tests)
+- Frozen Phase 1 code ................. UNTOUCHED

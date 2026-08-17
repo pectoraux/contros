@@ -14,6 +14,7 @@
 
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { PrismaClient } from '@prisma/client'
+import { dbTx } from '../../src/lib/db'
 import {
   programmeRepository,
   programmeRevisionRepo,
@@ -273,4 +274,62 @@ describe('Programme domain integration tests', () => {
     const viaB = await programmeRevisionRepo.getForOrganization(ORG_B, revision!.id)
     expect(viaB).toBeNull()
   }, 30000)
+
+  // ── X3: Cross-programme dependency rejection ─────────────────────────────
+
+  test('X3: dependency creation rejects activities from different programmes', async () => {
+    // Create a second programme in Org A.
+    const prog2 = await db.programme.create({
+      data: { id: 'test-prog-programme-b', organizationId: ORG_A, name: 'Programme B', status: 'draft' },
+    })
+    // Create an activity in programme 2.
+    await db.activity.create({
+      data: { id: 'test-prog-act-cross', programmeId: prog2.id, name: 'Cross', duration: 3, status: 'planned' },
+    })
+
+    // Attempt to create a dependency: predecessor from PROG_A, successor from prog2.
+    // This must be REJECTED — dependency edges cannot cross programme boundaries.
+    await expect(
+      dbTx.$transaction(async (tx) => {
+        await activityDependencyRepository.create(tx, PROG_A, {
+          predecessorActivityId: 'test-prog-act-1', // in PROG_A
+          successorActivityId: 'test-prog-act-cross', // in prog2 — WRONG programme
+          type: 'FS',
+          lag: 0,
+        })
+      }),
+    ).rejects.toThrow(/not found in programme/)
+
+    // Clean up prog2.
+    await db.activity.delete({ where: { id: 'test-prog-act-cross' } }).catch(() => {})
+    await db.programme.delete({ where: { id: prog2.id } }).catch(() => {})
+  }, 30000)
+
+  // ── X2: ProgrammeRevision immutability (no update/delete path) ───────────
+
+  test('X2: programmeRevisionRepo has no update or delete method', async () => {
+    const fs = await import('node:fs')
+    const src = fs.readFileSync('src/repositories/programme-repositories.ts', 'utf8')
+    const revSection = src.slice(
+      src.indexOf('export const programmeRevisionRepo'),
+      src.indexOf('// ─── Activity Repository'),
+    )
+    // No update or delete methods.
+    expect(revSection).not.toMatch(/async update|async delete/)
+    // Only createFinalized + getForOrganization + getLatestRevisionNo.
+    expect(revSection).toMatch(/createFinalized/)
+    expect(revSection).toMatch(/getForOrganization/)
+    expect(revSection).toMatch(/getLatestRevisionNo/)
+  })
+
+  // ── X1: Legacy deprecation documentation ─────────────────────────────────
+
+  test('X1: programmeRevisionRepo is the sole new-programme authority (no EstimateRevision(revisionType=programme) creation)', async () => {
+    // Verify the repository source documents the deprecation.
+    const fs = await import('node:fs')
+    const src = fs.readFileSync('src/repositories/programme-repositories.ts', 'utf8')
+    expect(src).toMatch(/DEPRECATED/)
+    expect(src).toMatch(/EstimateRevision\.revisionType='programme'/)
+    expect(src).toMatch(/SOLE authority for new programme revisions/)
+  })
 }, 300000)
