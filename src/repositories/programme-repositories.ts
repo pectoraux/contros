@@ -250,6 +250,24 @@ export const activityRepository = {
     })
   },
 
+  /**
+   * List activities for a programme within a transaction (for snapshot-at-lock).
+   * Q1: used inside the finalization transaction after the Programme row is locked.
+   */
+  async listForProgrammeInTransaction(
+    tx: Tx,
+    orgId: string,
+    programmeId: string,
+  ) {
+    return tx.activity.findMany({
+      where: {
+        programmeId,
+        programme: { organizationId: orgId },
+      },
+      orderBy: { createdAt: 'asc' },
+    })
+  },
+
   /** List activities for a programme (tenant-scoped via programme). */
   async listForProgramme(orgId: string, programmeId: string) {
     return db.activity.findMany({
@@ -261,7 +279,12 @@ export const activityRepository = {
     })
   },
 
-  /** Update a mutable activity (NOT a finalized revision's snapshot). */
+  /**
+   * Q2: Update a mutable activity. Takes the Programme row lock first to
+   * serialize against concurrent finalization. The lock ensures that a
+   * finalization running in parallel either sees the pre-edit or post-edit
+   * state, never a partially-mixed snapshot.
+   */
   async update(orgId: string, activityId: string, data: {
     name?: string
     duration?: number
@@ -270,12 +293,22 @@ export const activityRepository = {
     estimateLineId?: string | null
     workDefinitionVersionId?: string | null
   }) {
-    return db.activity.updateMany({
-      where: {
-        id: activityId,
-        programme: { organizationId: orgId },
-      },
-      data,
+    return dbTx.$transaction(async (tx) => {
+      // Q2: Lock the Programme row. First find the activity's programmeId.
+      const activity = await tx.activity.findFirst({
+        where: { id: activityId, programme: { organizationId: orgId } },
+        select: { programmeId: true },
+      })
+      if (!activity) {
+        throw new Error('Activity not found in this organization')
+      }
+      // Lock the parent Programme row.
+      await tx.$queryRaw`SELECT id FROM "Programme" WHERE id = ${activity.programmeId} FOR UPDATE`
+      // Now update the activity.
+      return tx.activity.update({
+        where: { id: activityId },
+        data,
+      })
     })
   },
 }
@@ -337,6 +370,24 @@ export const activityDependencyRepository = {
 
   async listForProgramme(orgId: string, programmeId: string) {
     return db.activityDependency.findMany({
+      where: {
+        programmeId,
+        programme: { organizationId: orgId },
+      },
+    })
+  },
+
+  /**
+   * Q1: List dependencies for a programme within a transaction (for
+   * snapshot-at-lock). Used inside the finalization transaction after the
+   * Programme row is locked.
+   */
+  async listForProgrammeInTransaction(
+    tx: Tx,
+    orgId: string,
+    programmeId: string,
+  ) {
+    return tx.activityDependency.findMany({
       where: {
         programmeId,
         programme: { organizationId: orgId },

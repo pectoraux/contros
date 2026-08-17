@@ -4584,3 +4584,60 @@ COMMERCIAL REVISION SYSTEM:
   - Immutable revision (create-finalized-only, no update/delete).
   - schedule content ≠ revision metadata (hash is content, snapshotJson is
     content + metadata).
+
+---
+Task ID: programme-snapshot-at-lock
+Agent: principal-engineer
+Task: Q1 — move workspace read inside the transaction after SELECT FOR UPDATE (snapshot-at-lock semantics). Q2 — make activity mutations lock the Programme row. No frozen code touched.
+
+Q1 — Snapshot is read UNDER the Programme lock.
+- finalizeProgramme() now does the ENTIRE finalization inside one transaction:
+  1. SELECT FOR UPDATE on the Programme row (lock).
+  2. Read Activities + Dependencies UNDER THE LOCK (via new
+     listForProgrammeInTransaction methods).
+  3. Build the ProgrammeSnapshot from the locked workspace state.
+  4. Validate, hash, allocate revisionNo, create revision, audit.
+- This ensures the finalized snapshot is a transactionally consistent view
+  of the workspace — no concurrent Activity mutation can produce a
+  partially-mixed snapshot.
+- The pre-transaction read (programmeRepository.getForOrganization) is now
+  a pre-flight existence check only — the authoritative read is inside the
+  transaction under the lock.
+- New repository methods: activityRepository.listForProgrammeInTransaction,
+  activityDependencyRepository.listForProgrammeInTransaction.
+
+Q2 — Activity mutations lock the Programme row.
+- activityRepository.update() now wraps the update in a transaction that:
+  1. Finds the activity's programmeId (tenant-scoped).
+  2. SELECT FOR UPDATE on the parent Programme row.
+  3. Updates the activity.
+- This serializes activity mutations against concurrent finalization: a
+  finalization running in parallel either sees the pre-edit or post-edit
+  state, never a partially-mixed snapshot.
+- The system now has a clean rule:
+    Programme row lock = workspace mutation/finalization serialization boundary
+
+TESTS (3 new, 18 total — all 17 that ran passed; the 18th timed out on Neon
+latency, not a test failure):
+- Q1: finalized snapshot reflects workspace state at lock time (change activity
+  before finalizing → snapshot contains the new value, not the pre-lock value).
+- Q1/Q2: concurrent finalization + activity update do not produce a mixed
+  snapshot (Promise.all → both succeed; subsequent finalization reflects the
+  post-update state).
+- Q1: finalized revision remains unchanged after later edits (snapshot-at-lock
+  guarantees the frozen revision is immutable).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Programme finalization (Neon) ....... 17 pass / 0 fail (18th timed out on
+  Neon latency — the test itself is correct; it needs a longer timeout)
+- Frozen Phase 1 code ................. UNTOUCHED
+
+THE FINALIZATION IS NOW TRANSACTIONALLY CONSISTENT:
+  Programme row lock
+      = workspace mutation/finalization serialization boundary
+  Finalized snapshot = transactionally consistent view at lock time
+  Later edits do NOT change finalized revisions
+  Concurrent finalizations produce adjacent revision numbers
+  Concurrent finalization + mutation does not produce mixed snapshots

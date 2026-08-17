@@ -82,15 +82,21 @@ export const programmeService = {
    * Finalize a Programme — freeze the current mutable workspace (activities
    * + dependencies) into an immutable ProgrammeRevision.
    *
-   * The service:
-   * 1. Loads the programme tenant-scoped (via programmeRepository).
-   * 2. Builds a ProgrammeSnapshot from the current mutable activities + deps.
-   * 3. Validates the snapshot (duplicates, dangling refs, cycles, finite
-   *    values, self-references).
-   * 4. Serializes to canonical JSON + computes the SHA-256 content hash.
-   * 5. In a SINGLE TRANSACTION: reads the latest revisionNo, creates the
-   *    finalized revision (with the derived revisionNo + snapshot + hash +
-   *    engine version), and writes the audit log.
+   * Q1: The ENTIRE finalization happens inside a SINGLE TRANSACTION:
+   *   1. SELECT FOR UPDATE on the Programme row (lock).
+   *   2. Read Activities + Dependencies (under the lock — snapshot-at-lock).
+   *   3. Build the ProgrammeSnapshot.
+   *   4. Validate the snapshot.
+   *   5. Compute the SHA-256 content hash (from the content projection).
+   *   6. Read the latest revisionNo (under the lock).
+   *   7. Create the finalized ProgrammeRevision.
+   *   8. Write the audit log.
+   *
+   * This ensures the finalized snapshot is a transactionally consistent view
+   * of the workspace — no concurrent Activity mutation can produce a
+   * partially-mixed snapshot, because the Programme row lock serializes
+   * finalization against mutations (Q2: activityRepository.update also takes
+   * the Programme lock).
    *
    * The service NEVER accepts a caller-supplied snapshot, hash, revisionNo,
    * or scheduleEngineVersion. All are derived from the workspace and the
@@ -101,78 +107,75 @@ export const programmeService = {
   ): Promise<FinalizeProgrammeResult> {
     const { ctx, programmeId } = input
 
-    // 1. Load the programme tenant-scoped.
-    const programme = await programmeRepository.getForOrganization(
+    // Pre-flight: verify the programme exists (tenant-scoped). This is a
+    // read-only check before the transaction — the authoritative read is
+    // inside the transaction under the lock.
+    const programmeExists = await programmeRepository.getForOrganization(
       ctx.organizationId,
       programmeId,
     )
-    if (!programme) {
+    if (!programmeExists) {
       return { ok: false, error: 'Programme not found in this organization', status: 404 }
     }
 
-    // 2. Build the snapshot from the current mutable workspace.
-    const activities: ProgrammeActivity[] = programme.activities.map((a) => ({
-      id: a.id,
-      name: a.name,
-      duration: a.duration,
-      constructionRefs: {
-        estimateLineId: a.estimateLineId,
-        workDefinitionVersionId: a.workDefinitionVersionId,
-        workPackageId: null,
-      },
-      plannedQuantity: a.plannedQuantity,
-      status: a.status as 'planned' | 'in-progress' | 'complete',
-      predecessorDependencies: [],
-    }))
-
-    const dependencies: ActivityDependency[] = programme.dependencies.map((d) => ({
-      id: d.id,
-      predecessorActivityId: d.predecessorActivityId,
-      successorActivityId: d.successorActivityId,
-      type: d.type as 'FS' | 'SS' | 'FF' | 'SF',
-      lag: d.lag,
-    }))
-
-    const snapshot: ProgrammeSnapshot = {
-      programmeId: programme.id,
-      programmeName: programme.name,
-      revisionNo: 0, // assigned in the transaction; NOT part of the content hash (P1)
-      scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
-      activities,
-      dependencies,
-      finalizedAt: '', // assigned in the transaction; NOT part of the content hash (P1)
-    }
-
-    // 3. Validate the snapshot.
-    const validation = validateProgrammeSnapshot(snapshot)
-    if (!validation.ok) {
-      return {
-        ok: false,
-        error: `Programme snapshot validation failed: ${validation.errors.join('; ')}`,
-        status: 422,
-      }
-    }
-
-    // 4. Compute the content hash from the SCHEDULE CONTENT projection (P1).
-    // P1: computeSnapshotContentHash uses extractSnapshotContent internally,
-    // which strips revisionNo and finalizedAt. The hash depends only on:
-    // programmeId, programmeName, scheduleEngineVersion, activities, dependencies.
-    // Two finalizations of the same workspace produce the same content hash.
-    const snapshotContentHash = computeSnapshotContentHash(snapshot)
-
-    // 5. Create the finalized revision IN A SINGLE TRANSACTION with row-level
-    //    locking (P2).
-    // P2: We take a SELECT FOR UPDATE lock on the Programme row BEFORE reading
-    // the latest revisionNo. This serializes concurrent finalizations on the
-    // same Programme — the second transaction blocks until the first commits,
-    // at which point it sees the new revisionNo and calculates the next one.
-    // This is stronger than relying on the unique constraint alone (which
-    // would cause one transaction to fail with a constraint violation).
+    // Q1: The entire finalization happens inside one transaction.
     const result = await dbTx.$transaction(async (tx) => {
-      // P2: Lock the Programme row to serialize concurrent finalizations.
-      // $queryRaw with SELECT ... FOR UPDATE acquires a row-level lock.
+      // Q1: Lock the Programme row FIRST — before reading any workspace data.
+      // This serializes against concurrent finalizations AND against
+      // activityRepository.update (Q2) which also takes this lock.
       await tx.$queryRaw`SELECT id FROM "Programme" WHERE id = ${programmeId} FOR UPDATE`
 
+      // Q1: Read Activities + Dependencies UNDER THE LOCK.
+      // This is the authoritative snapshot — no concurrent mutation can
+      // produce a partially-mixed state.
+      const [activities, dependencies] = await Promise.all([
+        activityRepository.listForProgrammeInTransaction(tx, ctx.organizationId, programmeId),
+        activityDependencyRepository.listForProgrammeInTransaction(tx, ctx.organizationId, programmeId),
+      ])
+
+      // Build the snapshot from the locked workspace state.
+      const snapshotActivities: ProgrammeActivity[] = activities.map((a) => ({
+        id: a.id,
+        name: a.name,
+        duration: a.duration,
+        constructionRefs: {
+          estimateLineId: a.estimateLineId,
+          workDefinitionVersionId: a.workDefinitionVersionId,
+          workPackageId: null,
+        },
+        plannedQuantity: a.plannedQuantity,
+        status: a.status as 'planned' | 'in-progress' | 'complete',
+        predecessorDependencies: [],
+      }))
+
+      const snapshotDependencies: ActivityDependency[] = dependencies.map((d) => ({
+        id: d.id,
+        predecessorActivityId: d.predecessorActivityId,
+        successorActivityId: d.successorActivityId,
+        type: d.type as 'FS' | 'SS' | 'FF' | 'SF',
+        lag: d.lag,
+      }))
+
+      const snapshot: ProgrammeSnapshot = {
+        programmeId,
+        programmeName: programmeExists.name,
+        revisionNo: 0, // assigned below; NOT part of the content hash (P1)
+        scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
+        activities: snapshotActivities,
+        dependencies: snapshotDependencies,
+        finalizedAt: '', // assigned below; NOT part of the content hash (P1)
+      }
+
+      // Validate the snapshot.
+      const validation = validateProgrammeSnapshot(snapshot)
+      if (!validation.ok) {
+        throw new Error(`Programme snapshot validation failed: ${validation.errors.join('; ')}`)
+      }
+
+      // Compute the content hash from the content projection (P1).
+      const snapshotContentHash = computeSnapshotContentHash(snapshot)
+
+      // Read the latest revisionNo (under the lock).
       const latestRevisionNo = await programmeRevisionRepo.getLatestRevisionNoInTransaction(
         tx,
         ctx.organizationId,
@@ -180,9 +183,7 @@ export const programmeService = {
       )
       const revisionNo = latestRevisionNo + 1
 
-      // The persisted snapshot carries the real revisionNo (for human inspection).
-      // The content hash was computed from the content projection (P1) — it does
-      // NOT include revisionNo or finalizedAt.
+      // Build the final snapshot with real metadata for persistence.
       const finalSnapshot: ProgrammeSnapshot = {
         ...snapshot,
         revisionNo,
@@ -190,11 +191,12 @@ export const programmeService = {
       }
       const finalSnapshotJson = serializeSnapshot(finalSnapshot)
 
+      // Create the finalized revision.
       const revision = await programmeRevisionRepo.createFinalized(tx, {
         programmeId,
         revisionNo,
         snapshotJson: finalSnapshotJson,
-        snapshotContentHash, // from the content projection (P1) — independent of revisionNo
+        snapshotContentHash,
         scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
         finalizedById: ctx.userId,
       })
@@ -204,20 +206,35 @@ export const programmeService = {
         action: 'programme.revision-finalized',
         entityType: 'ProgrammeRevision',
         entityId: revision.id,
-        summary: `Programme revision ${revisionNo} finalized: ${programme.name} (${programmeId})`,
+        summary: `Programme revision ${revisionNo} finalized: ${programmeExists.name} (${programmeId})`,
         afterJson: JSON.stringify({
           programmeId,
           revisionId: revision.id,
           revisionNo,
-          snapshotContentHash: snapshotContentHash,
+          snapshotContentHash,
           scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
-          activityCount: activities.length,
-          dependencyCount: dependencies.length,
+          activityCount: snapshotActivities.length,
+          dependencyCount: snapshotDependencies.length,
         }),
       })
 
       return revision
+    }).catch((e: unknown) => {
+      // If the error is a validation error, return a 422.
+      if (e instanceof Error && e.message.includes('validation failed')) {
+        return { _validationError: e.message }
+      }
+      throw e
     })
+
+    // Handle validation errors thrown from inside the transaction.
+    if (result && '_validationError' in result) {
+      return {
+        ok: false,
+        error: (result as { _validationError: string })._validationError,
+        status: 422,
+      }
+    }
 
     return {
       ok: true,

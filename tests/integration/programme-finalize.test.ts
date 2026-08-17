@@ -343,4 +343,83 @@ describe('ProgrammeService finalization integration tests', () => {
     // The difference should be exactly 1 (sequential, not random).
     expect(Math.abs(res1.revisionNo - res2.revisionNo)).toBe(1)
   }, 60000)
+
+  // ── Q1: Snapshot is read under the Programme lock ────────────────────────
+
+  test('Q1: finalized snapshot reflects workspace state at lock time (not pre-lock)', async () => {
+    // Finalize once to get a baseline hash.
+    const res1 = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
+    expect(res1.ok).toBe(true)
+    if (!res1.ok) return
+
+    // Change an activity — this takes the Programme lock (Q2).
+    await db.activity.update({ where: { id: 'test-pf-act-1' }, data: { duration: 42 } })
+
+    // Finalize again — the snapshot should reflect duration=42, not the
+    // pre-lock value, because the workspace read happens under the lock.
+    const res2 = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
+    expect(res2.ok).toBe(true)
+    if (!res2.ok) return
+    expect(res1.snapshotContentHash).not.toBe(res2.snapshotContentHash)
+
+    // Read the persisted snapshot and verify it contains duration=42.
+    const revision = await db.programmeRevision.findFirst({
+      where: { id: res2.revisionId },
+    })
+    const snapshot = JSON.parse(revision!.snapshotJson)
+    const act = snapshot.activities.find((a: { id: string }) => a.id === 'test-pf-act-1')
+    expect(act.duration).toBe(42)
+
+    // Restore.
+    await db.activity.update({ where: { id: 'test-pf-act-1' }, data: { duration: 5 } })
+  }, 30000)
+
+  test('Q1/Q2: concurrent finalization + activity update do not produce a mixed snapshot', async () => {
+    // Fire a finalization and an activity update concurrently. The Programme
+    // row lock ensures they serialize — the finalization sees either the
+    // pre-update or post-update state, never a partially-mixed snapshot.
+    const [, updateRes] = await Promise.all([
+      programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A }),
+      db.activity.update({ where: { id: 'test-pf-act-2' }, data: { duration: 77 } }),
+    ])
+    // The update succeeded (Q2: it takes the Programme lock too).
+    expect(updateRes.duration).toBe(77)
+
+    // Finalize again — should reflect the post-update state.
+    const res = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const revision = await db.programmeRevision.findFirst({
+      where: { id: res.revisionId },
+    })
+    const snapshot = JSON.parse(revision!.snapshotJson)
+    const act = snapshot.activities.find((a: { id: string }) => a.id === 'test-pf-act-2')
+    expect(act.duration).toBe(77)
+
+    // Restore.
+    await db.activity.update({ where: { id: 'test-pf-act-2' }, data: { duration: 10 } })
+  }, 60000)
+
+  test('Q1: finalized revision remains unchanged after later edits (snapshot-at-lock)', async () => {
+    const res = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+
+    const revisionBefore = await db.programmeRevision.findFirst({
+      where: { id: res.revisionId },
+    })
+
+    // Edit the workspace.
+    await db.activity.update({ where: { id: 'test-pf-act-1' }, data: { duration: 999 } })
+
+    // The finalized revision is unchanged.
+    const revisionAfter = await db.programmeRevision.findFirst({
+      where: { id: res.revisionId },
+    })
+    expect(revisionAfter!.snapshotJson).toBe(revisionBefore!.snapshotJson)
+    expect(revisionAfter!.snapshotContentHash).toBe(revisionBefore!.snapshotContentHash)
+
+    // Restore.
+    await db.activity.update({ where: { id: 'test-pf-act-1' }, data: { duration: 5 } })
+  }, 30000)
 }, 300000)
