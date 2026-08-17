@@ -3947,3 +3947,71 @@ CANONICAL → XLSX PATH (now complete from HTTP to bytes):
 
 NEXT (NOT started): contractor UI download action. The backend boundary is
 complete; the UI becomes a thin consumer.
+
+---
+Task ID: boq-xlsx-http-smoke-test
+Agent: principal-engineer
+Task: Authenticated HTTP smoke test using the SEEDED demo user + SEEDED finalized revision. Per reviewer: use existing auth mechanism, not invented test data. The full HTTP→XLSX path is now END-TO-END VERIFIED.
+
+SMOKE TEST (scripts/boq-route-smoke-test.ts):
+- Uses the SEEDED demo user: kwesi@adomconstruction.gh / demo1234 (org-1).
+- Uses the SEEDED finalized revision: rev-office-1 (Office Complex, revisionNo 1).
+- Real NextAuth credentials flow → real session cookie → real GET request to
+  /api/estimates/revisions/rev-office-1/boq.xlsx.
+- 14 assertions, ALL PASSING:
+
+  200 finalized revision (golden path):
+    ✅ status is 200
+    ✅ Content-Type is application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+    ✅ Content-Disposition is attachment
+    ✅ Content-Disposition has BOQ filename
+    ✅ Content-Disposition has revision ID
+    ✅ body is non-empty (valid XLSX bytes)
+    ✅ body starts with ZIP magic (PK)
+    ✅ no audit warning header (audit succeeded)
+
+  401 unauthenticated:
+    ✅ status is 401
+
+  404 nonexistent revision:
+    ✅ status is 404
+    ✅ error is safe (no DB/neon/password details)
+
+  422 non-finalized revision:
+    ✅ status is 422
+    ✅ error mentions "not finalized"
+
+  Determinism:
+    ✅ same Content-Disposition on repeat
+
+EVIDENCE HIERARCHY (now complete):
+  service → PostgreSQL:       ✅ integration verified (16 tests)
+  route structure:            ✅ verified (7 boundary unit tests)
+  route → real HTTP →         ✅ END-TO-END VERIFIED (14 smoke test assertions)
+    authenticated session →
+    XLSX bytes
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 261 pass / 0 fail (0 regressions)
+- HTTP smoke test ..................... 14 pass / 0 fail (real NextAuth + seeded data)
+- Frozen Phase 1 code ................. UNTOUCHED
+
+CANONICAL → XLSX PATH (FULLY VERIFIED END-TO-END):
+  GET /api/estimates/revisions/:revisionId/boq.xlsx
+      ↓ requireAuth() → RequestContext (real NextAuth JWT session)
+      ↓ boqProjectionService.exportXlsx()
+      ↓ tenant-scoped EstimateRevision lookup (Neon PostgreSQL)
+      ↓ projectRevision (pure, lossless, SHA-256)
+      ↓ buildXlsxArtifact (frozen, display-rounded)
+      ↓ serializeXlsxArtifact (write-excel-file@4.1.1)
+      ↓ 200 + Content-Type + Content-Disposition + XLSX bytes
+
+The BOQ canonical→office path is now MATURE and FULLY VERIFIED from
+authenticated HTTP request through the immutable historical revision to the
+downloadable workbook. The backend boundary is complete.
+
+NEXT ARCHITECTURAL FRONTIER (per reviewer):
+Stop spending disproportionate effort on Excel. Move toward the
+Project/Programme + construction information graph that connects:
+  plans → quantities → BOQ → estimate → programme
