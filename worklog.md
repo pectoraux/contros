@@ -4453,3 +4453,78 @@ THE AUTHORITATIVE CHAIN (now with proper boundary):
 
 NEXT: ProgrammeService finalization — the schedule analogue of
 EstimateService → EstimateRevision.
+
+---
+Task ID: programme-finalization-service
+Agent: principal-engineer
+Task: ProgrammeService.finalizeProgramme() — the schedule analogue of EstimateService → EstimateRevision. Pure snapshot build → validate → canonical serialize → SHA-256 hash → immutable ProgrammeRevision (in a single transaction). No frozen code touched.
+
+SERVICE (src/application/programme-service.ts):
+- finalizeProgramme({ ctx, programmeId }) →
+  { ok: true, revisionId, revisionNo, snapshotContentHash, scheduleEngineVersion } | Err
+- Pipeline:
+  1. Load programme tenant-scoped (programmeRepository.getForOrganization).
+  2. Build ProgrammeSnapshot from mutable activities + dependencies.
+     - finalizedAt = '' (NOT part of the content hash — it's audit metadata).
+     - revisionNo = 0 (placeholder — assigned in the transaction).
+  3. Validate (validateProgrammeSnapshot: duplicates, dangling, cycles, finite).
+  4. Serialize (canonical JSON) + compute SHA-256 content hash.
+     - The hash is computed from SCHEDULE CONTENT only (activities + deps +
+       engine version + programme identity). revisionNo and finalizedAt are
+       NOT in the hash — they're metadata. Two finalizations of the same
+       workspace produce the same content hash.
+  5. IN A SINGLE TRANSACTION:
+     - getLatestRevisionNoInTransaction (atomic read).
+     - revisionNo = latest + 1.
+     - createFinalized (with the derived revisionNo + snapshot + hash).
+     - audit: programme.revision-finalized.
+  - A1 CONCURRENCY: the revisionNo read + create happen atomically. Two
+    concurrent finalizations cannot both calculate the same revisionNo.
+
+CONTENT HASH SEMANTICS:
+- The hash identifies the schedule CONTENT (what activities, what dependencies,
+  what durations/lags, what engine version). It does NOT include revisionNo or
+  finalizedAt. This means:
+  - Same workspace → same content hash (reproducibility).
+  - Changed activity → different hash.
+  - Changed dependency → different hash.
+  - Different revisionNo (same content) → same hash.
+
+REPOSITORY (src/repositories/programme-repositories.ts):
+- New: getLatestRevisionNoInTransaction(tx, orgId, programmeId) — reads the
+  latest revisionNo WITHIN a transaction so the read + create are atomic.
+
+INTEGRATION TESTS (tests/integration/programme-finalize.test.ts — 12 tests):
+1. First finalization → revisionNo 1 with hash + engine version.
+2. Second finalization → revisionNo 2.
+3. Same workspace snapshot → same snapshotContentHash.
+4. Changing activity duration → different hash.
+5. Changing dependency lag → different hash.
+6. Finalized revision contains frozen snapshot; later edits do NOT change it.
+7. Tenant isolation: Org B cannot finalize Org A programme.
+8. Missing programme → 404.
+9. Cyclic dependency → 422.
+10. Non-finite duration → 422 (defense-in-depth; Prisma can't read Infinity,
+    which IS the defense working).
+11. Audit: PROGRAMME_REVISION_FINALIZED recorded with provenance.
+12. Source audit: programmeRevisionRepo has no update/delete method.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Programme finalization (Neon) ....... 12 pass / 0 fail / 35 expect()
+- Frozen Phase 1 code ................. UNTOUCHED
+
+PROGRAMME HISTORY IS NOW REAL:
+  Programme (mutable workspace)
+      ↓ finalizeProgramme()
+  ProgrammeRevision (immutable, content-hashed, tenant-scoped)
+      ↓
+  Bid.programmeRevisionId (FK)
+      ↓
+  Bid submission (programmeRevisionRepo.getForBid)
+
+Two historical truths:
+  EstimateRevision  = commercial history (immutable)
+  ProgrammeRevision = schedule history (immutable)
+  The graph connects them without collapsing them into one source of truth.

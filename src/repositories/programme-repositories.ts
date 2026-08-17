@@ -197,6 +197,29 @@ export const programmeRevisionRepo = {
     })
     return prog?.revisions[0]?.revisionNo ?? 0
   },
+
+  /**
+   * A1: Get the latest revision number WITHIN a transaction, so the read +
+   * create happen atomically. This prevents two concurrent finalizations
+   * from both calculating the same revisionNo.
+   */
+  async getLatestRevisionNoInTransaction(
+    tx: Tx,
+    orgId: string,
+    programmeId: string,
+  ): Promise<number> {
+    const prog = await tx.programme.findFirst({
+      where: { id: programmeId, organizationId: orgId },
+      select: {
+        revisions: {
+          orderBy: { revisionNo: 'desc' },
+          take: 1,
+          select: { revisionNo: true },
+        },
+      },
+    })
+    return prog?.revisions[0]?.revisionNo ?? 0
+  },
 }
 
 // ─── Activity Repository ────────────────────────────────────────────────────
