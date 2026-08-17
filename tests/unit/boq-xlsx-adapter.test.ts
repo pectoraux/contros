@@ -328,6 +328,54 @@ describe('XLSX adapter — J1: artifact owns immutable data (no shared mutable r
   })
 })
 
+describe('XLSX adapter — K1: artifact is IMMUTABLE (recursively frozen at runtime)', () => {
+  test('Object.isFrozen is true on the artifact and all nested structures', () => {
+    const proj = makeProjection()
+    const artifact = buildXlsxArtifact(makeAdapterInput(proj))
+    expect(Object.isFrozen(artifact)).toBe(true)
+    expect(Object.isFrozen(artifact.formatting)).toBe(true)
+    expect(Object.isFrozen(artifact.formatting.columns)).toBe(true)
+    expect(Object.isFrozen(artifact.formatting.columns[0])).toBe(true)
+    expect(Object.isFrozen(artifact.worksheets)).toBe(true)
+    expect(Object.isFrozen(artifact.worksheets[0])).toBe(true)
+    expect(Object.isFrozen(artifact.worksheets[0].rows)).toBe(true)
+    expect(Object.isFrozen(artifact.worksheets[0].rows[0])).toBe(true)
+    expect(Object.isFrozen(artifact.worksheets[0].rows[0].cells)).toBe(true)
+    expect(Object.isFrozen(artifact.worksheets[0].rows[0].cells[0])).toBe(true)
+  })
+
+  test('mutating a frozen artifact property throws in strict mode', () => {
+    'use strict'
+    const proj = makeProjection()
+    const artifact = buildXlsxArtifact(makeAdapterInput(proj))
+    // Mutating a frozen top-level property throws TypeError in strict mode.
+    expect(() => {
+      ;(artifact as unknown as { adapterVersion: number }).adapterVersion = 999
+    }).toThrow(TypeError)
+    // Mutating a deeply nested cell value also throws.
+    expect(() => {
+      ;(artifact.worksheets[0].rows[0].cells[0] as { value: unknown }).value = 'CHANGED'
+    }).toThrow(TypeError)
+  })
+
+  test('mutating a frozen artifact does not change its content (provenance intact)', () => {
+    'use strict'
+    const proj = makeProjection()
+    const artifact = buildXlsxArtifact(makeAdapterInput(proj))
+    const hashBefore = artifact.sourceContentHash
+    const headerBefore = artifact.worksheets[0].rows[0].cells[0].value
+    // Attempt mutation — throws in strict mode (caught).
+    try {
+      ;(artifact.worksheets[0].rows[0].cells[0] as { value: unknown }).value = 'CHANGED'
+    } catch {
+      // expected TypeError in strict mode
+    }
+    // The artifact is unchanged — provenance is intact.
+    expect(artifact.sourceContentHash).toBe(hashBefore)
+    expect(artifact.worksheets[0].rows[0].cells[0].value).toBe(headerBefore)
+  })
+})
+
 describe('XLSX adapter — J2: no invented Code column', () => {
   test('the default v1 formatting has NO Code column', () => {
     const fields = DEFAULT_XLSX_FORMATTING.columns.map((c) => c.field)

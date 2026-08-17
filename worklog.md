@@ -3256,3 +3256,63 @@ DISPOSITION (per reviewer):
     milestone proving: same XlsxArtifact + same serializer version/config →
     same workbook content; and where achievable: same inputs → byte-identical
     XLSX. The strong byte-identity invariant will be TESTED, not assumed.
+
+---
+Task ID: boq-xlsx-adapter-freeze
+Agent: principal-engineer
+Task: Freeze the produced XlsxArtifact at runtime (recursive Object.freeze) + remove stale "Code" mention in the totals-row comment. No frozen code touched.
+
+ISSUES CLOSED (per reviewer's findings):
+
+K1 — XlsxArtifact is now IMMUTABLE at runtime (recursively frozen).
+- The J1 deep-copy closed the input-aliasing gap (mutating the input config
+  no longer affects the built artifact), but the artifact ITSELF remained
+  mutable: artifact.formatting.columns[0].header = ... would succeed. The code
+  said "immutable in practice" but only guaranteed ownership/isolation.
+- This mattered for the serializer's future contract ("same artifact → same
+  bytes"): a mutable artifact carrying sourceContentHash (claiming projection P)
+  could be mutated after construction and serialized to a workbook that differs
+  from P's projection — a provenance mismatch.
+- Fix: buildXlsxArtifact now recursively Object.freezes the produced artifact
+  (deepFreeze helper — depth-first freeze of all nested objects + arrays).
+  The artifact is IMMUTABLE at runtime. Any mutation attempt throws TypeError
+  in strict mode. Only the serializer consumes it; it never mutates.
+- New tests (3): Object.isFrozen is true on the artifact + all nested
+  structures (formatting, columns, worksheets, rows, cells); mutating a frozen
+  property throws TypeError in strict mode; mutating does not change content
+  (provenance intact — sourceContentHash unchanged).
+
+K2 — Removed the stale "Code" mention in the totals-row comment.
+- The totals-row default-case comment still listed "No, Code, Unit, Qty, Unit
+  Rate, Margin %" even though Code was removed in J2. Harmless but stale.
+- Fix: comment now reads "No, Unit, Qty, Unit Rate, Margin %".
+
+FILES MODIFIED (no frozen code):
+- src/lib/boq/xlsx-adapter.ts — deepFreeze helper; buildXlsxArtifact freezes
+  the returned artifact; docstring updated (immutable, not just owned); stale
+  Code comment fixed.
+- tests/unit/boq-xlsx-adapter.test.ts — +3 K1 immutability tests.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 246 pass / 0 fail (was 243; +3 K1;
+  0 regressions)
+- Adapter tests .................... 29 pass / 0 fail
+- K1 tests prove: Object.isFrozen true on all nested structures; mutation
+  throws TypeError in strict mode; provenance (sourceContentHash) intact after
+  attempted mutation.
+- Frozen Phase 1 code ................. UNTOUCHED
+
+DISPOSITION (per reviewer):
+  ✅ caller/config isolation (J1)
+  ✅ no invented business-code semantics (J2)
+  ✅ pure office boundary
+  ✅ versioned formatting
+  ✅ display rounding isolated
+  ✅ no persistence/commercial dependencies
+  ✅ artifact is IMMUTABLE at runtime — recursively frozen (K1)
+  ✅ stale Code comment removed (K2)
+  → Proceed to library evaluation. Do NOT choose on popularity alone; evaluate
+    candidates against actual required features (number formats, widths, freeze
+    panes, filtering, formulas, deterministic ZIP/XML output) and test
+    byte-for-byte reproducibility before committing.

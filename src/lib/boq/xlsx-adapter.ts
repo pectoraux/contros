@@ -177,7 +177,7 @@ function renderTotalsRow(
           numberFormat: col.numberFormat,
         }
       default:
-        // Non-totalable columns (No, Code, Unit, Qty, Unit Rate, Margin %)
+        // Non-totalable columns (No, Unit, Qty, Unit Rate, Margin %)
         // are blank in the totals row.
         return { value: null, numberFormat: col.numberFormat }
     }
@@ -213,6 +213,34 @@ function deepCopyFormatting(config: XlsxFormattingConfig): XlsxFormattingConfig 
   }
 }
 
+/**
+ * Recursively Object.freeze a plain-data structure (objects + arrays).
+ * K1: makes the produced XlsxArtifact IMMUTABLE at runtime — not merely owned,
+ * but frozen. Any attempt to mutate a frozen property throws in strict mode
+ * (or is silently ignored in sloppy mode). This closes the provenance-mismatch
+ * gap: an artifact carrying sourceContentHash cannot be mutated after
+ * construction, so the serializer's "same artifact → same bytes" contract holds.
+ *
+ * Primitives (string/number/boolean/null/undefined) are returned as-is.
+ * Functions are not frozen (the artifact model has none).
+ */
+function deepFreeze<T>(value: T): T {
+  if (value === null || value === undefined) return value
+  if (typeof value !== 'object') return value
+  // Arrays are objects; freeze the array then each element.
+  if (Array.isArray(value)) {
+    Object.freeze(value)
+    for (const item of value) deepFreeze(item)
+    return value
+  }
+  const obj = value as Record<string, unknown>
+  // Freeze nested objects first (depth-first), then freeze the container.
+  for (const key of Object.keys(obj)) {
+    deepFreeze(obj[key])
+  }
+  return Object.freeze(value)
+}
+
 // ─── The pure adapter function ──────────────────────────────────────────────
 
 /**
@@ -224,7 +252,13 @@ function deepCopyFormatting(config: XlsxFormattingConfig): XlsxFormattingConfig 
  *
  * J1: the artifact OWNS its formatting + column structures (deep-copied from
  * the input). Mutating the input config after buildXlsxArtifact returns does
- * NOT affect the already-built artifact. The artifact is immutable in practice.
+ * NOT affect the already-built artifact.
+ *
+ * K1: the produced artifact is recursively Object.frozen — it is IMMUTABLE at
+ * runtime, not merely owned. This prevents a provenance mismatch where an
+ * artifact carrying sourceContentHash (claiming projection P) is mutated
+ * after construction and then serialized to a workbook that differs from P's
+ * projection. Only the serializer consumes the artifact; it never mutates it.
  */
 export function buildXlsxArtifact(input: XlsxAdapterInput): XlsxArtifact {
   const { projection, adapterVersion, formatting } = input
@@ -257,12 +291,19 @@ export function buildXlsxArtifact(input: XlsxAdapterInput): XlsxArtifact {
     rows,
   }
 
-  return {
+  const artifact: XlsxArtifact = {
     adapterVersion,
     formatting: ownedFormatting,
     sourceContentHash: projection.provenance.contentHash,
     worksheets: [worksheet],
   }
+
+  // K1: recursively freeze the artifact so it is IMMUTABLE at runtime. This
+  // closes the provenance-mismatch gap: an artifact carrying sourceContentHash
+  // cannot be mutated after construction, so the serializer's "same artifact →
+  // same bytes" contract is sound. Object.freeze is shallow per object, so we
+  // recurse through arrays + nested objects.
+  return deepFreeze(artifact) as XlsxArtifact
 }
 
 // ─── Canonical invariant verification (for tests / audit) ───────────────────
