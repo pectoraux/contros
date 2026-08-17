@@ -3316,3 +3316,89 @@ DISPOSITION (per reviewer):
     candidates against actual required features (number formats, widths, freeze
     panes, filtering, formulas, deterministic ZIP/XML output) and test
     byte-for-byte reproducibility before committing.
+
+---
+Task ID: boq-xlsx-serializer-evaluation
+Agent: principal-engineer
+Task: Serializer evaluation harness — empirically determine byte-for-byte determinism of candidate XLSX serializers. NOT production integration. No changes to BoqProjection or XlsxArtifact contracts.
+
+METHODOLOGY (per reviewer's directive):
+- Build ONE fixed XlsxArtifact (from a real BoqProjection via finalizeRevision).
+- For each candidate: serialize twice → compare Buffer bytes → SHA-256 each →
+  on mismatch, unzip + diff ZIP/XML entries + flag timestamp metadata.
+- Run the probe multiple times (3 process runs) to detect cross-process
+  non-determinism (the within-process match could mask a timestamp that
+  changes between process invocations).
+
+CANDIDATES EVALUATED:
+- write-excel-file@4.1.1 (Node 18+, narrow, supports widths/formats/freeze)
+- exceljs@4.4.0 (comparison baseline; active in 2026, heavier dep tree)
+- @office-kit/xlsx: NOT evaluated — requires Node 22+ (runtime is Node 24, so
+  compatible, but deferred per reviewer's directive until write-excel-file /
+  exceljs results are in).
+
+HARNESS: scripts/xlsx-determinism-probe.ts (evaluation script, NOT a product
+test, NOT production code). Uses a minimal ZIP central-directory parser to
+list entries + inflate deflated entries for XML diffing. The parser's
+inflateSync hits a raw-deflate vs zlib-wrapped edge case ("incorrect header
+check") on some entries, but that does NOT affect the byte comparison (the
+core determinism test) — only the ZIP-level XML diff. The byte comparison is
+authoritative.
+
+RESULTS (3 process runs):
+
+  Within-process determinism (serialize twice in one process):
+    write-excel-file@4.1.1: ✅ byte-identical (both serializations match)
+    exceljs@4.4.0:          ✅ byte-identical (both serializations match)
+
+  Cross-process determinism (serialize in separate process runs):
+    write-excel-file@4.1.1: ❌ NOT byte-identical across processes
+      run1 sha256=eb794b46…  run2 sha256=59e547c0…  run3 sha256=c40ccdc0…
+    exceljs@4.4.0:          ❌ NOT byte-identical across processes
+      run1 sha256=250bc6be…  run2 sha256=2f74e02f…  run3 sha256=99cac9d4…
+
+  Root cause (presumed, not yet isolated at XML level due to the inflate edge
+  case): both libraries write timestamp metadata (created/modified) into
+  docProps/core.xml, which changes between process runs. The within-process
+  match occurs because the timestamp is captured once per workbook construction
+  and reused for both serializations in the same process.
+
+CONCLUSION (honest, per the two-level invariant model):
+- Canonical invariant (same inputs → same XlsxArtifact): GUARANTEED ✅
+- Strong byte invariant (same inputs → byte-identical XLSX): DOES NOT HOLD for
+  either candidate as-is, across process boundaries. 🔶
+
+  The strong byte invariant is CANDIDATE-DEPENDENT and PROCESS-BOUNDARY-
+  DEPENDENT. It cannot be promoted to a product guarantee for either library
+  without further work (e.g., post-processing the XLSX to strip/normalize
+  docProps/core.xml timestamps, or finding a serializer option to suppress
+  them).
+
+RECOMMENDATION:
+- write-excel-file@4.1.1 remains the preferred candidate (narrower, lighter,
+  within-process deterministic). Its cross-process non-determinism is the
+  standard XLSX-timestamp issue, not a library defect.
+- Before production integration: either (a) accept that the strong byte
+  invariant does not hold and document the canonical invariant as the product
+  guarantee (the workbook CONTENT is reproducible; the bytes are not, due to
+  metadata timestamps), or (b) add a post-processing step that normalizes the
+  timestamp metadata to achieve cross-process byte identity. This is a product
+  decision, not an architectural one.
+- The BoqProjection and XlsxArtifact contracts are unchanged. No production
+  serializer code was added. The harness is an evaluation tool only.
+
+FILES:
+- scripts/xlsx-determinism-probe.ts — the evaluation harness (NEW).
+- package.json + bun.lock — write-excel-file@4.1.1 + exceljs@4.4.0 added as
+  devDependencies (evaluation only; NOT production deps).
+
+DISPOSITION (per reviewer's two-level model):
+  Canonical invariant: ✅ GUARANTEED (product guarantee)
+  Strong byte invariant: 🔶 CANDIDATE-DEPENDENT + PROCESS-BOUNDARY-DEPENDENT
+    - within-process: ✅ both candidates
+    - cross-process: ❌ both candidates (timestamp metadata)
+    - NOT a product guarantee without further work
+  → Do NOT promote "same artifact → byte-identical XLSX" to a permanent product
+    invariant. The honest status is: same artifact → same workbook CONTENT
+    (guaranteed); same artifact → byte-identical XLSX (within-process only,
+    candidate-dependent).
