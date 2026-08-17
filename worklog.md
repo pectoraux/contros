@@ -2514,3 +2514,89 @@ The unblock sequence remains:
       → deployment secrets updated ❌ PENDING
       → security incident closed ❌ PENDING
       → BOQ architecture review may begin ⏳ BLOCKED
+
+---
+Task ID: boq-phase1
+Agent: principal-engineer
+Task: BOQ Phase 1 — domain contract, schema, repositories, pure functions, services, tests. Per approved architecture (two-flow: external→canonical input + canonical→projection). No XLSX parser, no AI matching, no auto-sync, no changes to frozen Phase 1 services.
+
+ARCHITECTURE implemented (approved spec, Sections 1-12):
+- Three distinct concepts, NOT one giant BoqService:
+    BoqImportService   — ingestion boundary (never touches EstimateLine)
+    BoqBindingService  — identity link (human-confirmed; AI may suggest, never bind)
+    BoqReconciliationService — computes results on demand (never stored as truth)
+  (BoqProjectionService — canonical→XLSX — deferred to a later milestone per spec)
+- BoqItem is an OBSERVATION: raw* fields preserve exactly what the spreadsheet
+  said; normalized* fields are deterministic derivations. Both persist (audit).
+- BoqBinding answers "which canonical line?" (identity). Reconciliation answers
+  "how do values differ?" (comparison). Separate decisions, separate services.
+- Reconciliation is a pure function output (reconcile()), NOT persisted truth.
+  No BoqReconciliation model exists in the schema (architecture-audited).
+- RATE_DIVERGENT is asymmetric: canonical EstimateLine.unitRate is AUTHORITATIVE;
+  the external rate is an observation. There is NO "sync imported rate" op.
+  Verified by integration test: EstimateLine.unitRate unchanged after reconcile.
+- Classifications are DIMENSIONS (bindingStatus + differences[]), not mutually
+  exclusive enums — avoids QTY_AND_RATE_DIVERGENT combinatorial explosion.
+- Matching tiers (deterministic, no AI): CODE_EXACT → DESCRIPTION_UNIT_EXACT →
+  WORK_DEFINITION → CANDIDATE_SELECTED → MANUAL. suggestBindingStatus returns
+  MATCHED / AMBIGUOUS / UNMATCHED. AI may later generate candidates but never bind.
+- Reuses the existing AuditLog (no BOQ-specific audit subsystem).
+- Tenant isolation: BoqImport is the org-owned root; BoqItem/BoqBinding reached
+  via it. Cross-tenant access impossible (verified by integration tests).
+
+FILES (new — no frozen code modified):
+- src/lib/boq/types.ts         — domain contract (types, enums, result types)
+- src/lib/boq/normalize.ts     — pure normalization (parseNumber, normalizeUnit/
+  Code/Description, normalizeRow). Deterministic, audit-preserving.
+- src/lib/boq/match.ts         — pure deterministic matching (generateCandidates,
+  suggestBindingStatus). 5 tiers, scored candidates, never binds.
+- src/lib/boq/reconcile.ts     — pure reconciliation (reconcile, reconcileBatch,
+  summarizeResults). bindingStatus + differences[] dimensions.
+- src/lib/boq/index.ts         — barrel
+- src/repositories/boq-repositories.ts — boqImportRepository, boqItemRepository,
+  boqBindingRepository. Tenant-scoped, no business logic.
+- src/repositories/index.ts    — barrel export appended
+- src/application/boq-import-service.ts    — createImport, parseImport, get/list
+- src/application/boq-binding-service.ts   — suggestBindings, confirmBinding
+  (human-only), rejectBinding, get/list
+- src/application/boq-reconciliation-service.ts — reconcileImport, reconcileItem
+- prisma/schema.prisma         — BoqImport (with fileHash), BoqItem (raw* +
+  normalized*), BoqBinding (1:1 to BoqItem). Pushed to Neon.
+- tests/unit/boq-normalize.test.ts  — 16 tests
+- tests/unit/boq-match.test.ts       — 12 tests
+- tests/unit/boq-reconcile.test.ts   — 13 tests
+- tests/integration/boq-service.test.ts — 14 tests against Neon PostgreSQL
+
+FORBIDDEN patterns (Section 11) — explicitly rejected and architecture-audited:
+  route → Prisma                       ✅ (services → repositories)
+  route → XLSX parser → EstimateLine   ✅ (parser is injected; import never touches EstimateLine)
+  BOQ rate → EstimateLine rate         ✅ (RATE_DIVERGENT asymmetric; integration test verifies no mutation)
+  BOQ quantity → EstimateLine quantity ✅ (import never mutates canonical)
+  import parser → business decision    ✅ (parser normalizes; service decides)
+  AI matcher → automatic binding       ✅ (confirmBinding rejects AI actor; INVARIANT 5)
+  reconciliation row → canonical state ✅ (no BoqReconciliation model; pure function)
+  current Estimate → historical export ✅ (projection deferred; will use EstimateRevision)
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 185 pass / 0 fail / 555 expect() (was 147;
+  +38 BOQ tests, 0 regressions)
+- BOQ integration tests (Neon) ........ 14 pass / 0 fail / 52 expect()
+  (full flow: createImport → parseImport → suggestBindings → confirmBinding →
+  rejectBinding → reconcileImport → tenant isolation → architecture audits)
+- Neon schema ........................ BoqImport, BoqItem, BoqBinding tables created
+- Frozen Phase 1 code ................. UNTOUCHED (no src/application/estimate-service,
+  bid-service, etc. changes; no PricingEngine changes)
+
+Milestone scope (per spec — deliberately small):
+- BoqImport, BoqItem, BoqBinding + deterministic normalization + matching +
+  reconciliation result type + unit tests + PostgreSQL integration tests.
+- NO XLSX export yet (BoqProjectionService — later milestone).
+- NO AI matching yet (candidate generator only; human binds).
+- NO automatic synchronization (RATE_DIVERGENT is read-only comparison).
+- NO changes to PricingEngine, EstimateService, BidService, or EstimateRevision.
+
+Next milestones (NOT started):
+- STEP 9:  canonical → XLSX projection (consumes immutable EstimateRevision)
+- STEP 10: external XLSX import adapter (real XLSX parsing, injected into BoqImportService)
+- STEP 11: workspace UI

@@ -38,6 +38,7 @@ model Organization {
   calibrationProposals CalibrationProposal[]
   documents      Document[]
   productivityObservations ProductivityObservation[]
+  boqImports     BoqImport[]
 }
 
 model User {
@@ -399,6 +400,7 @@ model EstimateLine {
   executionSegments     ExecutionSegment[]
   commercialExceptions  CommercialException[]
   actuals               ProjectActual[]
+  boqBindings           BoqBinding[]
 }
 
 // P0-5 fix: hybrid execution needs explicit allocation, never a 50% heuristic.
@@ -724,4 +726,99 @@ model DocumentVersion {
   document        Document @relation(fields: [documentId], references: [id])
 
   @@unique([documentId, revisionNo])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BOQ Domain — external BOQ import, binding, reconciliation (BOQ Phase 1)
+//
+// ARCHITECTURE: BoqItem is an OBSERVATION (what the client spreadsheet said),
+// NOT canonical commercial state. EstimateLine remains the canonical object
+// (INVARIANT 2). They are linked only by an explicit, audited BoqBinding.
+//
+// Reconciliation is NOT persisted as truth — it is a deterministic pure
+// function output (see src/lib/boq/reconcile.ts). The models below store
+// the import artifact, the observed rows, and the human-confirmed bindings.
+//
+// INVARIANT 5: an imported BOQ rate can NEVER silently commit a price.
+// INVARIANT 9: the XLSX is a working copy, not canonical state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One uploaded external workbook. `fileHash` makes the same client workbook
+// identifiable across re-uploads even if the filename changes (audit req).
+model BoqImport {
+  id              String   @id @default(cuid())
+  organizationId  String
+  opportunityId   String?
+  documentId      String?
+  fileReference   String   // storage path / key for the uploaded file
+  fileName        String
+  fileHash        String   // sha256 of file contents — re-upload detection
+  status          String   @default("pending") // pending | parsed | failed
+  source          String   @default("client") // client | consultant | tender-portal | internal | other
+  createdAt       DateTime @default(now())
+  createdById     String?
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  items           BoqItem[]
+
+  @@index([organizationId])
+  @@index([organizationId, fileHash])
+}
+
+// A single row parsed from an external workbook — an OBSERVATION.
+// raw* fields preserve EXACTLY what the spreadsheet said (audit-preserving).
+// normalized* fields are our deterministic normalization.
+// This row NEVER carries canonical commercial truth.
+model BoqItem {
+  id                  String   @id @default(cuid())
+  boqImportId         String
+  worksheet           String
+  rowNumber           Int
+
+  // Exactly what the spreadsheet said.
+  rawDescription      String
+  rawCode             String?
+  rawQuantity         Float?
+  rawUnit             String?
+  rawRate             Float?
+  rawAmount           Float?
+
+  // Our deterministic normalization (may be null if unparseable).
+  normalizedDescription String?
+  normalizedCode       String?
+  normalizedUnit       String?
+  normalizedQuantity   Float?
+  normalizedRate       Float?
+
+  currency            String?
+  provenanceJson      String   @default("{}") // {source,row,import,timestamp}
+  createdAt           DateTime @default(now())
+
+  boqImport           BoqImport @relation(fields: [boqImportId], references: [id])
+  binding             BoqBinding?
+
+  @@index([boqImportId])
+  @@unique([boqImportId, worksheet, rowNumber])
+}
+
+// Identity link between a BoqItem and a canonical EstimateLine.
+// Binding answers "which canonical line does this external row refer to?"
+// It does NOT answer "do the values match?" (that is reconciliation).
+// A binding is an explicit, audited human decision — never an AI auto-bind.
+model BoqBinding {
+  id                  String   @id @default(cuid())
+  boqItemId           String   @unique // 1:1 — one binding per BoqItem
+  estimateLineId      String?
+  status              String   // MATCHED | AMBIGUOUS | UNMATCHED | REJECTED
+  matchMethod         String?  // CODE_EXACT | DESCRIPTION_UNIT_EXACT | WORK_DEFINITION | CANDIDATE_SELECTED | MANUAL
+  candidateIdsJson    String   @default("[]") // scored candidate EstimateLine IDs (for AMBIGUOUS)
+  confirmedById       String?
+  confirmedAt         DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  boqItem             BoqItem      @relation(fields: [boqItemId], references: [id])
+  estimateLine        EstimateLine? @relation(fields: [estimateLineId], references: [id])
+
+  @@index([estimateLineId])
 }

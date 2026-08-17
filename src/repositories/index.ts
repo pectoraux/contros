@@ -1345,3 +1345,12 @@ export { scopeWorkspaceRepository } from './scope-workspace-repository'
 
 // ─── Bid Readiness Repository ───────────────────────────────────────────────
 export { bidReadinessRepository } from './bid-readiness-repository'
+
+// ─── BOQ Repositories (BOQ Phase 1) ─────────────────────────────────────────
+//
+// Tenant-aware persistence for BoqImport / BoqItem / BoqBinding.
+// BoqImport is the org-owned root; BoqItem and BoqBinding are reached via it,
+// so cross-tenant access is impossible. No business logic here — only
+// persistence. Normalization/matching/reconciliation live in src/lib/boq.
+
+export { boqImportRepository, boqItemRepository, boqBindingRepository } from './boq-repositories'
