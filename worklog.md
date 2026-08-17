@@ -2347,3 +2347,43 @@ NEXT STAGE (scoped, awaiting go-ahead — NOT started):
   BOQ = projection), 3 (provenance), 5 (imports cannot silently commit a
   price), 9 (XLSX = working copy, not canonical state).
 - Followed by: Deterministic Schedule Engine -> apps/plan -> MS Project clone.
+
+---
+Task ID: browser-e2e-verify
+Agent: principal-engineer
+Task: Browser E2E verification of the Phase 1 core flow against Neon PostgreSQL.
+
+Method:
+- Dev server started with explicit DATABASE_URL=Neon postgres URL (overriding
+  the sandbox shell's SQLite DATABASE_URL, which Next.js would otherwise honor
+  over .env — same root cause as the test loader fix).
+- Agent Browser used for end-to-end interaction (single Bash call per flow to
+  keep the server alive across the sandbox process-lifecycle limit).
+
+Verified core flow (the golden path the user specified):
+1. Login .................. ✅ Clicked "Director Kwesi" demo login → JWT session
+                              established, dashboard rendered.
+2. Dashboard .............. ✅ GET /api/dashboard → 200 (real KPIs from Neon:
+                              open opportunities, bids due, alerts).
+3. Opportunities .......... ✅ GET /api/opportunities → 200. Real list from Neon:
+                              "Two-Storey Classroom Block — AMA Basic School"
+                              (Estimating, GHS 183,152.62, 2 blocked) and
+                              "Office Complex — Zenith Properties" (Won).
+4. Office Complex ......... ✅ Clicked the row → workspace loaded.
+                              GET /api/opportunities/opp-office → 200.
+5. Bid Readiness .......... ✅ GET /api/opportunities/opp-office/readiness → 200.
+6. Workspace tabs ......... ✅ Body text confirms: "Scope · Estimate · BOQ ·
+                              Programme · Tender Pack" — all tabs present.
+7. Console errors ......... ✅ None. No 500s, no exceptions, no hydration errors.
+8. Domain invariants ...... ✅ Visible in UI: "Estimate is canonical. BOQ is a
+                              projection. AI never commits prices."
+
+Minor cosmetic note (NOT a freeze blocker):
+- The workspace footer shows "SQLite working replica · GHS". This is a stale
+  label from the pre-Neon era. The actual database is Neon PostgreSQL (all data
+  is fetched from Neon). This label should be updated in a future cosmetic pass.
+
+Conclusion:
+- The browser E2E golden path is VERIFIED against Neon PostgreSQL.
+- Combined with the 261 tests verified passing (147 unit + 114 integration, 0
+  failures), Phase 1 is now fully verified: code + tests + deployment + browser.
