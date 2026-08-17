@@ -4184,3 +4184,60 @@ NEXT (per reviewer's sequence):
 - Only then migrate the schema.
 - Do NOT start: Gantt chart, drag-and-drop dates, critical-path UI,
   resource histogram, calendars, resources.
+
+---
+Task ID: programme-contract-corrections
+Agent: principal-engineer
+Task: Fix two contract issues before schema migration — canonical serialization + finite-number validation. Add snapshot content hash. Extract shared canonical-JSON primitive. No frozen code touched.
+
+V1 — Canonical/stable snapshot serialization.
+- Extracted stableJsonStringify + computeContentDigest from the BOQ domain into
+  a shared module: src/lib/canonical-json.ts. Both domains now use the SAME
+  canonical serializer — no second serialization rule.
+- serializeSnapshot() now uses stableJsonStringify (sorted keys at every depth)
+  instead of plain JSON.stringify. Same logical content → same canonical JSON
+  regardless of object construction order.
+- The BOQ projection.ts was updated to import from the shared module (removed
+  its duplicate stableJsonStringify).
+- Tests: canonical serialization is order-independent (two snapshots with
+  different property insertion order produce the same JSON).
+
+V2 — Finite-number validation.
+- validateProgrammeSnapshot() now rejects NaN, Infinity, -Infinity for both
+  duration and lag. The schedule engine defensively converts these to zero,
+  which is appropriate for a pure calculation engine — but a finalized
+  ProgrammeSnapshot is persisted schedule truth and must never contain
+  non-finite values.
+- duration: must be Number.isFinite + >= 0.
+- lag: must be Number.isFinite (negative allowed — represents a lead).
+- Tests: NaN/Infinity/-Infinity rejected for both duration and lag; negative
+  lag allowed; zero duration allowed.
+
+V3 — Snapshot content hash.
+- computeSnapshotContentHash(snapshot) → SHA-256 of the canonical JSON (64 hex).
+  Mirrors the BoqProjection's sourceContentHash pattern.
+- This should be persisted as ProgrammeRevision.snapshotContentHash so the
+  revision's content identity is directly inspectable without parsing the
+  snapshot JSON.
+- Tests: deterministic (same snapshot → same hash); different content →
+  different hash; correct format (64 hex chars).
+
+SHARED MODULE (src/lib/canonical-json.ts):
+- stableJsonStringify(value): sorted keys at every depth, arrays preserve order.
+- computeContentDigest(value): SHA-256 of the canonical JSON.
+- Used by: BOQ projection (contentHash), Programme snapshot (serialize +
+  contentHash). Single canonical serialization rule across both domains.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 289 pass / 0 fail (+10 V1/V2/V3 tests;
+  0 regressions — the BOQ projection tests still pass with the shared module)
+- Frozen Phase 1 code ................. UNTOUCHED
+
+NEXT (per reviewer's sequence):
+1. ✅ Fix stable serialization (DONE)
+2. ✅ Add finite-number validation (DONE)
+3. Validate relationships against existing models (EstimateRevision,
+   ProjectActual, Bid, WDV, Scope) — NEXT
+4. Finalize the Prisma design
+5. Only then migrate

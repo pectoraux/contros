@@ -20,11 +20,13 @@ import {
   deserializeSnapshot,
   replaySchedule,
   schedulesMatch,
+  computeSnapshotContentHash,
   CURRENT_SCHEDULE_ENGINE_VERSION,
   type ProgrammeSnapshot,
   type ProgrammeActivity,
   type ActivityDependency,
 } from '../../src/lib/programme'
+import { stableJsonStringify } from '../../src/lib/canonical-json'
 import { computeSchedule } from '../../src/lib/engines/schedule-engine'
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -243,10 +245,83 @@ describe('Programme — validation', () => {
     expect(result.ok).toBe(false)
     expect(result.errors.some((e) => e.includes('self-referencing'))).toBe(true)
   })
+
+  test('V2: NaN duration is rejected', () => {
+    const snapshot = makeSnapshot({
+      activities: [makeActivity({ id: 'a', duration: NaN })],
+    })
+    const result = validateProgrammeSnapshot(snapshot)
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((e) => e.includes('non-finite duration'))).toBe(true)
+  })
+
+  test('V2: Infinity duration is rejected', () => {
+    const snapshot = makeSnapshot({
+      activities: [makeActivity({ id: 'a', duration: Infinity })],
+    })
+    const result = validateProgrammeSnapshot(snapshot)
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((e) => e.includes('non-finite duration'))).toBe(true)
+  })
+
+  test('V2: -Infinity duration is rejected', () => {
+    const snapshot = makeSnapshot({
+      activities: [makeActivity({ id: 'a', duration: -Infinity })],
+    })
+    const result = validateProgrammeSnapshot(snapshot)
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((e) => e.includes('non-finite'))).toBe(true)
+  })
+
+  test('V2: NaN lag is rejected', () => {
+    const snapshot = makeSnapshot({
+      activities: [
+        makeActivity({ id: 'a', duration: 5 }),
+        makeActivity({ id: 'b', duration: 3 }),
+      ],
+      dependencies: [makeDependency({ lag: NaN })],
+    })
+    const result = validateProgrammeSnapshot(snapshot)
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((e) => e.includes('non-finite lag'))).toBe(true)
+  })
+
+  test('V2: Infinity lag is rejected', () => {
+    const snapshot = makeSnapshot({
+      activities: [
+        makeActivity({ id: 'a', duration: 5 }),
+        makeActivity({ id: 'b', duration: 3 }),
+      ],
+      dependencies: [makeDependency({ lag: Infinity })],
+    })
+    const result = validateProgrammeSnapshot(snapshot)
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((e) => e.includes('non-finite lag'))).toBe(true)
+  })
+
+  test('V2: negative lag is ALLOWED (it represents a lead)', () => {
+    const snapshot = makeSnapshot({
+      activities: [
+        makeActivity({ id: 'a', duration: 5 }),
+        makeActivity({ id: 'b', duration: 3 }),
+      ],
+      dependencies: [makeDependency({ predecessorActivityId: 'a', successorActivityId: 'b', lag: -2 })], // negative = lead, valid
+    })
+    const result = validateProgrammeSnapshot(snapshot)
+    expect(result.ok).toBe(true)
+  })
+
+  test('V2: zero duration is allowed', () => {
+    const snapshot = makeSnapshot({
+      activities: [makeActivity({ id: 'a', duration: 0 })],
+    })
+    const result = validateProgrammeSnapshot(snapshot)
+    expect(result.ok).toBe(true)
+  })
 })
 
 describe('Programme — serialization', () => {
-  test('snapshot → JSON → snapshot round-trips faithfully', () => {
+  test('snapshot → JSON → snapshot round-trips faithfully (canonical serialization)', () => {
     const snapshot = makeSnapshot({
       activities: [
         makeActivity({ id: 'a', duration: 5, plannedQuantity: 100 }),
@@ -256,11 +331,50 @@ describe('Programme — serialization', () => {
     })
     const json = serializeSnapshot(snapshot)
     const restored = deserializeSnapshot(json)
-    expect(JSON.stringify(restored)).toBe(JSON.stringify(snapshot))
+    // V1: canonical JSON uses sorted keys, so JSON.stringify(restored) may differ
+    // from JSON.stringify(snapshot) in key order. Compare structurally instead.
+    expect(stableJsonStringify(restored)).toBe(stableJsonStringify(snapshot))
     expect(restored.activities).toHaveLength(2)
     expect(restored.dependencies).toHaveLength(1)
     expect(restored.activities[0].plannedQuantity).toBe(100)
     expect(restored.activities[1].plannedQuantity).toBeNull()
+  })
+
+  test('V1: canonical serialization is order-independent (same logical content → same JSON)', () => {
+    // Two snapshots with the same logical content but different property
+    // insertion order must produce the same canonical JSON.
+    const snap1 = makeSnapshot({
+      activities: [makeActivity({ id: 'a', duration: 5, plannedQuantity: 100 })],
+      dependencies: [],
+    })
+    // Construct a logically identical snapshot with different insertion order.
+    const snap2: ProgrammeSnapshot = {
+      finalizedAt: snap1.finalizedAt,
+      dependencies: snap1.dependencies,
+      activities: snap1.activities,
+      scheduleEngineVersion: snap1.scheduleEngineVersion,
+      revisionNo: snap1.revisionNo,
+      programmeName: snap1.programmeName,
+      programmeId: snap1.programmeId,
+    }
+    expect(serializeSnapshot(snap1)).toBe(serializeSnapshot(snap2))
+  })
+
+  test('V3: computeSnapshotContentHash is deterministic (SHA-256, 64 hex chars)', () => {
+    const snapshot = makeSnapshot({
+      activities: [makeActivity({ id: 'a', duration: 5 })],
+    })
+    const hash1 = computeSnapshotContentHash(snapshot)
+    const hash2 = computeSnapshotContentHash(snapshot)
+    expect(hash1).toBe(hash2)
+    expect(hash1).toHaveLength(64) // SHA-256 hex
+    expect(hash1).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  test('V3: different snapshot content → different content hash', () => {
+    const snap1 = makeSnapshot({ activities: [makeActivity({ id: 'a', duration: 5 })] })
+    const snap2 = makeSnapshot({ activities: [makeActivity({ id: 'a', duration: 10 })] })
+    expect(computeSnapshotContentHash(snap1)).not.toBe(computeSnapshotContentHash(snap2))
   })
 
   test('invalid JSON throws', () => {

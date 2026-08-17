@@ -41,6 +41,7 @@ import {
   type LineSnapshot,
 } from '@/lib/engines/revision-service'
 import { createHash } from 'node:crypto'
+import { stableJsonStringify } from '@/lib/canonical-json'
 import type {
   BoqProjection,
   BoqProjectionRow,
@@ -99,19 +100,6 @@ function computeContentHash(
   const json = stableJsonStringify(payload)
   // SHA-256 over the stable JSON. node:crypto is a runtime standard; no deps.
   return createHash('sha256').update(json, 'utf8').digest('hex')
-}
-
-/** Deterministic JSON stringify: object keys sorted lexicographically at every depth. */
-function stableJsonStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value)
-  }
-  if (Array.isArray(value)) {
-    return '[' + value.map(stableJsonStringify).join(',') + ']'
-  }
-  const obj = value as Record<string, unknown>
-  const keys = Object.keys(obj).sort()
-  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableJsonStringify(obj[k])).join(',') + '}'
 }
 
 /** Project a WorkDefinition from the snapshot's WDV (or null). */

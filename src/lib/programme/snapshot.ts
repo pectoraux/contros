@@ -7,9 +7,22 @@
  *
  * ARCHITECTURE:
  *   validateProgrammeSnapshot(snapshot) → validation result
- *   serializeSnapshot(snapshot) → JSON string (for ProgrammeRevision.snapshotJson)
+ *   serializeSnapshot(snapshot) → canonical JSON (stable key order)
+ *   computeSnapshotContentHash(snapshot) → SHA-256 digest
  *   deserializeSnapshot(json) → ProgrammeSnapshot
  *   replaySchedule(snapshot) → ScheduleResult (deterministic CPM)
+ *
+ * V1: Uses the shared canonical JSON serializer (stableJsonStringify) from
+ * @/lib/canonical-json — the same primitive used by the BOQ domain. No second
+ * serialization rule.
+ *
+ * V2: Validates finite numeric values. duration must be finite + >= 0; lag
+ * must be finite (negative allowed = leads). NaN/Infinity are rejected —
+ * they must never enter persisted schedule truth.
+ *
+ * V3: The snapshot content hash (SHA-256 of the canonical JSON) provides
+ * content-addressing for the immutable ProgrammeRevision, mirroring the
+ * EstimateRevision/BoqProjection pattern.
  *
  * The replay guarantee mirrors EstimateRevision:
  *   same ProgrammeSnapshot + same schedule-engine version
@@ -17,6 +30,7 @@
  */
 
 import { computeSchedule, type ScheduleActivity, type ScheduleResult } from '@/lib/engines/schedule-engine'
+import { stableJsonStringify, computeContentDigest } from '@/lib/canonical-json'
 import type {
   ActivityDependency,
   ProgrammeActivity,
@@ -33,8 +47,15 @@ import type {
  *   - duplicate activity IDs
  *   - dangling dependency references (predecessor/successor IDs not in activities)
  *   - dependency cycles (via the schedule engine's cycle detection)
+ *   - V2: non-finite durations (NaN, Infinity, -Infinity)
+ *   - V2: non-finite lag values (NaN, Infinity, -Infinity)
  *   - negative durations (allowed = 0, but negative is invalid)
  *   - self-referencing dependencies (an activity depending on itself)
+ *
+ * V2: the schedule engine defensively converts invalid values to zero, which
+ * is appropriate for a pure calculation engine. But a finalized ProgrammeSnapshot
+ * is persisted schedule truth — NaN/Infinity must never be accepted. The
+ * contract requires: duration = finite + >= 0; lag = finite (negative allowed).
  *
  * Returns { ok, errors, duplicateActivityIds, danglingDependencyRefs, hasCycle }.
  */
@@ -57,10 +78,19 @@ export function validateProgrammeSnapshot(
     errors.push(`Duplicate activity IDs: ${duplicateActivityIds.join(', ')}`)
   }
 
-  // Check for negative durations.
+  // V2: Check for non-finite or negative durations.
   for (const activity of snapshot.activities) {
-    if (activity.duration < 0) {
+    if (!Number.isFinite(activity.duration)) {
+      errors.push(`Activity "${activity.id}" has non-finite duration: ${activity.duration}`)
+    } else if (activity.duration < 0) {
       errors.push(`Activity "${activity.id}" has negative duration: ${activity.duration}`)
+    }
+  }
+
+  // V2: Check for non-finite lag values (negative is allowed — it's a lead).
+  for (const dep of snapshot.dependencies) {
+    if (!Number.isFinite(dep.lag)) {
+      errors.push(`Dependency "${dep.id}" has non-finite lag: ${dep.lag}`)
     }
   }
 
@@ -105,14 +135,20 @@ export function validateProgrammeSnapshot(
   }
 }
 
-// ─── Serialization ──────────────────────────────────────────────────────────
+// ─── Serialization (V1: canonical/stable JSON) ──────────────────────────────
 
 /**
- * Serialize a ProgrammeSnapshot to JSON for storage in
- * ProgrammeRevision.snapshotJson. Deterministic: same snapshot → same JSON.
+ * Serialize a ProgrammeSnapshot to canonical JSON for storage in
+ * ProgrammeRevision.snapshotJson.
+ *
+ * V1: Uses the shared stableJsonStringify (sorted keys at every depth) — the
+ * same primitive used by the BOQ domain. This ensures:
+ *   same logical ProgrammeSnapshot → same canonical JSON → same content hash
+ * regardless of how a caller constructed the object. The historical identity
+ * of a ProgrammeRevision does not depend on object property insertion order.
  */
 export function serializeSnapshot(snapshot: ProgrammeSnapshot): string {
-  return JSON.stringify(snapshot)
+  return stableJsonStringify(snapshot)
 }
 
 /**
@@ -128,6 +164,25 @@ export function deserializeSnapshot(json: string): ProgrammeSnapshot {
     throw new Error('Invalid ProgrammeSnapshot: missing dependencies array')
   }
   return parsed
+}
+
+// ─── Content hash (V3: SHA-256 of canonical JSON) ───────────────────────────
+
+/**
+ * Compute a SHA-256 content digest of a ProgrammeSnapshot.
+ *
+ * V3: mirrors the BoqProjection's sourceContentHash pattern. The digest is
+ * over the canonical JSON (sorted keys), so it is independent of object
+ * construction order. This provides content-addressing for the immutable
+ * ProgrammeRevision:
+ *   same snapshot → same content hash → same historical schedule identity
+ *
+ * This should be persisted as ProgrammeRevision.snapshotContentHash so the
+ * revision's content identity is directly inspectable without parsing the
+ * snapshot JSON.
+ */
+export function computeSnapshotContentHash(snapshot: ProgrammeSnapshot): string {
+  return computeContentDigest(snapshot)
 }
 
 // ─── Schedule replay (deterministic CPM) ────────────────────────────────────
