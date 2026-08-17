@@ -20,6 +20,13 @@ export interface RawBoqRow {
   unit: unknown
   rate: unknown
   amount: unknown
+  /**
+   * H4: the EXACT original cell representation for audit-grade fidelity.
+   * A map of column → { value: <original>, formatted?: <display>, formula?: <formula> }.
+   * Preserves "0012" vs 12 vs "12.00" vs formula cells. If the parser does
+   * not supply this, it falls back to deriving it from the semantic fields.
+   */
+  cells?: Record<string, { value: unknown; formatted?: string; formula?: string }>
 }
 
 export interface NormalizedBoqItem {
@@ -31,6 +38,8 @@ export interface NormalizedBoqItem {
   rawUnit: string | null
   rawRate: number | null
   rawAmount: number | null
+  /** H4: verbatim cell-level representation serialized as JSON. */
+  rawCellJson: string
   normalizedDescription: string | null
   normalizedCode: string | null
   normalizedUnit: string | null
@@ -129,9 +138,34 @@ export function normalizeCode(value: unknown): string | null {
 }
 
 /**
+ * Build the verbatim cell-level JSON. If the parser supplied a `cells` map
+ * (the preferred, audit-grade path), use it verbatim. Otherwise, derive a
+ * best-effort cell map from the semantic fields so rawCellJson is never empty.
+ */
+function buildRawCellJson(row: RawBoqRow): string {
+  if (row.cells && Object.keys(row.cells).length > 0) {
+    return JSON.stringify(row.cells)
+  }
+  // Fallback: derive from semantic fields. This still preserves the original
+  // value type (number vs string) for audit, just not formula/formatted info.
+  const cells: Record<string, { value: unknown }> = {}
+  if (row.description !== undefined && row.description !== null)
+    cells['description'] = { value: row.description }
+  if (row.code !== undefined && row.code !== null) cells['code'] = { value: row.code }
+  if (row.quantity !== undefined && row.quantity !== null)
+    cells['quantity'] = { value: row.quantity }
+  if (row.unit !== undefined && row.unit !== null) cells['unit'] = { value: row.unit }
+  if (row.rate !== undefined && row.rate !== null) cells['rate'] = { value: row.rate }
+  if (row.amount !== undefined && row.amount !== null)
+    cells['amount'] = { value: row.amount }
+  return JSON.stringify(cells)
+}
+
+/**
  * Normalize one raw spreadsheet row into a NormalizedBoqItem.
  * The raw* fields are preserved verbatim (as strings/numbers); the
  * normalized* fields are the deterministic derivations.
+ * rawCellJson (H4) preserves the EXACT original cell representation.
  */
 export function normalizeRow(row: RawBoqRow): NormalizedBoqItem {
   const rawDescription =
@@ -147,6 +181,7 @@ export function normalizeRow(row: RawBoqRow): NormalizedBoqItem {
     rawUnit: row.unit === null || row.unit === undefined ? null : String(row.unit),
     rawRate: parseNumber(row.rate),
     rawAmount: parseNumber(row.amount),
+    rawCellJson: buildRawCellJson(row),
     normalizedDescription: normalizeDescription(row.description),
     normalizedCode: normalizeCode(row.code),
     normalizedUnit: normalizeUnit(row.unit),

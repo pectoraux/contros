@@ -1353,4 +1353,4 @@ export { bidReadinessRepository } from './bid-readiness-repository'
 // so cross-tenant access is impossible. No business logic here — only
 // persistence. Normalization/matching/reconciliation live in src/lib/boq.
 
-export { boqImportRepository, boqItemRepository, boqBindingRepository } from './boq-repositories'
+export { boqImportRepository, boqItemRepository, boqBindingRepository, canonicalLineRepository } from './boq-repositories'

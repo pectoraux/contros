@@ -15,24 +15,23 @@
  */
 
 import type { RequestContext } from '@/lib/context'
-import { auditLogRepository, boqBindingRepository, boqItemRepository } from '@/repositories'
+import { auditLogRepository, boqBindingRepository, boqItemRepository, canonicalLineRepository } from '@/repositories'
 import {
   generateCandidates,
   suggestBindingStatus,
   type BindingCandidate,
   type BoqItemForMatch,
-  type CanonicalLineForMatch,
   type MatchMethod,
 } from '@/lib/boq'
-import { db } from '@/lib/db'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface SuggestBindingsInput {
   ctx: RequestContext
   importId: string
-  /** Canonical lines to match against (typically an opportunity's estimate lines). */
-  canonicalLines: CanonicalLineForMatch[]
+  // H1 hardening: canonical lines are loaded AUTHORITATIVELY by the service
+  // (tenant + opportunity scoped), NOT supplied by the caller. A caller can no
+  // longer inject arbitrary "canonical" projections into the matcher.
 }
 
 export interface SuggestBindingsResult {
@@ -66,19 +65,24 @@ export interface RejectBindingInput {
 export const boqBindingService = {
   /**
    * Generate binding suggestions for every item in an import, against the
-   * provided canonical lines. Does NOT persist bindings — only suggests.
-   * The caller (UI/human) reviews and confirms.
+   * canonical EstimateLines for the import's opportunity. Does NOT persist
+   * bindings — only suggests. The caller (UI/human) reviews and confirms.
    *
-   * This is the only place candidates are generated. It's deterministic.
+   * H1 hardening: the canonical lines are loaded AUTHORITATIVELY here (tenant +
+   * opportunity scoped via canonicalLineRepository), not supplied by the caller.
+   * A caller cannot inject arbitrary "canonical" projections into the matcher.
    */
   async suggestBindings(
     input: SuggestBindingsInput,
   ): Promise<SuggestBindingsResult> {
-    const { ctx, importId, canonicalLines } = input
-    const items = await boqItemRepository.listForImport(
-      ctx.organizationId,
-      importId,
-    )
+    const { ctx, importId } = input
+    const [items, canonicalLines] = await Promise.all([
+      boqItemRepository.listForImport(ctx.organizationId, importId),
+      canonicalLineRepository.listForImportOpportunity(
+        ctx.organizationId,
+        importId,
+      ),
+    ])
     const suggestions = items.map((item) => {
       const forMatch: BoqItemForMatch = {
         boqItemId: item.id,

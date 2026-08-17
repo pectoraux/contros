@@ -20,14 +20,13 @@
  */
 
 import type { RequestContext } from '@/lib/context'
-import { boqBindingRepository, boqItemRepository } from '@/repositories'
+import { boqBindingRepository, boqItemRepository, canonicalLineRepository } from '@/repositories'
 import {
   reconcile,
   summarizeResults,
   type EstimateLineForReconcile,
   type ReconciliationResult,
 } from '@/lib/boq'
-import { db } from '@/lib/db'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -49,9 +48,10 @@ export const boqReconciliationService = {
   /**
    * Reconcile every item in an import against its bound EstimateLine.
    *
-   * Loads items + bindings (tenant-scoped), fetches the bound EstimateLines
-   * (tenant-scoped, verified via the estimate→organization chain), and runs
-   * the pure reconcile() function on each pair.
+   * H5 hardening: canonical lines are loaded via canonicalLineRepository
+   * (tenant + import-opportunity scoped), NOT via direct db.estimateLine calls.
+   * The application service no longer touches Prisma directly — it goes through
+   * the repository boundary, consistent with the rest of the architecture.
    *
    * The result is computed on demand — it is NOT persisted as authoritative
    * state. The caller may cache it, but the cache is disposable.
@@ -60,41 +60,22 @@ export const boqReconciliationService = {
     input: ReconcileImportInput,
   ): Promise<ReconcileImportResult> {
     const { ctx, importId } = input
-    const items = await boqItemRepository.listForImport(
-      ctx.organizationId,
-      importId,
-    )
-    const bindings = await boqBindingRepository.listForImport(
-      ctx.organizationId,
-      importId,
-    )
+    const [items, bindings, canonicalLines] = await Promise.all([
+      boqItemRepository.listForImport(ctx.organizationId, importId),
+      boqBindingRepository.listForImport(ctx.organizationId, importId),
+      canonicalLineRepository.listForImportOpportunity(
+        ctx.organizationId,
+        importId,
+      ),
+    ])
 
-    // Index bindings by boqItemId for O(1) lookup.
+    // Index bindings + canonical lines by ID for O(1) lookup.
     const bindingByItem = new Map(
       bindings.map((b) => [b.boqItemId, b] as const),
     )
-
-    // Collect the EstimateLine IDs we need to load (MATCHED bindings only).
-    const lineIds = bindings
-      .filter((b) => b.status === 'MATCHED' && b.estimateLineId)
-      .map((b) => b.estimateLineId!) as string[]
-
-    // Load canonical lines tenant-scoped (estimate.organizationId verified).
-    const lines = lineIds.length
-      ? await db.estimateLine.findMany({
-          where: {
-            id: { in: lineIds },
-            estimate: { organizationId: ctx.organizationId },
-          },
-          select: {
-            id: true,
-            quantity: true,
-            unit: true,
-            unitRate: true,
-          },
-        })
-      : []
-    const lineById = new Map(lines.map((l) => [l.id, l] as const))
+    const lineById = new Map(
+      canonicalLines.map((l) => [l.estimateLineId, l] as const),
+    )
 
     // Build the reconcile inputs and compute results (pure).
     const results: ReconciliationResult[] = items.map((item) => {
@@ -109,7 +90,7 @@ export const boqReconciliationService = {
         : undefined
       const lineForReconcile: EstimateLineForReconcile | null = line
         ? {
-            estimateLineId: line.id,
+            estimateLineId: line.estimateLineId,
             quantity: line.quantity,
             unit: line.unit,
             unitRate: line.unitRate,
@@ -155,24 +136,20 @@ export const boqReconciliationService = {
       | 'AMBIGUOUS'
       | 'UNMATCHED'
       | 'REJECTED'
-    let line: EstimateLineForReconcile | null = null
-    if (binding?.status === 'MATCHED' && binding.estimateLineId) {
-      const loaded = await db.estimateLine.findFirst({
-        where: {
-          id: binding.estimateLineId,
-          estimate: { organizationId: ctx.organizationId },
-        },
-        select: { id: true, quantity: true, unit: true, unitRate: true },
-      })
-      if (loaded) {
-        line = {
-          estimateLineId: loaded.id,
+    // H5: load the canonical line via the repository (opportunity-scoped),
+    // not via direct db.estimateLine calls.
+    const loaded = await canonicalLineRepository.getForBoqItem(
+      ctx.organizationId,
+      boqItemId,
+    )
+    const line: EstimateLineForReconcile | null = loaded
+      ? {
+          estimateLineId: loaded.estimateLineId,
           quantity: loaded.quantity,
           unit: loaded.unit,
           unitRate: loaded.unitRate,
         }
-      }
-    }
+      : null
     return reconcile({
       item: {
         boqItemId: item.id,

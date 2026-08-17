@@ -17,7 +17,7 @@
  * INVARIANT 9: the XLSX is a working copy, not canonical state.
  */
 
-import { dbTx } from '@/lib/db'
+import { dbTx, db } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
 import { auditLogRepository, boqImportRepository, boqItemRepository } from '@/repositories'
 import { normalizeRows, type RawBoqRow, type NormalizedBoqItem } from '@/lib/boq'
@@ -49,6 +49,17 @@ export interface CreateImportResult {
     fileHash: string
     fileName: string
   }
+  /**
+   * Prior imports of the same fileHash in this organization (H3: re-imports are
+   * permitted, but surfaced so the operator is aware). Empty array on first upload.
+   */
+  priorImportsOfSameHash: Array<{
+    id: string
+    fileName: string
+    status: string
+    opportunityId: string | null
+    createdAt: Date
+  }>
 }
 
 export interface ParseImportResult {
@@ -91,6 +102,7 @@ function toRepoItems(
     rawUnit: i.rawUnit,
     rawRate: i.rawRate,
     rawAmount: i.rawAmount,
+    rawCellJson: i.rawCellJson,
     normalizedDescription: i.normalizedDescription,
     normalizedCode: i.normalizedCode,
     normalizedUnit: i.normalizedUnit,
@@ -107,23 +119,93 @@ export const boqImportService = {
   /**
    * Create an import record (status: pending). The file must already be
    * stored at fileReference; this records its existence and hash.
+   *
+   * H2 hardening: validates the import↔opportunity↔document graph and tenant
+   * ownership BEFORE creating the record:
+   *   - if opportunityId is supplied, it must belong to ctx.organizationId.
+   *   - if documentId is supplied, it must belong to ctx.organizationId AND
+   *     to the supplied opportunityId, AND its kind must be 'boq'.
+   *   - opportunityId and documentId must be consistent (document.opportunityId
+   *     === opportunityId when both are supplied).
+   * Invalid references are rejected with 422, not silently stored.
    */
   async createImport(input: CreateImportInput): Promise<CreateImportResult> {
     const { ctx } = input
+    const opportunityId = input.opportunityId ?? null
+    const documentId = input.documentId ?? null
+
+    // Validate the opportunity reference (tenant-owned).
+    if (opportunityId) {
+      const opp = await db.opportunity.findFirst({
+        where: { id: opportunityId, organizationId: ctx.organizationId },
+        select: { id: true },
+      })
+      if (!opp) {
+        const err = new Error(
+          'Invalid opportunity: not found in this organization',
+        ) as Error & { status: number }
+        err.status = 422
+        throw err
+      }
+    }
+
+    // Validate the document reference (tenant-owned + opportunity-consistent + kind=boq).
+    if (documentId) {
+      const doc = await db.document.findFirst({
+        where: { id: documentId, organizationId: ctx.organizationId },
+        select: { id: true, opportunityId: true, kind: true },
+      })
+      if (!doc) {
+        const err = new Error(
+          'Invalid document: not found in this organization',
+        ) as Error & { status: number }
+        err.status = 422
+        throw err
+      }
+      if (doc.kind !== 'boq') {
+        const err = new Error(
+          `Invalid document: kind must be 'boq', got '${doc.kind}'`,
+        ) as Error & { status: number }
+        err.status = 422
+        throw err
+      }
+      if (opportunityId && doc.opportunityId !== opportunityId) {
+        const err = new Error(
+          'Invalid document: does not belong to the supplied opportunity',
+        ) as Error & { status: number }
+        err.status = 422
+        throw err
+      }
+      // If only documentId was supplied, infer the opportunityId from the doc.
+      if (!opportunityId && doc.opportunityId) {
+        input = { ...input, opportunityId: doc.opportunityId }
+      }
+    }
+
     const record = await boqImportRepository.create(ctx.organizationId, {
       opportunityId: input.opportunityId ?? null,
-      documentId: input.documentId ?? null,
+      documentId,
       fileReference: input.fileReference,
       fileName: input.fileName,
       fileHash: input.fileHash,
       source: input.source ?? 'client',
       createdById: ctx.userId,
     })
+    // H3: surface prior imports of the same hash (re-imports are permitted,
+    // but the operator must be aware). Returns the PRIOR imports (excludes this
+    // one), newest first.
+    const priorImports = await boqImportRepository.findPriorByHash(
+      ctx.organizationId,
+      input.fileHash,
+    )
+    const priorImportsExcludingThis = priorImports.filter(
+      (p) => p.id !== record.id,
+    )
     await auditLogRepository.create(ctx.organizationId, ctx.userId, {
       action: 'boq.import.created',
       entityType: 'BoqImport',
       entityId: record.id,
-      summary: `BOQ import created: ${input.fileName} (hash ${input.fileHash.substring(0, 12)}…)`,
+      summary: `BOQ import created: ${input.fileName} (hash ${input.fileHash.substring(0, 12)}…${priorImportsExcludingThis.length > 0 ? `, ${priorImportsExcludingThis.length} prior import(s) of same hash` : ''})`,
     })
     return {
       ok: true,
@@ -133,6 +215,7 @@ export const boqImportService = {
         fileHash: record.fileHash,
         fileName: record.fileName,
       },
+      priorImportsOfSameHash: priorImportsExcludingThis,
     }
   },
 

@@ -85,13 +85,18 @@ export interface BoqItemRecord {
   worksheet: string
   rowNumber: number
 
-  // Exactly what the spreadsheet said (audit-preserving).
+  // Semantic raw content (coerced for queryability — see rawCellJson for verbatim).
   rawDescription: string
   rawCode: string | null
   rawQuantity: number | null
   rawUnit: string | null
   rawRate: number | null
   rawAmount: number | null
+
+  // H4: the EXACT original cell representation, as a JSON object mapping
+  // column → { value: <original>, formatted?: <display string>, formula?: <formula string> }.
+  // Preserves "0012" vs 12 vs "12.00" vs formula cells — audit-grade fidelity.
+  rawCellJson: string
 
   // Our deterministic normalization (may be null if unparseable).
   normalizedDescription: string | null

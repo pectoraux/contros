@@ -173,3 +173,68 @@ describe('BOQ normalization — normalizeRow', () => {
     expect(rows[1].normalizedDescription).toBe('b')
   })
 })
+
+describe('BOQ normalization — rawCellJson (H4: verbatim cell-level preservation)', () => {
+  test('derives rawCellJson from semantic fields when cells not supplied', () => {
+    const row = normalizeRow({
+      worksheet: 'BOQ',
+      rowNumber: 1,
+      description: 'PVC Conduit',
+      code: 'WD-014',
+      quantity: '150',
+      unit: 'm',
+      rate: 'GHS 12',
+      amount: 1800,
+    })
+    expect(row.rawCellJson).toBeTruthy()
+    const cells = JSON.parse(row.rawCellJson)
+    // The value is the ORIGINAL (the string '150'), not the coerced Float 150.
+    expect(cells.quantity.value).toBe('150')
+    expect(cells.rate.value).toBe('GHS 12')
+    expect(cells.description.value).toBe('PVC Conduit')
+  })
+
+  test('preserves the parser-supplied cells map verbatim (audit-grade)', () => {
+    const row = normalizeRow({
+      worksheet: 'BOQ',
+      rowNumber: 2,
+      description: 'Steel',
+      code: null,
+      quantity: 12,
+      unit: 'ton',
+      rate: 900,
+      amount: 10800,
+      cells: {
+        quantity: { value: '0012', formatted: '0012.00', formula: '=A2*B2' },
+        rate: { value: 900, formatted: 'GHS 900.00' },
+      },
+    })
+    const cells = JSON.parse(row.rawCellJson)
+    // The parser-supplied cells are preserved verbatim — including the leading
+    // zeros, the formatted display string, and the formula. This is the
+    // audit-grade fidelity that the raw* numeric fields alone cannot provide.
+    expect(cells.quantity.value).toBe('0012')
+    expect(cells.quantity.formatted).toBe('0012.00')
+    expect(cells.quantity.formula).toBe('=A2*B2')
+    expect(cells.rate.formatted).toBe('GHS 900.00')
+    // The semantic rawQuantity is still the coerced Float (for queryability).
+    expect(row.rawQuantity).toBe(12)
+  })
+
+  test('rawCellJson is never empty when fields are present', () => {
+    const row = normalizeRow({
+      worksheet: 'S', rowNumber: 1, description: 'X', code: null,
+      quantity: 1, unit: 'm', rate: 10, amount: 10,
+    })
+    expect(row.rawCellJson).not.toBe('{}')
+    expect(JSON.parse(row.rawCellJson).quantity.value).toBe(1)
+  })
+
+  test('rawCellJson is empty object when no fields supplied', () => {
+    const row = normalizeRow({
+      worksheet: 'S', rowNumber: 1, description: null, code: null,
+      quantity: null, unit: null, rate: null, amount: null,
+    })
+    expect(row.rawCellJson).toBe('{}')
+  })
+})

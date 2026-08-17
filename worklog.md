@@ -2600,3 +2600,109 @@ Next milestones (NOT started):
 - STEP 9:  canonical → XLSX projection (consumes immutable EstimateRevision)
 - STEP 10: external XLSX import adapter (real XLSX parsing, injected into BoqImportService)
 - STEP 11: workspace UI
+
+---
+Task ID: boq-phase1-hardening
+Agent: principal-engineer
+Task: BOQ Phase 1 hardening — close the 6 architectural gaps found in review. Harden, not revert. No frozen Phase 1 code touched.
+
+GAPS CLOSED (per reviewer's P0/P1 findings):
+
+H1 — Binding service now loads canonical lines AUTHORITATIVELY.
+- SuggestBindingsInput no longer accepts a caller-supplied `canonicalLines` array.
+- BoqBindingService.suggestBindings loads canonical lines via the new
+  canonicalLineRepository.listForImportOpportunity() (tenant + opportunity scoped).
+- confirmBinding (via boqBindingRepository.upsert) now verifies the EstimateLine
+  belongs to the SAME opportunity as the import — not just the same org.
+  Same-org cross-opportunity binding (a domain-identity violation) is now rejected.
+- New integration tests: H7 cross-opportunity wrong-line binding rejected;
+  H7 suggestBindings never suggests lines from a different opportunity.
+
+H2 — Import↔opportunity↔document graph validated at create time.
+- BoqImportService.createImport now verifies, BEFORE creating the record:
+  * opportunityId belongs to ctx.organizationId (tenant-owned).
+  * documentId belongs to ctx.organizationId AND to the supplied opportunityId
+    (when both supplied) AND document.kind === 'boq'.
+  * If only documentId is supplied, opportunityId is inferred from the document.
+- Invalid references are rejected with 422, not silently stored.
+- New integration tests: H7 invalid opportunity (cross-tenant), wrong-kind
+  document, inconsistent document↔opportunity, and valid-document-inference.
+
+H3 — Duplicate-fileHash semantics decided and encoded.
+- Decision: multiple BoqImports with the same (organizationId, fileHash) ARE
+  permitted (a contractor may legitimately re-import the same workbook in
+  different contexts). The index is NON-UNIQUE by design.
+- createImport now returns `priorImportsOfSameHash` so the operator is AWARE
+  of prior imports of the same hash (surfaces, does not block).
+- New repository method findPriorByHash returns ALL prior imports (not just
+  the most recent).
+- Schema comment documents the decision explicitly.
+
+H4 — Raw/verbatim cell-level contract resolved.
+- New `rawCellJson` field on BoqItem (schema + types + normalize + repo + service).
+- RawBoqRow.cells (optional) carries the parser-supplied verbatim cell map:
+  { column → { value, formatted?, formula? } }. Preserves "0012" vs "12.00"
+  vs formula cells vs locale-specific formatting — audit-grade fidelity.
+- If the parser does not supply `cells`, the normalizer derives a best-effort
+  cell map from the semantic fields (preserving the original VALUE TYPE —
+  string vs number — before Float coercion).
+- The semantic raw* numeric fields (rawQuantity, rawRate) remain Float for
+  queryability; rawCellJson preserves the exact original representation.
+- New unit tests (4) + integration test assert rawCellJson fidelity.
+
+H5 — Reconciliation's direct Prisma access moved behind the repository.
+- BoqReconciliationService no longer imports `db` or calls db.estimateLine.
+- All canonical-line loading goes through canonicalLineRepository
+  (listForImportOpportunity, getForBoqItem).
+- New H6 integration test: reconciliation service source has zero
+  `db.estimateLine.<method>` calls and zero `from '@/lib/db'` imports.
+- The canonicalLineRepository object itself is audited to contain only reads
+  (findFirst/findMany), never writes (create/update/upsert/delete).
+
+H6 — Architecture audits strengthened (runtime behavior, not just regex).
+- The reconciliation-service boundary is now audited by checking ACTUAL CALL
+  patterns (`db.estimateLine.find|create|update|...`) not the bare word
+  `db.estimateLine` (which appears in doc comments).
+- The canonicalLineRepository object is sliced precisely (start → next export)
+  and audited for write-method absence.
+- The "no BoqReconciliation persistence model" test checks the schema regex
+  AND the service source for any `boqReconciliationRepository` import/call.
+- RATE_DIVERGENT non-mutation is re-asserted at runtime (EstimateLine.unitRate
+  unchanged after reconciliation).
+
+H7 — New integration tests for domain-identity + reference integrity.
+- Cross-opportunity wrong-line binding rejected (same org, different opp).
+- suggestBindings never suggests lines from a different opportunity.
+- Invalid opportunity reference (cross-tenant) rejected.
+- Wrong-kind document (jha, not boq) rejected.
+- Inconsistent document↔opportunity rejected.
+- Valid boq document accepted + opportunity inferred.
+
+FILES MODIFIED (no frozen Phase 1 code):
+- src/lib/boq/types.ts          — BoqItemRecord.rawCellJson added.
+- src/lib/boq/normalize.ts     — RawBoqRow.cells + buildRawCellJson + rawCellJson.
+- src/repositories/boq-repositories.ts — canonicalLineRepository (new, read-only),
+  findPriorByHash, opportunity-scoped binding verification.
+- src/repositories/index.ts     — export canonicalLineRepository.
+- src/application/boq-binding-service.ts — authoritative canonical-line loading,
+  no caller-supplied lines.
+- src/application/boq-import-service.ts — import↔opp↔doc graph validation,
+  priorImportsOfSameHash surfacing.
+- src/application/boq-reconciliation-service.ts — repository-only canonical access.
+- prisma/schema.prisma         — BoqItem.rawCellJson column + H3 semantics comment.
+- tests/unit/boq-normalize.test.ts — +4 rawCellJson tests.
+- tests/integration/boq-service.test.ts — +9 H6/H7 tests, existing tests updated.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 189 pass / 0 fail (was 185; +4 rawCellJson; 0 regressions)
+- BOQ integration tests (Neon) ........ 23 pass / 0 fail / 78 expect()
+  (was 14; +9 H6/H7 hardening tests — all green against PostgreSQL)
+- Neon schema ........................ BoqItem.rawCellJson column added (db:push)
+- Frozen Phase 1 code ................. UNTOUCHED (no estimate/bid/opportunity/pricing changes)
+
+The core commercial invariant remains intact: no BOQ pathway writes imported
+rates into EstimateLine, and reconciliation remains non-authoritative. The
+application boundary is now authoritative: canonical lines are loaded by the
+service (not the caller), the import↔opp↔doc graph is validated, and the
+reconciliation service goes through the repository boundary.

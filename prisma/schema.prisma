@@ -745,6 +745,17 @@ model DocumentVersion {
 
 // One uploaded external workbook. `fileHash` makes the same client workbook
 // identifiable across re-uploads even if the filename changes (audit req).
+//
+// DUPLICATE-HASH SEMANTICS (H3 decision): multiple BoqImports with the same
+// (organizationId, fileHash) ARE permitted. A contractor may legitimately
+// re-import the same workbook content in different contexts (different
+// opportunities, or a re-parse after a format fix). The index is NON-UNIQUE
+// by design — it supports lookup/detection, not a uniqueness invariant. The
+// application service surfaces prior imports of the same hash via
+// findPriorImportsByHash so the operator is AWARE of the re-upload, but it
+// does not block it. If a future product decision requires uniqueness, add
+// @@unique([organizationId, fileHash]) — but that would prevent legitimate
+// re-imports, so it is deliberately not enforced here.
 model BoqImport {
   id              String   @id @default(cuid())
   organizationId  String
@@ -752,7 +763,7 @@ model BoqImport {
   documentId      String?
   fileReference   String   // storage path / key for the uploaded file
   fileName        String
-  fileHash        String   // sha256 of file contents — re-upload detection
+  fileHash        String   // sha256 of file contents — re-upload detection (NON-UNIQUE; see semantics above)
   status          String   @default("pending") // pending | parsed | failed
   source          String   @default("client") // client | consultant | tender-portal | internal | other
   createdAt       DateTime @default(now())
@@ -766,7 +777,12 @@ model BoqImport {
 }
 
 // A single row parsed from an external workbook — an OBSERVATION.
-// raw* fields preserve EXACTLY what the spreadsheet said (audit-preserving).
+// raw* fields preserve the spreadsheet's SEMANTIC content (description/code
+// as strings, numeric values coerced to Float for queryability).
+// rawCellJson preserves the EXACT original cell representation (the literal
+// string/value the spreadsheet held BEFORE any coercion) so the original
+// observation can always be reconstructed for audit — e.g. "0012" vs "12.00",
+// formula cells, formatted currency strings, locale-specific formatting.
 // normalized* fields are our deterministic normalization.
 // This row NEVER carries canonical commercial truth.
 model BoqItem {
@@ -775,13 +791,18 @@ model BoqItem {
   worksheet           String
   rowNumber           Int
 
-  // Exactly what the spreadsheet said.
+  // Semantic raw content (coerced for queryability — see rawCellJson for verbatim).
   rawDescription      String
   rawCode             String?
   rawQuantity         Float?
   rawUnit             String?
   rawRate             Float?
   rawAmount           Float?
+
+  // H4: the EXACT original cell representation, as a JSON object mapping
+  // column → { value: <original>, formatted: <display string?>, formula: <formula string?> }.
+  // Preserves "0012" vs 12 vs "12.00" vs formula cells — audit-grade fidelity.
+  rawCellJson         String   @default("{}")
 
   // Our deterministic normalization (may be null if unparseable).
   normalizedDescription String?
