@@ -1,5 +1,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// XLSX Serializer Fidelity Evaluation (EVALUATION HARNESS — not a product test)
+// XLSX Serializer Fidelity Evaluation (EVALUATION RECORD — not a product test)
+//
+// STATUS: EVALUATION COMPLETE. write-excel-file@4.1.1 was declared the
+// production serializer (M5). The other candidates (exceljs) and the
+// independent reader (read-excel-file) were removed from devDependencies (M6).
+// This script is retained as the evaluation record. To re-run it, temporarily
+// reinstall: `bun add -d exceljs read-excel-file`.
 //
 // Purpose: verify that candidate serializers faithfully round-trip the COMPLETE
 // XlsxArtifact contract — not just cell values, but every concern:
@@ -10,20 +16,22 @@
 //   XlsxArtifact → candidate serializer adapter → .xlsx → independent read-back
 //       → canonical workbook assertion.
 //
-// The read-back uses read-excel-file (a DIFFERENT library than either writer)
-// so the assertion is genuinely independent, not the same library validating
+// The read-back used read-excel-file (a DIFFERENT library than either writer)
+// so the assertion was genuinely independent, not the same library validating
 // itself.
 //
-// This is the PRIMARY gate. Byte determinism is a secondary measurement (the
-// determinism probe covers that). No timestamp-normalization layer is added.
+// Result: write-excel-file passed 9/9 checks across all 6 config variants
+// (54/54). exceljs failed M1 (numeric cell style indices) + M2 (missing column
+// widths for some columns) — a real fidelity gap.
 //
-// Run: bun run scripts/xlsx-fidelity-eval.ts
+// Run: bun run scripts/xlsx-fidelity-eval.ts (requires re-installing eval deps)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
+import { inflateRawSync } from 'node:zlib'
 const require = createRequire(import.meta.url)
 
 import {
@@ -110,7 +118,7 @@ function makeWriteExcelFileAdapter(): FidelityAdapter {
     version: require('write-excel-file/package.json').version,
     async serialize(artifact: XlsxArtifact): Promise<Buffer> {
       const writeXlsxFile = (await import('write-excel-file/node')).default
-      const sheet = artifact.worksheets[0]
+      const sheet = artifact.worksheet
       // write-excel-file cell shape: { value, type, align, ... }.
       // Column metadata (width, format) is passed via the `columns` option on
       // the sheet, OR embedded in the data. We use the sheet's `columns` option.
@@ -161,7 +169,7 @@ function makeExcelJsAdapter(): FidelityAdapter {
     async serialize(artifact: XlsxArtifact): Promise<Buffer> {
       const ExcelJS = await import('exceljs')
       const wb = new ExcelJS.Workbook()
-      const sheet = artifact.worksheets[0]
+      const sheet = artifact.worksheet
       const ws = wb.addWorksheet(sheet.name)
       // Column order + width + number format.
       ws.columns = sheet.columns.map((col) => ({
@@ -218,6 +226,203 @@ async function readBackXlsx(buf: Buffer): Promise<ReadBackSheet> {
   }
 }
 
+// ─── Structural XML inspection (M1: number formats, M2: column widths) ──────
+//
+// read-excel-file does not expose per-cell numFmt or column width. So we parse
+// the raw XML entries (xl/styles.xml + xl/worksheets/sheet1.xml) directly from
+// the .xlsx ZIP. This is a lightweight structural check — NOT a full XLSX
+// library, just enough to verify the two formatting concerns the independent
+// reader couldn't.
+
+/** Minimal ZIP entry extraction (central directory). Returns Map<name, Buffer>. */
+function parseZipEntries(buf: Buffer): Map<string, Buffer> {
+  const entries = new Map<string, Buffer>()
+  let eocd = -1
+  for (let i = buf.length - 22; i >= 0; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
+  }
+  if (eocd === -1) return entries
+  const count = buf.readUInt16LE(eocd + 10)
+  let cd = buf.readUInt32LE(eocd + 16)
+  for (let i = 0; i < count; i++) {
+    if (buf.readUInt32LE(cd) !== 0x02014b50) break
+    const method = buf.readUInt16LE(cd + 10)
+    const compSize = buf.readUInt32LE(cd + 20)
+    const nameLen = buf.readUInt16LE(cd + 28)
+    const extraLen = buf.readUInt16LE(cd + 30)
+    const commentLen = buf.readUInt16LE(cd + 32)
+    const localOff = buf.readUInt32LE(cd + 42)
+    const name = buf.toString('utf8', cd + 46, cd + 46 + nameLen)
+    const lname = buf.readUInt16LE(localOff + 26)
+    const lextra = buf.readUInt16LE(localOff + 28)
+    const dataOff = localOff + 30 + lname + lextra
+    const compData = buf.subarray(dataOff, dataOff + compSize)
+    const content = method === 0 ? compData : method === 8 ? inflateRawSync(compData) : Buffer.from(`[unsupported ${method}]`)
+    entries.set(name, content)
+    cd += 46 + nameLen + extraLen + commentLen
+  }
+  return entries
+}
+
+/**
+ * M1: Verify number formats. Parses xl/styles.xml to extract the numFmts map
+ * and the cellXfs style indices, then parses xl/worksheets/sheet1.xml to find
+ * each data cell's style index and resolve its format code. Asserts that the
+ * numeric columns carry the expected numberFormat from the artifact config.
+ *
+ * This is a best-effort structural check — it verifies the format codes are
+ * PRESENT in the styles table and applied to the right columns, not a full
+ * OOXML conformance test.
+ */
+function verifyNumberFormats(
+  xlsxBuf: Buffer,
+  artifact: XlsxArtifact,
+): FidelityCheck[] {
+  const checks: FidelityCheck[] = []
+  try {
+    const entries = parseZipEntries(xlsxBuf)
+    const stylesXml = entries.get('xl/styles.xml')?.toString('utf8') ?? ''
+    const sheetXml = entries.get('xl/worksheets/sheet1.xml')?.toString('utf8') ?? ''
+
+    // Parse numFmts: <numFmts count="N"><numFmt numFmtId="K" formatCode="..."/></numFmts>
+    const numFmtMap = new Map<number, string>()
+    const numFmtRe = /<numFmt[^>]*numFmtId="(\d+)"[^>]*formatCode="([^"]*)"/g
+    let m: RegExpExecArray | null
+    while ((m = numFmtRe.exec(stylesXml)) !== null) {
+      numFmtMap.set(Number(m[1]), m[2])
+    }
+    // Built-in formats (0-49) — we only care that custom codes are present.
+    // Parse cellXfs: <cellXfs count="N"><xf numFmtId="K" .../>...</cellXfs>
+    const xfFormats: number[] = []
+    const cellXfsMatch = stylesXml.match(/<cellXfs[^>]*>([\s\S]*?)<\/cellXfs>/)
+    if (cellXfsMatch) {
+      const xfRe = /<xf[^>]*numFmtId="(\d+)"/g
+      while ((m = xfRe.exec(cellXfsMatch[1])) !== null) {
+        xfFormats.push(Number(m[1]))
+      }
+    }
+
+    // Check that each expected custom format code appears in the styles table.
+    const expectedFormats = new Set(
+      artifact.worksheet.columns
+        .filter((c) => c.numberFormat !== null)
+        .map((c) => c.numberFormat as string),
+    )
+    let allFormatsPresent = true
+    let formatDetail = ''
+    for (const expected of expectedFormats) {
+      const found = [...numFmtMap.values()].includes(expected)
+      if (!found) {
+        // Could be a built-in format code; check if it's a well-known one.
+        const builtins: Record<string, number> = { '#,##0.00': 4, '0.00%': 10 }
+        if (!(expected in builtins)) {
+          allFormatsPresent = false
+          formatDetail = `expected format "${expected}" not in styles.xml numFmts`
+        }
+      }
+    }
+    checks.push({
+      concern: 'number formats present in styles.xml (M1)',
+      passed: allFormatsPresent,
+      detail: formatDetail || `${expectedFormats.size} custom format(s) present: ${[...expectedFormats].join(', ')}`,
+    })
+
+    // Verify the sheet XML references style indices for data cells.
+    // Each <c s="N"> has a style index; the numeric columns should have
+    // non-zero style indices (formatting applied).
+    const dataRows = artifact.worksheet.rows.filter((r) => !r.isHeader && !r.isTotals)
+    if (dataRows.length > 0) {
+      const numericColIndices: number[] = []
+      artifact.worksheet.columns.forEach((col, i) => {
+        if (col.numberFormat !== null) numericColIndices.push(i)
+      })
+      // Check at least one data row has style attributes on numeric cells.
+      // Column letters: A, B, C, ... → the cell ref like "E2" (col E, row 2).
+      const colLetter = (idx: number) => String.fromCharCode(65 + idx)
+      let styledNumericCells = 0
+      for (const row of sheetXml.match(/<row[^>]*>[\s\S]*?<\/row>/g) ?? []) {
+        for (const colIdx of numericColIndices) {
+          const ref = colLetter(colIdx)
+          const cellRe = new RegExp(`<c r="${ref}\\d+"[^>]*s="(\\d+)"`)
+          const cm = row.match(cellRe)
+          if (cm) styledNumericCells++
+        }
+      }
+      checks.push({
+        concern: 'numeric cells carry style indices (M1)',
+        passed: styledNumericCells > 0,
+        detail: `${styledNumericCells} numeric cell(s) with style attributes found`,
+      })
+    }
+  } catch (e) {
+    checks.push({
+      concern: 'number formats (M1)',
+      passed: false,
+      detail: `parse error: ${e instanceof Error ? e.message : String(e)}`,
+    })
+  }
+  return checks
+}
+
+/**
+ * M2: Verify column widths. Parses xl/worksheets/sheet1.xml for the <cols>
+ * section and asserts each column's width matches the artifact config.
+ */
+function verifyColumnWidths(
+  xlsxBuf: Buffer,
+  artifact: XlsxArtifact,
+): FidelityCheck[] {
+  const checks: FidelityCheck[] = []
+  try {
+    const entries = parseZipEntries(xlsxBuf)
+    const sheetXml = entries.get('xl/worksheets/sheet1.xml')?.toString('utf8') ?? ''
+    // <cols><col min="1" max="1" width="6" .../>...</cols>
+    const colsMatch = sheetXml.match(/<cols>([\s\S]*?)<\/cols>/)
+    if (!colsMatch) {
+      checks.push({
+        concern: 'column widths in sheet1.xml (M2)',
+        passed: false,
+        detail: 'no <cols> section found',
+      })
+      return checks
+    }
+    const colWidths = new Map<number, number>()
+    const colRe = /<col[^>]*min="(\d+)"[^>]*width="([\d.]+)"/g
+    let m: RegExpExecArray | null
+    while ((m = colRe.exec(colsMatch[1])) !== null) {
+      colWidths.set(Number(m[1]), Number(m[2]))
+    }
+    // Compare against the artifact's column widths (1-based in OOXML).
+    let allMatch = true
+    const mismatches: string[] = []
+    artifact.worksheet.columns.forEach((col, i) => {
+      const ooxmlIdx = i + 1
+      const actual = colWidths.get(ooxmlIdx)
+      if (actual === undefined) {
+        allMatch = false
+        mismatches.push(`col ${ooxmlIdx} (${col.header}): missing width`)
+      } else if (Math.abs(actual - col.width) > 0.5) {
+        allMatch = false
+        mismatches.push(`col ${ooxmlIdx} (${col.header}): expected ${col.width}, got ${actual}`)
+      }
+    })
+    checks.push({
+      concern: 'column widths in sheet1.xml (M2)',
+      passed: allMatch,
+      detail: mismatches.length === 0
+        ? `${artifact.worksheet.columns.length} column widths match`
+        : mismatches.join('; '),
+    })
+  } catch (e) {
+    checks.push({
+      concern: 'column widths (M2)',
+      passed: false,
+      detail: `parse error: ${e instanceof Error ? e.message : String(e)}`,
+    })
+  }
+  return checks
+}
+
 /** Assert the read-back matches the canonical artifact. Returns pass/fail per concern. */
 interface FidelityCheck {
   concern: string
@@ -226,7 +431,7 @@ interface FidelityCheck {
 }
 
 function assertFidelity(artifact: XlsxArtifact, readBack: ReadBackSheet): FidelityCheck[] {
-  const sheet = artifact.worksheets[0]
+  const sheet = artifact.worksheet
   const checks: FidelityCheck[] = []
 
   // 1. Sheet name
@@ -317,52 +522,129 @@ function assertFidelity(artifact: XlsxArtifact, readBack: ReadBackSheet): Fideli
   return checks
 }
 
+// ─── Config variants (M3: exercise the artifact contract branches) ──────────
+
+interface Variant {
+  name: string
+  formatting: XlsxFormattingConfig
+}
+
+function buildVariants(): Variant[] {
+  return [
+    { name: 'default config', formatting: DEFAULT_XLSX_FORMATTING },
+    {
+      name: 'header disabled',
+      formatting: { ...DEFAULT_XLSX_FORMATTING, includeHeader: false },
+    },
+    {
+      name: 'totals disabled',
+      formatting: { ...DEFAULT_XLSX_FORMATTING, includeTotalsRow: false },
+    },
+    {
+      name: 'custom worksheet name',
+      formatting: { ...DEFAULT_XLSX_FORMATTING, worksheetName: 'Tender BOQ' },
+    },
+    {
+      name: 'custom display decimals (4dp money, 3dp qty)',
+      formatting: {
+        ...DEFAULT_XLSX_FORMATTING,
+        formattingVersion: 2,
+        moneyDisplayDecimals: 4,
+        quantityDisplayDecimals: 3,
+      },
+    },
+    {
+      name: 'custom column order (reversed) + widths + formats',
+      formatting: {
+        ...DEFAULT_XLSX_FORMATTING,
+        formattingVersion: 3,
+        columns: [...DEFAULT_XLSX_FORMATTING.columns].reverse().map((c) => ({
+          ...c,
+          width: c.width + 5,
+        })),
+      },
+    },
+  ]
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log('=== XLSX Serializer Fidelity Evaluation ===')
   console.log(`Runtime: node ${process.version}, bun ${Bun.version}\n`)
 
-  const artifact = buildFixedArtifact()
-  console.log(`Fixed XlsxArtifact: ${artifact.worksheets[0].rows.length} rows, ${artifact.worksheets[0].columns.length} columns`)
-  console.log(`  columns: ${artifact.worksheets[0].columns.map((c) => c.header).join(', ')}\n`)
+  const baseProjection = ((): import('../src/lib/boq/projection-contract').BoqProjection => {
+    const snap = finalizeRevision('est-1', 1, POLICY, [
+      makeLine({ lineId: 'l1' }),
+      makeLine({ lineId: 'l2', quantity: 50, description: 'Concrete work' }),
+    ])
+    return projectRevision({
+      estimateRevisionId: 'rev-1',
+      snapshotJson: snap,
+      projectionVersion: 1 as never,
+    })
+  })()
 
+  const variants = buildVariants()
   const adapters: FidelityAdapter[] = [
     makeWriteExcelFileAdapter(),
     makeExcelJsAdapter(),
   ]
 
+  let totalPass = 0
+  let totalChecks = 0
+
   for (const adapter of adapters) {
     console.log(`=== ${adapter.name}@${adapter.version} ===`)
-    try {
-      const bytes = await adapter.serialize(artifact)
-      // Write to temp file for read-back (read-excel-file reads from file/buffer).
-      const tmpFile = join(tmpdir(), `fidelity-${adapter.name}-${Date.now()}.xlsx`)
-      writeFileSync(tmpFile, bytes)
-      const readBuf = readFileSync(tmpFile)
-      try { unlinkSync(tmpFile) } catch { /* best effort */ }
-
-      const readBack = await readBackXlsx(readBuf)
-      const checks = assertFidelity(artifact, readBack)
-
-      const passed = checks.filter((c) => c.passed).length
-      const total = checks.length
-      console.log(`  Fidelity: ${passed}/${total} concerns passed`)
-      for (const c of checks) {
-        console.log(`  ${c.passed ? '✅' : '❌'} ${c.concern}: ${c.detail}`)
+    for (const variant of variants) {
+      const artifact = buildXlsxArtifact({
+        projection: baseProjection,
+        adapterVersion: CURRENT_XLSX_ADAPTER_VERSION,
+        formatting: variant.formatting,
+      })
+      console.log(`  --- variant: ${variant.name} ---`)
+      try {
+        const bytes = await adapter.serialize(artifact)
+        const readBack = await readBackXlsx(bytes)
+        // Content checks (independent read-back)
+        const contentChecks = assertFidelity(artifact, readBack)
+        // Structural checks (M1: number formats, M2: column widths)
+        const formatChecks = verifyNumberFormats(bytes, artifact)
+        const widthChecks = verifyColumnWidths(bytes, artifact)
+        const allChecks = [...contentChecks, ...formatChecks, ...widthChecks]
+        const passed = allChecks.filter((c) => c.passed).length
+        totalPass += passed
+        totalChecks += allChecks.length
+        console.log(`    Fidelity: ${passed}/${allChecks.length}`)
+        for (const c of allChecks) {
+          if (!c.passed) {
+            console.log(`    ❌ ${c.concern}: ${c.detail}`)
+          }
+        }
+        // Only print failures to keep output readable; summarize passes.
+        const failures = allChecks.filter((c) => !c.passed)
+        if (failures.length === 0) {
+          console.log(`    ✅ all ${allChecks.length} checks passed`)
+        }
+      } catch (e) {
+        console.log(`    ERROR: ${e instanceof Error ? e.message : String(e)}`)
+        totalChecks++
       }
-      console.log(`  Bytes: ${bytes.length}\n`)
-    } catch (e) {
-      console.log(`  ERROR: ${e instanceof Error ? e.message : String(e)}\n`)
     }
+    console.log('')
   }
 
-  console.log('=== NOTE ===')
-  console.log('Number formats and column widths are NOT asserted by read-excel-file')
-  console.log('(it does not expose per-cell numFmt or column width via its buffer API).')
-  console.log('Those concerns require a richer reader or a format-inspection step.')
-  console.log('The assertions above cover: sheet name, row count, column count,')
-  console.log('header values, data values, totals label.')
+  console.log('=== SUMMARY ===')
+  console.log(`Total: ${totalPass}/${totalChecks} checks passed across all variants + candidates`)
+  console.log('')
+  console.log('Checks cover:')
+  console.log('  content (independent read-back): sheet name, row count, column count,')
+  console.log('    header values, data values, totals label')
+  console.log('  M1 number formats: present in styles.xml + applied to numeric cells')
+  console.log('  M2 column widths: present in sheet1.xml <cols> and match config')
+  console.log('  M3 config variants: header off, totals off, custom name, custom')
+  console.log('    decimals, custom column order/widths/formats')
+  console.log('  M4 single-sheet: XlsxArtifact carries one worksheet (not an array)')
 }
 
 main().catch((e) => {

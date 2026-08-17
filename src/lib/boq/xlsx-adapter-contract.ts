@@ -214,8 +214,14 @@ export interface XlsxArtifact {
   formatting: XlsxFormattingConfig
   /** The contentHash of the source BoqProjection (for traceability). */
   sourceContentHash: string
-  /** The worksheets (v1: a single BOQ sheet). */
-  worksheets: XlsxWorksheet[]
+  /**
+   * The single worksheet. M4: XLSX adapter v1 is explicitly SINGLE-SHEET —
+   * the BOQ projection produces one "BOQ" worksheet. The contract carries a
+   * single worksheet object, not an array, so multi-sheet machinery is not
+   * silently carried. If a future version needs multiple sheets, the adapter
+   * version + formatting version must bump and this field changes shape.
+   */
+  worksheet: XlsxWorksheet
 }
 
 // ─── Input to the adapter ───────────────────────────────────────────────────

@@ -1,5 +1,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// XLSX Serializer Determinism Probe (EVALUATION HARNESS — not a product test)
+// XLSX Serializer Determinism Probe (EVALUATION RECORD — not a product test)
+//
+// STATUS: EVALUATION COMPLETE. write-excel-file@4.1.1 was declared the
+// production serializer. exceljs was removed from devDependencies. This script
+// is retained as the evaluation record. To re-run the exceljs portion,
+// temporarily reinstall: `bun add -d exceljs`.
 //
 // Purpose: empirically determine whether candidate XLSX serializers produce
 // byte-for-byte identical output when serializing the SAME XlsxArtifact twice.
@@ -206,7 +211,7 @@ async function serializeWithWriteExcelFile(artifact: XlsxArtifact): Promise<Seri
   // write-excel-file cell `type` uses CONSTRUCTORS (String, Number), not
   // string literals. For empty cells, omit type and set value: null.
   const writeXlsxFile = (await import('write-excel-file/node')).default
-  const sheet = artifact.worksheets[0]
+  const sheet = artifact.worksheet
   const data = sheet.rows.map((row) =>
     row.cells.map((cell) => {
       if (cell.value === null) return { value: null }
@@ -226,7 +231,7 @@ async function serializeWithExcelJS(artifact: XlsxArtifact): Promise<SerializeRe
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')
   const wb = new ExcelJS.Workbook()
-  const sheet = artifact.worksheets[0]
+  const sheet = artifact.worksheet
   const ws = wb.addWorksheet(sheet.name)
   ws.columns = sheet.columns.map((col) => ({
     key: col.field,
@@ -298,7 +303,7 @@ async function main() {
   console.log(`Timestamp: ${new Date().toISOString()}\n`)
 
   const artifact = buildFixedArtifact()
-  console.log(`Fixed XlsxArtifact: ${artifact.worksheets[0].rows.length} rows, sourceContentHash=${artifact.sourceContentHash}\n`)
+  console.log(`Fixed XlsxArtifact: ${artifact.worksheet.rows.length} rows, sourceContentHash=${artifact.sourceContentHash}\n`)
 
   const results: CandidateResult[] = []
 

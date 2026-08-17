@@ -295,7 +295,7 @@ export function buildXlsxArtifact(input: XlsxAdapterInput): XlsxArtifact {
     adapterVersion,
     formatting: ownedFormatting,
     sourceContentHash: projection.provenance.contentHash,
-    worksheets: [worksheet],
+    worksheet, // M4: single worksheet (v1 is explicitly single-sheet)
   }
 
   // K1: recursively freeze the artifact so it is IMMUTABLE at runtime. This

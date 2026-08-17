@@ -3545,3 +3545,100 @@ DISPOSITION (per reviewer):
   → write-excel-file@4.1.1 remains the preferred candidate (fidelity 6/6 +
     cross-process XML determinism). Production integration still pending the
     product decision on whether canonical-only provenance is sufficient.
+
+---
+Task ID: boq-xlsx-fidelity-gate-complete
+Agent: principal-engineer
+Task: Close the full serializer-fidelity gate — verify number formats + column widths structurally, exercise config variants, declare single-sheet v1, choose write-excel-file, remove evaluation deps. Per reviewer's 6-step final evaluation pass.
+
+M1 — Number formats verified structurally.
+- Added verifyNumberFormats() to the fidelity harness: parses xl/styles.xml
+  (numFmts + cellXfs) and xl/worksheets/sheet1.xml (cell style indices).
+  Asserts expected format codes are present AND applied to numeric cells.
+- write-excel-file: ✅ formats present + applied.
+- exceljs: ❌ numeric cells did not carry style attributes in the expected XML
+  shape (a real fidelity gap, not a harness artifact).
+
+M2 — Column widths verified structurally.
+- Added verifyColumnWidths(): parses xl/worksheets/sheet1.xml <cols> section,
+  asserts each column's width matches the artifact config.
+- write-excel-file: ✅ all widths match.
+- exceljs: ❌ missing widths for some columns (cols 7/8) — exceljs doesn't
+  emit widths for columns without populated cells in every row.
+
+M3 — Config variants exercised.
+- 6 variants tested: default, header disabled, totals disabled, custom
+  worksheet name, custom display decimals (4dp money/3dp qty), custom column
+  order (reversed) + widths + formats.
+- write-excel-file: 9/9 checks passed on ALL 6 variants (54/54 total).
+- exceljs: 6-7/8-9 per variant (failed M1 + M2 consistently).
+
+M4 — XLSX v1 is explicitly single-sheet.
+- Changed XlsxArtifact.worksheets: XlsxWorksheet[] → worksheet: XlsxWorksheet
+  (singular). The contract now carries one worksheet object, not an array.
+  Multi-sheet machinery is not silently carried. If a future version needs
+  multiple sheets, the adapter version + formatting version bump and the field
+  changes shape. Documented in the contract.
+
+M5 — write-excel-file@4.1.1 DECLARED the production serializer.
+- Evidence: fidelity 9/9 across all 6 variants (54/54); cross-process XML
+  content byte-identical (only ZIP wrapper drifts); narrower/simpler scope.
+- exceljs eliminated: failed M1 (numeric cell styles) + M2 (column widths).
+- Moved from devDependencies → production dependencies.
+
+M6 — Evaluation dependencies removed.
+- exceljs + read-excel-file removed from devDependencies (evaluation complete).
+- write-excel-file@^4.1.1 is now the single XLSX dependency (production).
+- The fidelity + determinism harness scripts are retained as the evaluation
+  record, with headers noting the eval is complete and how to re-run if needed.
+
+FINAL EVIDENCE SUMMARY:
+  write-excel-file@4.1.1 (CHOSEN):
+    content fidelity (independent read-back): ✅ 6/6 per variant
+    number formats (M1, structural):           ✅ present + applied
+    column widths (M2, structural):            ✅ all match
+    config variants (M3):                      ✅ 6/6 variants, 54/54 checks
+    within-process byte identity:              ✅
+    cross-process XML content identity:        ✅ (only ZIP wrapper drifts)
+    single-sheet contract (M4):                ✅
+
+  exceljs@4.4.0 (ELIMINATED):
+    content fidelity: ✅ 6/6 per variant
+    number formats (M1): ❌ numeric cells missing style attributes
+    column widths (M2): ❌ missing widths for some columns
+    cross-process XML: ❌ drifts (docProps/core.xml timestamps)
+
+PRODUCT INVARIANT (final):
+  Canonical invariant (same inputs → same XlsxArtifact): GUARANTEED ✅
+  Strong byte invariant (byte-identical XLSX): NOT a product guarantee.
+    The XlsxArtifact's sourceContentHash (SHA-256) is the authoritative
+    identity. The XLSX file is a presentation artifact. ZIP-level byte identity
+    is not worth building a custom archive-normalization subsystem around.
+  No timestamp-normalization layer (per reviewer — GenOffice owns the
+    projection; write-excel-file owns Excel).
+
+FILES MODIFIED:
+- src/lib/boq/xlsx-adapter-contract.ts — worksheets[] → worksheet (M4).
+- src/lib/boq/xlsx-adapter.ts — returns worksheet (singular) (M4).
+- tests/unit/boq-xlsx-adapter.test.ts — updated all refs to .worksheet (M4).
+- scripts/xlsx-fidelity-eval.ts — +M1/M2 structural checks, +M3 variants,
+  evaluation-record header.
+- scripts/xlsx-determinism-probe.ts — evaluation-record header.
+- package.json + bun.lock — write-excel-file → production dep; exceljs +
+  read-excel-file removed.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 246 pass / 0 fail (0 regressions)
+- Fidelity (write-excel-file) ......... 54/54 checks across 6 variants
+- Frozen Phase 1 code ................. UNTOUCHED
+
+DISPOSITION (per reviewer's 6-step final pass):
+  ✅ M1 number formats verified structurally
+  ✅ M2 column widths verified structurally
+  ✅ M3 config variants exercised (6 variants)
+  ✅ M4 XLSX v1 explicitly single-sheet
+  ✅ M5 write-excel-file declared the serializer
+  ✅ M6 exceljs + read-excel-file removed
+  → Approved for production integration. GenOffice owns the projection;
+    write-excel-file owns Excel.

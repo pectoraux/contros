@@ -88,8 +88,8 @@ describe('XLSX adapter — basic shape', () => {
   test('builds an artifact with a single BOQ worksheet, header + data + totals', () => {
     const proj = makeProjection()
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
-    expect(artifact.worksheets).toHaveLength(1)
-    const sheet = artifact.worksheets[0]
+    expect(artifact.worksheet).toBeTruthy()
+    const sheet = artifact.worksheet
     expect(sheet.name).toBe('BOQ')
     // header + 1 data row + totals row
     expect(sheet.rows).toHaveLength(3)
@@ -135,7 +135,7 @@ describe('XLSX adapter — CANONICAL INVARIANT (same inputs → same artifact)',
     const a = buildXlsxArtifact(makeAdapterInput(proj))
     const b = buildXlsxArtifact(makeAdapterInput(proj, { formatting: config2 }))
     expect(artifactsMatch(a, b)).toBe(false)
-    expect(b.worksheets[0].name).toBe('BOQ-v2')
+    expect(b.worksheet.name).toBe('BOQ-v2')
   })
 
   test('changing the adapter version changes the artifact identity', () => {
@@ -150,7 +150,7 @@ describe('XLSX adapter — DISPLAY ROUNDING preserves the projection', () => {
   test('quantity 1.2375 → cell value 1.24 (display-rounded), projection stays 1.2375', () => {
     const proj = makeProjection([makeLine({ quantity: 1.2375 })])
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
-    const sheet = artifact.worksheets[0]
+    const sheet = artifact.worksheet
     const dataRow = sheet.rows.find((r) => !r.isHeader && !r.isTotals)!
     // Find the Qty column (index 3 in v1 default config: No, Desc, Unit, Qty).
     const qtyCell = dataRow.cells[3]
@@ -164,7 +164,7 @@ describe('XLSX adapter — DISPLAY ROUNDING preserves the projection', () => {
   test('money values are display-rounded; projection values are exact', () => {
     const proj = makeProjection([makeLine({ quantity: 100 })])
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
-    const sheet = artifact.worksheets[0]
+    const sheet = artifact.worksheet
     const dataRow = sheet.rows.find((r) => !r.isHeader && !r.isTotals)!
     // sellPrice cell is display-rounded to 2dp.
     const sellCell = dataRow.cells[5] // Sell Price column (v1: No,Desc,Unit,Qty,UnitRate,Sell)
@@ -188,7 +188,7 @@ describe('XLSX adapter — DISPLAY ROUNDING preserves the projection', () => {
   test('a projection with many-decimal quantity: display cell is rounded, projection is exact', () => {
     const proj = makeProjection([makeLine({ quantity: 123.456789 })])
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
-    const dataRow = artifact.worksheets[0].rows.find((r) => !r.isHeader && !r.isTotals)!
+    const dataRow = artifact.worksheet.rows.find((r) => !r.isHeader && !r.isTotals)!
     expect(dataRow.cells[3].value).toBe(123.46) // display-rounded to 2dp
     expect(proj.rows[0].quantity).toBe(123.456789) // projection exact
   })
@@ -202,7 +202,7 @@ describe('XLSX adapter — ORDERING', () => {
       makeLine({ lineId: 'm' }),
     ])
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
-    const dataRows = artifact.worksheets[0].rows.filter((r) => !r.isHeader && !r.isTotals)
+    const dataRows = artifact.worksheet.rows.filter((r) => !r.isHeader && !r.isTotals)
     // rowNumber is 1,2,3 in projection order (z, a, m) — NOT sorted.
     expect(dataRows.map((r) => r.cells[0].value)).toEqual([1, 2, 3])
   })
@@ -216,7 +216,7 @@ describe('XLSX adapter — ORDERING', () => {
       ],
     }
     const artifact = buildXlsxArtifact(makeAdapterInput(proj, { formatting: config }))
-    const header = artifact.worksheets[0].rows[0]
+    const header = artifact.worksheet.rows[0]
     expect(header.cells[0].value).toBe('Margin %') // reversed order
   })
 })
@@ -225,7 +225,7 @@ describe('XLSX adapter — totals row', () => {
   test('totals row sums sellPrice, directCost, expectedProfit from projection totals', () => {
     const proj = makeProjection([makeLine({ quantity: 100 }), makeLine({ lineId: 'l2', quantity: 50 })])
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
-    const totalsRow = artifact.worksheets[0].rows.find((r) => r.isTotals)!
+    const totalsRow = artifact.worksheet.rows.find((r) => r.isTotals)!
     // v1 columns: No(0), Desc(1), Unit(2), Qty(3), UnitRate(4), Sell(5), Direct(6), Profit(7), Margin(8).
     expect(totalsRow.cells[5].value).toBe(Math.round(proj.totals.totalSellPrice * 100) / 100)
     expect(totalsRow.cells[6].value).toBe(Math.round(proj.totals.totalDirectCost * 100) / 100)
@@ -235,7 +235,7 @@ describe('XLSX adapter — totals row', () => {
   test('totals row labels the Description column as TOTAL', () => {
     const proj = makeProjection()
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
-    const totalsRow = artifact.worksheets[0].rows.find((r) => r.isTotals)!
+    const totalsRow = artifact.worksheet.rows.find((r) => r.isTotals)!
     // Description column is index 1 (v1: No, Desc, ...).
     expect(totalsRow.cells[1].value).toBe('TOTAL')
   })
@@ -244,7 +244,7 @@ describe('XLSX adapter — totals row', () => {
     const proj = makeProjection()
     const config: XlsxFormattingConfig = { ...DEFAULT_XLSX_FORMATTING, includeTotalsRow: false }
     const artifact = buildXlsxArtifact(makeAdapterInput(proj, { formatting: config }))
-    expect(artifact.worksheets[0].rows.some((r) => r.isTotals)).toBe(false)
+    expect(artifact.worksheet.rows.some((r) => r.isTotals)).toBe(false)
   })
 })
 
@@ -253,9 +253,9 @@ describe('XLSX adapter — includeHeader toggle', () => {
     const proj = makeProjection()
     const config: XlsxFormattingConfig = { ...DEFAULT_XLSX_FORMATTING, includeHeader: false }
     const artifact = buildXlsxArtifact(makeAdapterInput(proj, { formatting: config }))
-    expect(artifact.worksheets[0].rows.some((r) => r.isHeader)).toBe(false)
+    expect(artifact.worksheet.rows.some((r) => r.isHeader)).toBe(false)
     // First row is now a data row.
-    expect(artifact.worksheets[0].rows[0].isHeader).toBe(false)
+    expect(artifact.worksheet.rows[0].isHeader).toBe(false)
   })
 })
 
@@ -291,11 +291,11 @@ describe('XLSX adapter — J1: artifact owns immutable data (no shared mutable r
     }
     const artifact = buildXlsxArtifact(makeAdapterInput(proj, { formatting: config }))
     // Snapshot the artifact's header before mutating the input config.
-    const headerBefore = artifact.worksheets[0].rows[0].cells.map((c) => c.value)
+    const headerBefore = artifact.worksheet.rows[0].cells.map((c) => c.value)
     // Now mutate the ORIGINAL input config — change a column header.
     config.columns[0] = { ...config.columns[0], header: 'CHANGED' }
     // The already-built artifact must NOT change — it owns its own data.
-    const headerAfter = artifact.worksheets[0].rows[0].cells.map((c) => c.value)
+    const headerAfter = artifact.worksheet.rows[0].cells.map((c) => c.value)
     expect(headerAfter).toEqual(headerBefore)
     expect(headerAfter[0]).not.toBe('CHANGED')
   })
@@ -312,7 +312,7 @@ describe('XLSX adapter — J1: artifact owns immutable data (no shared mutable r
     config.columns.push({ field: 'description', header: 'Extra', width: 10, numberFormat: null })
     // The artifact's columns are unchanged.
     expect(artifact.formatting.columns.length).toBe(artifactColumnCount)
-    expect(artifact.worksheets[0].columns.length).toBe(artifactColumnCount)
+    expect(artifact.worksheet.columns.length).toBe(artifactColumnCount)
   })
 
   test('the artifact formatting is a deep copy, not the same reference', () => {
@@ -336,12 +336,12 @@ describe('XLSX adapter — K1: artifact is IMMUTABLE (recursively frozen at runt
     expect(Object.isFrozen(artifact.formatting)).toBe(true)
     expect(Object.isFrozen(artifact.formatting.columns)).toBe(true)
     expect(Object.isFrozen(artifact.formatting.columns[0])).toBe(true)
-    expect(Object.isFrozen(artifact.worksheets)).toBe(true)
-    expect(Object.isFrozen(artifact.worksheets[0])).toBe(true)
-    expect(Object.isFrozen(artifact.worksheets[0].rows)).toBe(true)
-    expect(Object.isFrozen(artifact.worksheets[0].rows[0])).toBe(true)
-    expect(Object.isFrozen(artifact.worksheets[0].rows[0].cells)).toBe(true)
-    expect(Object.isFrozen(artifact.worksheets[0].rows[0].cells[0])).toBe(true)
+    expect(Object.isFrozen(artifact.worksheet)).toBe(true)
+    expect(Object.isFrozen(artifact.worksheet)).toBe(true)
+    expect(Object.isFrozen(artifact.worksheet.rows)).toBe(true)
+    expect(Object.isFrozen(artifact.worksheet.rows[0])).toBe(true)
+    expect(Object.isFrozen(artifact.worksheet.rows[0].cells)).toBe(true)
+    expect(Object.isFrozen(artifact.worksheet.rows[0].cells[0])).toBe(true)
   })
 
   test('mutating a frozen artifact property throws in strict mode', () => {
@@ -354,7 +354,7 @@ describe('XLSX adapter — K1: artifact is IMMUTABLE (recursively frozen at runt
     }).toThrow(TypeError)
     // Mutating a deeply nested cell value also throws.
     expect(() => {
-      ;(artifact.worksheets[0].rows[0].cells[0] as { value: unknown }).value = 'CHANGED'
+      ;(artifact.worksheet.rows[0].cells[0] as { value: unknown }).value = 'CHANGED'
     }).toThrow(TypeError)
   })
 
@@ -363,16 +363,16 @@ describe('XLSX adapter — K1: artifact is IMMUTABLE (recursively frozen at runt
     const proj = makeProjection()
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
     const hashBefore = artifact.sourceContentHash
-    const headerBefore = artifact.worksheets[0].rows[0].cells[0].value
+    const headerBefore = artifact.worksheet.rows[0].cells[0].value
     // Attempt mutation — throws in strict mode (caught).
     try {
-      ;(artifact.worksheets[0].rows[0].cells[0] as { value: unknown }).value = 'CHANGED'
+      ;(artifact.worksheet.rows[0].cells[0] as { value: unknown }).value = 'CHANGED'
     } catch {
       // expected TypeError in strict mode
     }
     // The artifact is unchanged — provenance is intact.
     expect(artifact.sourceContentHash).toBe(hashBefore)
-    expect(artifact.worksheets[0].rows[0].cells[0].value).toBe(headerBefore)
+    expect(artifact.worksheet.rows[0].cells[0].value).toBe(headerBefore)
   })
 })
 
@@ -394,7 +394,7 @@ describe('XLSX adapter — J2: no invented Code column', () => {
   test('the built artifact does not expose versionId under any header', () => {
     const proj = makeProjection([makeLine()])
     const artifact = buildXlsxArtifact(makeAdapterInput(proj))
-    const dataRow = artifact.worksheets[0].rows.find((r) => !r.isHeader && !r.isTotals)!
+    const dataRow = artifact.worksheet.rows.find((r) => !r.isHeader && !r.isTotals)!
     // No cell should contain the WDV versionId ('wdv-1').
     const allValues = dataRow.cells.map((c) => c.value)
     expect(allValues).not.toContain('wdv-1')
