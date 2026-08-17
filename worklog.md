@@ -3880,3 +3880,70 @@ API ROUTE NOTE (for the next step):
   A successful export remains HTTP 200 regardless of auditWarning.
   auditWarning is operational metadata (e.g. an X-Audit-Warning header), NOT
   a reason to change the HTTP status. The commercial export succeeded.
+
+---
+Task ID: boq-xlsx-api-route
+Agent: principal-engineer
+Task: Thin API route for BOQ XLSX export + boundary tests. Per approved milestone. No frozen code touched.
+
+ROUTE (src/app/api/estimates/revisions/[revisionId]/boq.xlsx/route.ts):
+- GET /api/estimates/revisions/:revisionId/boq.xlsx
+- THIN ADAPTER: requireAuth() → parse revisionId → boqProjectionService.exportXlsx() → HTTP response mapping.
+- No Prisma, no repositories, no engines, no serializer, no projection logic in the route.
+- The ONLY service call is boqProjectionService.exportXlsx().
+
+Response mapping:
+  200 — XLSX bytes (binary Response, not JSON)
+    Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+    Content-Disposition: attachment; filename="BOQ-{revisionId}-v{revisionNo}.xlsx"
+    X-GenOffice-Audit-Warning: (only if auditWarning is non-null — informational, NOT a status change)
+  404 — revision not found / wrong tenant (NextResponse.json with safe error)
+  422 — revision exists but not finalized (NextResponse.json with safe error)
+  401/403 — auth errors (via authErrorResponse)
+
+Key route semantics:
+- auditWarning does NOT change the HTTP status. A successful export is always 200.
+  The warning is an optional X-GenOffice-Audit-Warning header.
+- No raw exception leakage — the service sanitizes audit errors; the route
+  maps known service results to controlled HTTP responses.
+- Unexpected errors propagate to the framework's server-side error handler
+  (the route does not catch and sanitize them — the service handles known
+  failures; unknown failures are framework-level).
+
+UNIT TESTS (tests/unit/boq-xlsx-route.test.ts — 7 tests):
+- Boundary: imports only the service + auth helpers (no Prisma/engines/repos/serializer).
+- Exports a GET handler.
+- Does not call Prisma or service internals directly (only boqProjectionService.exportXlsx).
+- Maps service results to HTTP responses (NextResponse.json for errors; binary Response for success).
+- Does not change HTTP status based on auditWarning (200 regardless).
+- Uses authErrorResponse for auth errors (existing pattern).
+- Parses revisionId from route params (not from query/body).
+
+HTTP-LEVEL INTEGRATION TEST STATUS:
+- The full HTTP-level test (200/404/422/content-type/content-disposition/audit-warning-
+  header) requires a running dev server with NextAuth session setup. The sandbox
+  process-lifecycle limitation (server killed between tool calls) and the auth
+  provider's password-hash requirement make this impractical in the current
+  sandbox. The route is verified STRUCTURALLY (boundary + mapping) via unit
+  tests, and the SERVICE is fully integration-tested (16 tests against Neon
+  covering tenant isolation, non-finalized rejection, audit failure, determinism,
+  and the mutable-current ≠ historical-export-truth invariant).
+- The scripts/boq-route-api-test.ts is retained as an API integration test
+  scaffold for when a running server + auth session is available.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 261 pass / 0 fail (+7 route; 0 regressions)
+- BOQ projection integration (Neon) ... 16 pass / 0 fail (service-level)
+- Frozen Phase 1 code ................. UNTOUCHED
+
+CANONICAL → XLSX PATH (now complete from HTTP to bytes):
+  GET /api/estimates/revisions/:revisionId/boq.xlsx
+      ↓ requireAuth() → RequestContext
+      ↓ boqProjectionService.exportXlsx()
+      ↓ tenant-scoped EstimateRevision lookup → projectRevision → buildXlsxArtifact
+      ↓ serializeXlsxArtifact → .xlsx bytes
+      ↓ 200 + Content-Type + Content-Disposition + (optional audit warning header)
+
+NEXT (NOT started): contractor UI download action. The backend boundary is
+complete; the UI becomes a thin consumer.
