@@ -4641,3 +4641,50 @@ THE FINALIZATION IS NOW TRANSACTIONALLY CONSISTENT:
   Later edits do NOT change finalized revisions
   Concurrent finalizations produce adjacent revision numbers
   Concurrent finalization + mutation does not produce mixed snapshots
+
+---
+Task ID: programme-dependency-locking
+Agent: principal-engineer
+Task: R1 — add Programme row lock to dependency mutations (create + deleteForProgramme). Close the last consistency hole: dependency mutations now use the same serialization boundary as activity mutations and finalization. No frozen code touched.
+
+R1 — Dependency mutations lock the Programme row.
+- activityDependencyRepository.create() now wraps in a transaction that:
+  1. SELECT FOR UPDATE on the parent Programme row (with orgId check).
+  2. Validates same-programme activities (X3).
+  3. Inserts the dependency.
+- activityDependencyRepository.deleteForProgramme() now wraps in a transaction
+  that locks the Programme row before deleting.
+- The signature changed: create() and deleteForProgramme() now take (orgId,
+  programmeId, ...) instead of (tx, programmeId, ...) — they manage their own
+  transactions internally (like activityRepository.update() does).
+- The invariant is now complete for the entire mutable workspace:
+    Programme row lock = Activity mutation + Dependency mutation + Finalization
+
+Column name fix: Prisma's default mapping uses camelCase column names in
+PostgreSQL (organizationId, not organization_id). The raw SQL in the
+dependency repository was updated to use the correct quoted column name:
+  "organizationId"
+
+TEST FIXES:
+- programme-service.test.ts: updated the X3 cross-programme dependency test to
+  use the new create() signature (orgId, programmeId, data — no tx parameter).
+- programme-finalize.test.ts: increased per-test timeouts from 30s to 60s to
+  accommodate Neon latency (the 18th test was timing out, not failing).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Programme service integration (Neon) . 10 pass / 0 fail (was 9/1; fixed)
+- Programme finalization (Neon) ....... 18 pass / 0 fail (all 18 completed
+  with 60s timeouts — was 17/1 timeout)
+- Frozen Phase 1 code ................. UNTOUCHED
+
+THE INVARIANT IS NOW COMPLETE:
+  Programme row lock
+      = Activity mutation
+      + Dependency mutation
+      + Finalization serialization boundary
+
+  No workspace mutation can race with finalization.
+  No finalized snapshot can be partially mixed.
+  All 18 PostgreSQL integration tests pass.

@@ -14,7 +14,6 @@
 
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { PrismaClient } from '@prisma/client'
-import { dbTx } from '../../src/lib/db'
 import {
   programmeRepository,
   programmeRevisionRepo,
@@ -290,13 +289,11 @@ describe('Programme domain integration tests', () => {
     // Attempt to create a dependency: predecessor from PROG_A, successor from prog2.
     // This must be REJECTED — dependency edges cannot cross programme boundaries.
     await expect(
-      dbTx.$transaction(async (tx) => {
-        await activityDependencyRepository.create(tx, PROG_A, {
-          predecessorActivityId: 'test-prog-act-1', // in PROG_A
-          successorActivityId: 'test-prog-act-cross', // in prog2 — WRONG programme
-          type: 'FS',
-          lag: 0,
-        })
+      activityDependencyRepository.create(ORG_A, PROG_A, {
+        predecessorActivityId: 'test-prog-act-1', // in PROG_A
+        successorActivityId: 'test-prog-act-cross', // in prog2 — WRONG programme
+        type: 'FS',
+        lag: 0,
       }),
     ).rejects.toThrow(/not found in programme/)
 

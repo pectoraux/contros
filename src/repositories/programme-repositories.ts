@@ -317,14 +317,18 @@ export const activityRepository = {
 
 export const activityDependencyRepository = {
   /**
-   * Create a dependency within a transaction.
+   * Create a dependency.
    * X3: enforces that predecessor.programmeId === successor.programmeId ===
    * dependency.programmeId. Throws if any activity belongs to a different
    * programme. This is a domain-identity invariant — a dependency edge cannot
    * cross programme boundaries.
+   *
+   * R1: Takes the Programme row lock FIRST to serialize against concurrent
+   * finalization. This completes the invariant:
+   *   Programme row lock = workspace mutation/finalization serialization boundary
    */
   async create(
-    tx: Tx,
+    orgId: string,
     programmeId: string,
     data: {
       predecessorActivityId: string
@@ -333,38 +337,41 @@ export const activityDependencyRepository = {
       lag?: number
     },
   ) {
-    // X3: Verify both activities belong to the SAME programme.
-    const [pred, succ] = await Promise.all([
-      tx.activity.findFirst({
-        where: { id: data.predecessorActivityId, programmeId },
-        select: { id: true, programmeId: true },
-      }),
-      tx.activity.findFirst({
-        where: { id: data.successorActivityId, programmeId },
-        select: { id: true, programmeId: true },
-      }),
-    ])
-    if (!pred) {
-      throw new Error(
-        `Cannot create dependency: predecessor "${data.predecessorActivityId}" not found in programme "${programmeId}"`,
-      )
-    }
-    if (!succ) {
-      throw new Error(
-        `Cannot create dependency: successor "${data.successorActivityId}" not found in programme "${programmeId}"`,
-      )
-    }
-    // Both activities are confirmed to belong to programmeId (the query
-    // filtered by programmeId). The dependency's programmeId matches.
+    return dbTx.$transaction(async (tx) => {
+      // R1: Lock the Programme row before any workspace read/mutation.
+      await tx.$queryRaw`SELECT id FROM "Programme" WHERE id = ${programmeId} AND "organizationId" = ${orgId} FOR UPDATE`
 
-    return tx.activityDependency.create({
-      data: {
-        programmeId,
-        predecessorActivityId: data.predecessorActivityId,
-        successorActivityId: data.successorActivityId,
-        type: data.type,
-        lag: data.lag ?? 0,
-      },
+      // X3: Verify both activities belong to the SAME programme.
+      const [pred, succ] = await Promise.all([
+        tx.activity.findFirst({
+          where: { id: data.predecessorActivityId, programmeId },
+          select: { id: true, programmeId: true },
+        }),
+        tx.activity.findFirst({
+          where: { id: data.successorActivityId, programmeId },
+          select: { id: true, programmeId: true },
+        }),
+      ])
+      if (!pred) {
+        throw new Error(
+          `Cannot create dependency: predecessor "${data.predecessorActivityId}" not found in programme "${programmeId}"`,
+        )
+      }
+      if (!succ) {
+        throw new Error(
+          `Cannot create dependency: successor "${data.successorActivityId}" not found in programme "${programmeId}"`,
+        )
+      }
+
+      return tx.activityDependency.create({
+        data: {
+          programmeId,
+          predecessorActivityId: data.predecessorActivityId,
+          successorActivityId: data.successorActivityId,
+          type: data.type,
+          lag: data.lag ?? 0,
+        },
+      })
     })
   },
 
@@ -395,9 +402,16 @@ export const activityDependencyRepository = {
     })
   },
 
-  async deleteForProgramme(tx: Tx, programmeId: string) {
-    return tx.activityDependency.deleteMany({
-      where: { programmeId },
+  /**
+   * R1: Delete all dependencies for a programme. Takes the Programme row lock
+   * first to serialize against concurrent finalization.
+   */
+  async deleteForProgramme(orgId: string, programmeId: string) {
+    return dbTx.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Programme" WHERE id = ${programmeId} AND "organizationId" = ${orgId} FOR UPDATE`
+      return tx.activityDependency.deleteMany({
+        where: { programmeId },
+      })
     })
   },
 }

@@ -103,7 +103,7 @@ describe('ProgrammeService finalization integration tests', () => {
     expect(res.revisionNo).toBe(1)
     expect(res.snapshotContentHash).toHaveLength(64)
     expect(res.scheduleEngineVersion).toBe(1)
-  }, 30000)
+  }, 60000)
 
   // ── 2. Second finalization → revisionNo 2 ────────────────────────────────
 
@@ -112,7 +112,7 @@ describe('ProgrammeService finalization integration tests', () => {
     expect(res.ok).toBe(true)
     if (!res.ok) return
     expect(res.revisionNo).toBe(2)
-  }, 30000)
+  }, 60000)
 
   // ── 3. Same workspace → same hash ────────────────────────────────────────
 
@@ -123,7 +123,7 @@ describe('ProgrammeService finalization integration tests', () => {
     expect(res2.ok).toBe(true)
     if (!res1.ok || !res2.ok) return
     expect(res1.snapshotContentHash).toBe(res2.snapshotContentHash)
-  }, 30000)
+  }, 60000)
 
   // ── 4. Changing activity → different hash ────────────────────────────────
 
@@ -141,7 +141,7 @@ describe('ProgrammeService finalization integration tests', () => {
 
     // Restore.
     await db.activity.update({ where: { id: 'test-pf-act-1' }, data: { duration: 5 } })
-  }, 30000)
+  }, 60000)
 
   // ── 5. Changing dependency → different hash ──────────────────────────────
 
@@ -157,7 +157,7 @@ describe('ProgrammeService finalization integration tests', () => {
     expect(res1.snapshotContentHash).not.toBe(res2.snapshotContentHash)
 
     await db.activityDependency.update({ where: { id: 'test-pf-dep-1' }, data: { lag: 0 } })
-  }, 30000)
+  }, 60000)
 
   // ── 6+7. Finalized revision ≠ mutable workspace ──────────────────────────
 
@@ -185,7 +185,7 @@ describe('ProgrammeService finalization integration tests', () => {
 
     // Restore.
     await db.activity.update({ where: { id: 'test-pf-act-1' }, data: { duration: 5 } })
-  }, 30000)
+  }, 60000)
 
   // ── 8. Tenant isolation ──────────────────────────────────────────────────
 
@@ -194,7 +194,7 @@ describe('ProgrammeService finalization integration tests', () => {
     expect(res.ok).toBe(false)
     if (res.ok) return
     expect(res.status).toBe(404)
-  }, 30000)
+  }, 60000)
 
   // ── 9. Missing programme → 404 ───────────────────────────────────────────
 
@@ -203,7 +203,7 @@ describe('ProgrammeService finalization integration tests', () => {
     expect(res.ok).toBe(false)
     if (res.ok) return
     expect(res.status).toBe(404)
-  }, 30000)
+  }, 60000)
 
   // ── 10. Cyclic dependency → 422 ──────────────────────────────────────────
 
@@ -220,7 +220,7 @@ describe('ProgrammeService finalization integration tests', () => {
     expect(res.error).toMatch(/cycle/i)
 
     await db.activityDependency.delete({ where: { id: 'test-pf-dep-cycle' } }).catch(() => {})
-  }, 30000)
+  }, 60000)
 
   // ── 11. Non-finite duration → 422 ────────────────────────────────────────
 
@@ -248,7 +248,7 @@ describe('ProgrammeService finalization integration tests', () => {
       // ALWAYS restore, even if the test threw.
       await db.$executeRaw`UPDATE "Activity" SET duration = 5 WHERE id = 'test-pf-act-1'`
     }
-  }, 30000)
+  }, 60000)
 
   // ── 12. Audit ────────────────────────────────────────────────────────────
 
@@ -273,7 +273,7 @@ describe('ProgrammeService finalization integration tests', () => {
     expect(after.scheduleEngineVersion).toBe(1)
     expect(typeof after.activityCount).toBe('number')
     expect(typeof after.dependencyCount).toBe('number')
-  }, 30000)
+  }, 60000)
 
   // ── 13. Source audit: no update/delete on programmeRevisionRepo ───────────
 
@@ -300,7 +300,7 @@ describe('ProgrammeService finalization integration tests', () => {
     expect(res1.snapshotContentHash).toBe(res2.snapshotContentHash)
     // But different revisionNo.
     expect(res1.revisionNo).not.toBe(res2.revisionNo)
-  }, 30000)
+  }, 60000)
 
   test('P1: persisted snapshotJson includes revisionNo + finalizedAt, but hash does not', async () => {
     const res = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
@@ -322,7 +322,7 @@ describe('ProgrammeService finalization integration tests', () => {
     const { computeSnapshotContentHash } = await import('../../src/lib/programme')
     const contentOnlyHash = computeSnapshotContentHash(snapshot)
     expect(contentOnlyHash).toBe(res.snapshotContentHash)
-  }, 30000)
+  }, 60000)
 
   // ── P2: Concurrent finalization produces unique revision numbers ──────────
 
@@ -372,7 +372,7 @@ describe('ProgrammeService finalization integration tests', () => {
 
     // Restore.
     await db.activity.update({ where: { id: 'test-pf-act-1' }, data: { duration: 5 } })
-  }, 30000)
+  }, 60000)
 
   test('Q1/Q2: concurrent finalization + activity update do not produce a mixed snapshot', async () => {
     // Fire a finalization and an activity update concurrently. The Programme
@@ -421,5 +421,5 @@ describe('ProgrammeService finalization integration tests', () => {
 
     // Restore.
     await db.activity.update({ where: { id: 'test-pf-act-1' }, data: { duration: 5 } })
-  }, 30000)
+  }, 60000)
 }, 300000)
