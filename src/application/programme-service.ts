@@ -57,6 +57,8 @@ import {
   type ProgrammeActivity,
   type ActivityDependency,
   type DependencyType,
+  type ChangeSummary,
+  computeChangeSummary,
 } from '@/lib/programme'
 import type { ScheduleResult } from '@/lib/engines/schedule-engine'
 
@@ -302,6 +304,119 @@ export const programmeService = {
    */
   async listProgrammes(ctx: RequestContext, opportunityId?: string) {
     return programmeRepository.listForOrganization(ctx.organizationId, opportunityId)
+  },
+
+  /**
+   * F1: Get a change summary comparing the current workspace against the
+   * latest finalized ProgrammeRevision. This is the "what changed since
+   * last revision?" surface for the finalization UX.
+   *
+   * The summary categorizes changes as:
+   *   - "schedule-affecting" — duration or dependency changes (change CPM outputs)
+   *   - "presentation" — name or sequence changes (do NOT change CPM outputs)
+   *
+   * If no finalized revision exists, returns a summary with all activities/
+   * dependencies as "added" (the workspace is entirely new).
+   *
+   * PURE DIFF: the underlying computeChangeSummary is a pure function; this
+   * method just loads the two snapshots (latest revision + current workspace)
+   * and enriches the result with activity names for display.
+   */
+  async getChangeSummary(
+    input: {
+      ctx: RequestContext
+      programmeId: string
+    },
+  ): Promise<
+    | {
+        ok: true
+        summary: ChangeSummary
+        latestRevisionNo: number | null
+      }
+    | Err
+  > {
+    const { ctx, programmeId } = input
+
+    const programme = await programmeRepository.getForOrganization(
+      ctx.organizationId,
+      programmeId,
+    )
+    if (!programme) {
+      return { ok: false, error: 'Programme not found in this organization', status: 404 }
+    }
+
+    // Build the workspace snapshot (same logic as getProgrammeSchedule workspace mode).
+    const workspaceActivities: ProgrammeActivity[] = programme.activities.map((a) => ({
+      id: a.id,
+      name: a.name,
+      duration: a.duration,
+      sequence: a.sequence,
+      constructionRefs: {
+        estimateLineId: a.estimateLineId,
+        workDefinitionVersionId: a.workDefinitionVersionId,
+        workPackageId: null,
+      },
+      plannedQuantity: a.plannedQuantity,
+      status: a.status as 'planned' | 'in-progress' | 'complete',
+      predecessorDependencies: [],
+    }))
+
+    const workspaceDependencies: ActivityDependency[] = programme.dependencies.map((d) => ({
+      id: d.id,
+      predecessorActivityId: d.predecessorActivityId,
+      successorActivityId: d.successorActivityId,
+      type: d.type as DependencyType,
+      lag: d.lag,
+    }))
+
+    const workspaceSnapshot: ProgrammeSnapshot = {
+      programmeId,
+      programmeName: programme.name,
+      revisionNo: 0,
+      scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
+      activities: workspaceActivities,
+      dependencies: workspaceDependencies,
+      finalizedAt: '',
+    }
+
+    // Get the latest finalized revision (if any).
+    const revisions = programme.revisions
+    const latestRevision = revisions.length > 0
+      ? revisions[0] // revisions are ordered by revisionNo desc
+      : null
+
+    let baseSnapshot: ProgrammeSnapshot
+    if (latestRevision) {
+      baseSnapshot = deserializeSnapshot(latestRevision.snapshotJson)
+    } else {
+      // No previous revision — the base is an empty programme.
+      // All workspace activities/dependencies will appear as "added".
+      baseSnapshot = {
+        programmeId,
+        programmeName: programme.name,
+        revisionNo: 0,
+        scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
+        activities: [],
+        dependencies: [],
+        finalizedAt: '',
+      }
+    }
+
+    // Compute the pure diff.
+    const summary = computeChangeSummary(baseSnapshot, workspaceSnapshot)
+
+    // Enrich dependency change names from the workspace activities.
+    const nameById = new Map(workspaceActivities.map((a) => [a.id, a.name]))
+    for (const dc of summary.dependencies) {
+      dc.predecessorName = nameById.get(dc.predecessorActivityId) ?? dc.predecessorActivityId
+      dc.successorName = nameById.get(dc.successorActivityId) ?? dc.successorActivityId
+    }
+
+    return {
+      ok: true,
+      summary,
+      latestRevisionNo: latestRevision?.revisionNo ?? null,
+    }
   },
 
   /**

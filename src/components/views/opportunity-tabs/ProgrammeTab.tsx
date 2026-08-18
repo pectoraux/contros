@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import type { OpportunityDetail } from '@/lib/api'
 import { ProgrammeGantt } from '@/components/views/programme/ProgrammeGantt'
+import { FinalizePanel } from '@/components/views/programme/FinalizePanel'
 import type { ScheduleResult } from '@/lib/engines/schedule-engine'
 import type { DependencyType } from '@/lib/programme'
 import type { DependencyItem, DependencyPatch } from '@/components/views/programme/DependencyList'
@@ -48,6 +49,7 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
   const [savingDependencyId, setSavingDependencyId] = useState<string | null>(null)
   const [deletingDependencyId, setDeletingDependencyId] = useState<string | null>(null)
   const [savingActivityUpdateId, setSavingActivityUpdateId] = useState<string | null>(null)
+  const [refreshKey, setRefreshKey] = useState(0)
 
   useEffect(() => {
     // Try to fetch the programme schedule from the API.
@@ -87,7 +89,7 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
       }
     }
     fetchSchedule()
-  }, [opp.id])
+  }, [opp.id, refreshKey])
 
   /**
    * Commit a duration edit. The flow is:
@@ -468,6 +470,16 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
         onCommitActivityUpdate={isWorkspace ? handleCommitActivityUpdate : undefined}
         savingActivityUpdateId={savingActivityUpdateId}
       />
+
+      {/* Finalization panel — workspace mode only.
+          Shows the change summary + Finalize button.
+          Finalization is irreversible; the workspace remains editable. */}
+      {isWorkspace && programmeId && (
+        <FinalizePanel
+          programmeId={programmeId}
+          onFinalized={() => setRefreshKey((k) => k + 1)}
+        />
+      )}
     </div>
   )
 }

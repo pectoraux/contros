@@ -5649,3 +5649,123 @@ NEXT: workspace save/finalization UX — the crucial distinction between
   Current workspace (mutable, unsaved/working plan)
   Finalize → ProgrammeRevision (immutable historical schedule)
 with a "what changed since last revision?" surface.
+
+---
+Task ID: workspace-finalization-ux
+Agent: principal-engineer
+Task: F1 — Workspace save/finalization UX. Three distinct states: current workspace (mutable), latest finalized revision (immutable), proposed next revision (deterministic). Change summary comparing workspace vs latest revision, categorizing schedule-affecting vs presentation changes. Finalize button triggers server-side finalizeProgramme() — no client-side save. Finalization is irreversible. Pure change-summary diff + service + 2 API routes + UI panel + 15 integration tests. No frozen code touched.
+
+THREE STATES (made explicit in the UI):
+  Current workspace      → mutable, unsaved/working plan
+  Latest finalized rev   → immutable historical truth
+  Proposed next revision → deterministic snapshot waiting to be finalized
+
+CHANGE SUMMARY (src/lib/programme/change-summary.ts):
+- Pure function: `computeChangeSummary(base, head) → ChangeSummary`
+- Categorizes changes as:
+    "schedule-affecting" — duration or dependency changes (change CPM outputs)
+    "presentation"       — name or sequence changes (do NOT change CPM outputs)
+- This distinction is the key explainability: the contractor can see which
+  changes affect the schedule vs which are just presentation/organization.
+- Activity changes: added, removed, renamed, reordered, duration-changed
+- Dependency changes: added, removed, type-changed, lag-changed
+- Dependencies matched by (predecessor, successor) ordered pair (U1)
+- Activities matched by ID (not name or sequence)
+- Deterministic: same inputs → same output
+
+SERVICE (src/application/programme-service.ts):
+- `getChangeSummary({ ctx, programmeId })` → loads latest revision + workspace,
+  computes the pure diff, enriches dependency names from workspace activities.
+  If no revision exists, all activities/deps appear as "added".
+
+API ROUTES:
+- POST /api/programmes/:programmeId/finalize
+  → requireAuth → programmeService.finalizeProgramme() → JSON
+  → 200: { ok, revisionId, revisionNo, snapshotContentHash, scheduleEngineVersion }
+  → 404: programme not found / wrong tenant
+  → 422: workspace has invalid schedule (cycles, invalid values)
+- GET /api/programmes/:programmeId/change-summary
+  → requireAuth → programmeService.getChangeSummary() → JSON
+  → 200: { ok, summary, latestRevisionNo }
+
+UI (src/components/views/programme/FinalizePanel.tsx):
+- Shows the three states: latest finalized revision number + proposed next.
+- Change summary panel with categorized changes:
+    schedule-affecting changes labeled in amber
+    presentation changes labeled in blue
+  Each change shows: icon, activity/dependency name, change kind, old→new
+  values, and a "schedule"/"presentation" tag.
+- Finalize button: triggers POST /finalize. NO client-side "save revision"
+  implementation — the server creates the immutable ProgrammeRevision.
+- After finalization: refreshes the change summary (shows no changes) +
+  notifies the parent to refresh the schedule view.
+- "Finalization is irreversible" warning.
+- Workspace mode only — not rendered for revision views.
+
+UI WIRING (ProgrammeTab.tsx):
+- Added `refreshKey` state to trigger schedule refetch after finalization.
+- Renders <FinalizePanel /> below the ProgrammeGantt in workspace mode.
+
+FINALIZATION IS IRREVERSIBLE:
+  ProgrammeRevision is create-finalized-only (X2):
+    ✗ no update method
+    ✗ no delete method
+    ✗ no overwrite
+  The workspace remains editable and becomes the basis for #N+1.
+
+AUDIT:
+  The existing finalizeProgramme() already writes an audit log entry with:
+    programmeId, revisionId, revisionNo, snapshotContentHash,
+    scheduleEngineVersion, activityCount, dependencyCount
+  The actor is recorded via actorId (FK to User).
+
+INTEGRATION TESTS (tests/integration/programme-finalize-ux.test.ts — 15 tests):
+1. Finalize workspace → revision 1.
+2. Edit workspace → revision 1 unchanged (immutability).
+3. Finalize again → revision 2.
+4. Same workspace content → same content hash (deterministic).
+5. Different schedule input → different content hash.
+6. Different sequence → different content hash, SAME CPM result
+   (sequence is content but not scheduling — proven).
+7. Cross-tenant finalize → 404.
+8. Cross-tenant change summary → 404.
+9. Finalized revision is read-only (no update/delete methods on repo — X2).
+10. Audit event recorded (programmeId, revisionId, revisionNo, hash, actor).
+11. Concurrent finalization → unique sequential revisions (6 and 7, same hash).
+12. Change summary is valid after finalization.
+13. Pure diff: same snapshots → no changes.
+14. Pure diff: duration change → schedule-affecting.
+15. Pure diff: sequence change → presentation only, NOT schedule-affecting.
+
+HTTP VERIFICATION (authenticated curl):
+- GET change-summary (no prior revision): latestRevisionNo=null, hasChanges=true,
+  all 3 activities as "added", both deps as "added", all scheduleAffecting. ✅
+- POST finalize: 200, revision 1, content hash returned. ✅
+- GET change-summary (after finalize): latestRevisionNo=1, hasChanges=false. ✅
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Finalization UX (Neon) ............. 15 pass / 0 fail
+- HTTP: change-summary → 200 ............ ✅
+- HTTP: finalize → 200 → revision 1 ..... ✅
+- HTTP: change-summary after → no changes ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE FINALIZATION UX IS NOW END-TO-END LIVE:
+  User sees what changed (schedule-affecting vs presentation)
+      ↓
+  User clicks "Finalize Revision N"
+      ↓
+  Server creates immutable ProgrammeRevision under the Programme-row lock
+      ↓
+  Audit log records who/what/when
+      ↓
+  Workspace remains editable for Revision N+1
+
+The contractor can now answer:
+  "What changed between Revision 3 and Revision 4, and who finalized it?"
+
+NEXT: revision comparison — the bridge to a genuinely useful programme graph:
+  Programme Revision 1 ↕ Programme Revision 2
+      ↓ What changed in duration? dependencies? planned work? commercial linkage?
