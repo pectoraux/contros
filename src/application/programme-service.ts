@@ -49,12 +49,15 @@ import {
 import {
   validateProgrammeSnapshot,
   serializeSnapshot,
+  deserializeSnapshot,
   computeSnapshotContentHash,
+  replaySchedule,
   CURRENT_SCHEDULE_ENGINE_VERSION,
   type ProgrammeSnapshot,
   type ProgrammeActivity,
   type ActivityDependency,
 } from '@/lib/programme'
+import type { ScheduleResult } from '@/lib/engines/schedule-engine'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -257,5 +260,136 @@ export const programmeService = {
    */
   async listProgrammes(ctx: RequestContext, opportunityId?: string) {
     return programmeRepository.listForOrganization(ctx.organizationId, opportunityId)
+  },
+
+  /**
+   * S1: Get the CPM schedule for a programme — either from an immutable
+   * ProgrammeRevision (historical truth) or from the current mutable workspace
+   * (live preview).
+   *
+   * revisionId supplied → immutable ProgrammeRevision:
+   *   deserialize snapshotJson → replaySchedule() → ScheduleResult
+   *
+   * revisionId absent → current mutable workspace:
+   *   construct snapshot in memory → validate → replaySchedule() → ScheduleResult
+   *
+   * The browser renders schedule truth; it does not create schedule truth.
+   * The CPM engine (replaySchedule) owns all date/float/critical-path logic.
+   * The UI must NOT reproduce FS/SS/FF/SF/lag calculations.
+   */
+  async getProgrammeSchedule(
+    input: {
+      ctx: RequestContext
+      programmeId: string
+      revisionId?: string
+    },
+  ): Promise<
+    | {
+        ok: true
+        mode: 'revision' | 'workspace'
+        revisionId?: string
+        revisionNo?: number
+        snapshotContentHash?: string
+        scheduleEngineVersion: number
+        schedule: ScheduleResult
+        programmeName: string
+      }
+    | Err
+  > {
+    const { ctx, programmeId, revisionId } = input
+
+    // ── Revision mode: immutable historical truth ──────────────────────────
+    if (revisionId) {
+      const revision = await programmeRevisionRepo.getForOrganization(
+        ctx.organizationId,
+        revisionId,
+      )
+      if (!revision) {
+        return { ok: false, error: 'Programme revision not found in this organization', status: 404 }
+      }
+      if (revision.status !== 'finalized') {
+        return { ok: false, error: 'Programme revision is not finalized', status: 422 }
+      }
+
+      const snapshot = deserializeSnapshot(revision.snapshotJson)
+      const schedule = replaySchedule(snapshot)
+
+      return {
+        ok: true,
+        mode: 'revision',
+        revisionId: revision.id,
+        revisionNo: revision.revisionNo,
+        snapshotContentHash: revision.snapshotContentHash,
+        scheduleEngineVersion: revision.scheduleEngineVersion,
+        schedule,
+        programmeName: revision.programme.name,
+      }
+    }
+
+    // ── Workspace mode: current mutable preview ────────────────────────────
+    const programme = await programmeRepository.getForOrganization(
+      ctx.organizationId,
+      programmeId,
+    )
+    if (!programme) {
+      return { ok: false, error: 'Programme not found in this organization', status: 404 }
+    }
+
+    // Build a snapshot from the current mutable workspace (NOT under a lock —
+    // this is a read-only preview, not a finalization. The schedule may
+    // change if the workspace is edited concurrently, which is acceptable for
+    // a live preview.)
+    const activities: ProgrammeActivity[] = programme.activities.map((a) => ({
+      id: a.id,
+      name: a.name,
+      duration: a.duration,
+      constructionRefs: {
+        estimateLineId: a.estimateLineId,
+        workDefinitionVersionId: a.workDefinitionVersionId,
+        workPackageId: null,
+      },
+      plannedQuantity: a.plannedQuantity,
+      status: a.status as 'planned' | 'in-progress' | 'complete',
+      predecessorDependencies: [],
+    }))
+
+    const dependencies: ActivityDependency[] = programme.dependencies.map((d) => ({
+      id: d.id,
+      predecessorActivityId: d.predecessorActivityId,
+      successorActivityId: d.successorActivityId,
+      type: d.type as 'FS' | 'SS' | 'FF' | 'SF',
+      lag: d.lag,
+    }))
+
+    const snapshot: ProgrammeSnapshot = {
+      programmeId: programme.id,
+      programmeName: programme.name,
+      revisionNo: 0,
+      scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
+      activities,
+      dependencies,
+      finalizedAt: '',
+    }
+
+    // Validate before replaying — if the workspace has cycles or invalid
+    // values, return an error rather than a partial schedule.
+    const validation = validateProgrammeSnapshot(snapshot)
+    if (!validation.ok) {
+      return {
+        ok: false,
+        error: `Workspace schedule is invalid: ${validation.errors.join('; ')}`,
+        status: 422,
+      }
+    }
+
+    const schedule = replaySchedule(snapshot)
+
+    return {
+      ok: true,
+      mode: 'workspace',
+      scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
+      schedule,
+      programmeName: programme.name,
+    }
   },
 }

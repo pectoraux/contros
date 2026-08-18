@@ -4688,3 +4688,50 @@ THE INVARIANT IS NOW COMPLETE:
   No workspace mutation can race with finalization.
   No finalized snapshot can be partially mixed.
   All 18 PostgreSQL integration tests pass.
+
+---
+Task ID: programme-schedule-read-service
+Agent: principal-engineer
+Task: S1 — getProgrammeSchedule read service (revision mode + workspace preview mode). S2 — 9 PostgreSQL integration tests. No frozen code touched.
+
+SERVICE (src/application/programme-service.ts):
+- getProgrammeSchedule({ ctx, programmeId, revisionId? }) →
+  { ok: true, mode, schedule: ScheduleResult, ... } | Err
+- Two modes:
+  * revision mode (revisionId supplied): deserialize the immutable
+    ProgrammeRevision.snapshotJson → replaySchedule() → ScheduleResult.
+    The schedule is historical truth — it does not change when the workspace
+    is edited.
+  * workspace mode (revisionId absent): construct a snapshot from the current
+    mutable Programme + Activities + Dependencies → validate →
+    replaySchedule() → ScheduleResult. The schedule is a live preview — it
+    changes when the workspace is edited.
+- The CPM engine (replaySchedule) owns ALL date/float/critical-path logic.
+  The UI must NOT reproduce FS/SS/FF/SF/lag calculations.
+
+INTEGRATION TESTS (tests/integration/programme-schedule-read.test.ts — 9 tests):
+1. Revision mode: finalized revision → deterministic ScheduleResult (15 days,
+   2 activities, critical path contains both).
+2. Workspace mode: current mutable workspace → deterministic preview.
+3. Same revision → same ScheduleResult (determinism).
+4. Tenant isolation: Org B cannot read Org A's schedule (404).
+5. Tenant isolation: Org B cannot read Org A's revision (404).
+6. Revision schedule does not change after workspace edits (historical truth).
+7. Workspace preview changes after activity edit (20+10=30 days).
+8. Missing programme → 404.
+9. Non-finalized revision → 422.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Programme schedule read (Neon) ...... 9 pass / 0 fail / 31 expect()
+- Frozen Phase 1 code ................. UNTOUCHED
+
+THE READ SERVICE ESTABLISHES:
+  ProgrammeRevision / Programme
+      ↓ getProgrammeSchedule (tenant-scoped)
+  ScheduleResult (from replaySchedule — the pure CPM engine)
+      ↓
+  Read-only Gantt view (renders, does not calculate)
+
+NEXT: the Gantt UI component (read-only, renders ScheduleResult).
