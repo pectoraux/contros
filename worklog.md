@@ -4768,3 +4768,58 @@ THE READ SERVICE IS NOW IDENTITY-SAFE:
   Tenant isolation → 404 (not a schedule from the wrong org).
   Non-finalized → 422 (not a schedule from a mutable draft).
   Workspace mode → validated live preview (not a historical truth).
+
+---
+Task ID: gantt-read-only-workspace
+Agent: principal-engineer
+Task: Read-only Gantt UI — API route + ProgrammeGantt component + ProgrammeTab wiring + browser smoke test. No frozen code touched.
+
+API ROUTES:
+- GET /api/programmes/[programmeId]/schedule (revisionId optional query param)
+  → requireAuth → programmeService.getProgrammeSchedule() → JSON response.
+  Response: { mode, programmeName, scheduleEngineVersion, revisionId?, revisionNo?, snapshotContentHash?, schedule }
+- GET /api/programmes/list?opportunityId=...
+  → requireAuth → programmeService.listProgrammes() → JSON array.
+
+GANTT COMPONENT (src/components/views/programme/ProgrammeGantt.tsx):
+- PURE RENDERER of ScheduleResult. Calculates PIXEL positions (barLeft, barWidth)
+  from the engine's day-based values, but does NOT calculate scheduling
+  semantics (start, finish, float, critical path, dependency resolution).
+- Displays: activity name, duration, early start, early finish, total float,
+  critical-path badge, timeline bar with day-grid.
+- Provenance header distinguishes "Revision N — finalized (historical truth)"
+  from "Current workspace preview (mutable — not finalized)".
+
+PROGRAMME TAB (src/components/views/opportunity-tabs/ProgrammeTab.tsx):
+- Rewritten from the old client-side CPM generation (generateProgrammeFromEstimate)
+  to fetch ScheduleResult from the API route.
+- Fetches: /api/programmes/list → /api/programmes/:id/schedule.
+- Renders <ProgrammeGantt /> with the server-computed schedule.
+- Shows loading, error, and empty states.
+- NO client-side CPM calculation (the old generateProgrammeFromEstimate +
+  computeSchedule calls are removed).
+
+BROWSER SMOKE TEST (authenticated, using seeded demo user + seeded programme):
+- Auth: kwesi@adomconstruction.gh / demo1234 (NextAuth credentials flow).
+- Programme: "Office Complex Programme" (3 activities, 2 FS dependencies).
+- Schedule API response:
+  Mode: workspace
+  Programme: Office Complex Programme
+  Duration: 33 days (3 + 10 + 20, all FS with 0 lag)
+  Activities: 3
+  Critical path: 3 activities (all critical — sequential FS chain)
+  Site Clearing: ES=0 EF=3 Dur=3 Float=0.0 CRITICAL
+  Foundation: ES=3 EF=13 Dur=10 Float=0.0 CRITICAL
+  Structure: ES=13 EF=33 Dur=20 Float=0.0 CRITICAL
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Programme schedule read (Neon) ...... 11 pass / 0 fail (service-level)
+- Browser smoke test .................. ✅ (real NextAuth + seeded programme +
+  schedule API → ScheduleResult with correct CPM values)
+- Frozen Phase 1 code ................. UNTOUCHED
+
+THE BROWSER RENDERS SCHEDULE TRUTH; IT DOES NOT CREATE SCHEDULE TRUTH.
+  Programme → getProgrammeSchedule → replaySchedule() → ScheduleResult → Gantt
+  No client-side CPM. No drag/drop. No date editing. No persistence.
