@@ -6,6 +6,7 @@ import type { OpportunityDetail } from '@/lib/api'
 import { ProgrammeGantt } from '@/components/views/programme/ProgrammeGantt'
 import type { ScheduleResult } from '@/lib/engines/schedule-engine'
 import type { DependencyType } from '@/lib/programme'
+import type { DependencyItem } from '@/components/views/programme/DependencyList'
 import { Info, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -18,12 +19,14 @@ interface ScheduleResponse {
   revisionNo?: number
   snapshotContentHash?: string
   schedule: ScheduleResult
+  dependencies: DependencyItem[]
 }
 
 interface PatchResponse {
   ok?: true
   schedule?: ScheduleResult
   programmeName?: string
+  dependencies?: DependencyItem[]
   error?: string
 }
 
@@ -31,6 +34,7 @@ interface DependencyResponse {
   ok?: true
   schedule?: ScheduleResult
   programmeName?: string
+  dependencies?: DependencyItem[]
   error?: string
 }
 
@@ -41,6 +45,7 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
   const [error, setError] = useState<string | null>(null)
   const [savingActivityId, setSavingActivityId] = useState<string | null>(null)
   const [savingDependency, setSavingDependency] = useState(false)
+  const [savingDependencyId, setSavingDependencyId] = useState<string | null>(null)
 
   useEffect(() => {
     // Try to fetch the programme schedule from the API.
@@ -124,6 +129,7 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
                   ...prev,
                   schedule: data.schedule!,
                   programmeName: data.programmeName ?? prev.programmeName,
+                  dependencies: data.dependencies ?? prev.dependencies,
                 }
               : prev,
           )
@@ -190,6 +196,7 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
                   ...prev,
                   schedule: data.schedule!,
                   programmeName: data.programmeName ?? prev.programmeName,
+                  dependencies: data.dependencies ?? prev.dependencies,
                 }
               : prev,
           )
@@ -203,6 +210,71 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
         return false
       } finally {
         setSavingDependency(false)
+      }
+    },
+    [programmeId],
+  )
+
+  /**
+   * Commit a dependency type/lag update. The flow is:
+   *
+   *   type + lag
+   *       ↓
+   *   PATCH /api/programmes/:programmeId/dependencies/:dependencyId
+   *       ↓
+   *   updated ScheduleResult (with updated dependencies list)
+   *       ↓
+   *   replace Gantt state
+   *
+   * The dependency ROW ID is the stable identity (U1); type and lag are
+   * MUTABLE PROPERTIES. This updates the SAME row — it never creates a
+   * competing edge. The UI sends only the property inputs; the server
+   * validates (same-tenant, same-programme, dependency exists, finite lag,
+   * valid type, no cycle) inside the Programme-row lock and returns the
+   * engine's recomputed ScheduleResult + updated dependencies list.
+   *
+   * Returns true on success (the row keeps its values), false on failure
+   * (the row reverts to the committed values).
+   */
+  const handleUpdateDependency = useCallback(
+    async (dependencyId: string, type: DependencyType, lag: number): Promise<boolean> => {
+      if (!programmeId) return false
+      setSavingDependencyId(dependencyId)
+      try {
+        const res = await fetch(
+          `/api/programmes/${programmeId}/dependencies/${dependencyId}`,
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type, lag }),
+          },
+        )
+        const data: DependencyResponse = await res.json().catch(() => ({}))
+        if (res.ok && data.ok && data.schedule) {
+          // Replace the entire schedule state with the engine's recomputed
+          // result. The updated type/lag may shift start/finish/float/
+          // critical-path values across the whole graph — all derived from
+          // the server.
+          setSchedule((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  schedule: data.schedule!,
+                  programmeName: data.programmeName ?? prev.programmeName,
+                  dependencies: data.dependencies ?? prev.dependencies,
+                }
+              : prev,
+          )
+          return true
+        }
+        // Failure: show the server's error (e.g. cycle, invalid type).
+        toast.error(data.error ?? 'Could not update dependency.')
+        return false
+      } catch {
+        toast.error('Network error while updating dependency.')
+        return false
+      } finally {
+        setSavingDependencyId(null)
       }
     },
     [programmeId],
@@ -281,6 +353,9 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
         savingActivityId={savingActivityId}
         onAddDependency={isWorkspace ? handleAddDependency : undefined}
         savingDependency={savingDependency}
+        dependencies={schedule.dependencies}
+        onUpdateDependency={isWorkspace ? handleUpdateDependency : undefined}
+        savingDependencyId={savingDependencyId}
       />
     </div>
   )

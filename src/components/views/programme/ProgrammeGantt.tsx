@@ -41,6 +41,7 @@ import { Loader2, Lock } from 'lucide-react'
 import type { ScheduleResult, ScheduledActivity } from '@/lib/engines/schedule-engine'
 import type { DependencyType } from '@/lib/programme'
 import { AddDependencyForm } from './AddDependencyForm'
+import { DependencyList, type DependencyItem } from './DependencyList'
 
 interface ProgrammeGanttProps {
   schedule: ScheduleResult
@@ -59,6 +60,10 @@ interface ProgrammeGanttProps {
     lag: number
   }) => Promise<boolean>
   savingDependency?: boolean
+  /** D2: existing dependency edges (with row IDs for PATCH). */
+  dependencies?: DependencyItem[]
+  onUpdateDependency?: (dependencyId: string, type: DependencyType, lag: number) => Promise<boolean>
+  savingDependencyId?: string | null
 }
 
 // Pixel width per day.
@@ -78,6 +83,9 @@ export function ProgrammeGantt({
   savingActivityId = null,
   onAddDependency,
   savingDependency = false,
+  dependencies = [],
+  onUpdateDependency,
+  savingDependencyId = null,
 }: ProgrammeGanttProps) {
   const { activities, projectDuration, criticalPath } = schedule
   const totalWidth = Math.max(projectDuration * DAY_WIDTH, 200)
@@ -182,6 +190,29 @@ export function ProgrammeGantt({
             activities={activities}
             onAdd={onAddDependency}
             saving={savingDependency}
+          />
+        </div>
+      )}
+
+      {/* Existing dependencies list — editable type/lag in workspace mode.
+          The dependency ROW ID is the stable identity (U1); type and lag
+          are MUTABLE PROPERTIES. The UI edits only those properties; the
+          engine derives the schedule OUTPUTS. */}
+      {dependencies.length > 0 && (
+        <div className="rounded-lg border border-border bg-card p-4">
+          <h4 className="mb-1 text-sm font-medium">
+            Dependencies ({dependencies.length})
+          </h4>
+          <p className="mb-3 text-xs text-muted-foreground">
+            {editable
+              ? 'Change type or lag to recompute the schedule. The ordered pair (predecessor → successor) is fixed — update the properties, not the identity.'
+              : 'These edges are part of the finalized revision (read-only).'}
+          </p>
+          <DependencyList
+            dependencies={dependencies}
+            editable={editable}
+            savingDependencyId={savingDependencyId}
+            onCommitUpdate={onUpdateDependency}
           />
         </div>
       )}

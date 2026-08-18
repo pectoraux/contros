@@ -5227,3 +5227,123 @@ THE DEPENDENCY IDENTITY IS NOW SETTLED:
 This gives us a coherent scheduling graph instead of gradually
 accumulating ambiguous edge records. The next mutations (change type,
 change lag, delete) now have a clean target: one edge per ordered pair.
+
+---
+Task ID: programme-dependency-type-lag-editing
+Agent: principal-engineer
+Task: D2 — Dependency type/lag editing: the third controlled schedule mutation. PATCH the existing dependency row (U1: row ID = identity, type/lag = mutable properties). Service + repo + API route + 9 PostgreSQL integration tests + UI (DependencyList with editable type/lag) + HTTP/browser verification. Also added `dependencies` to the schedule API response (carries row IDs for PATCH). No frozen code touched.
+
+REPOSITORY (src/repositories/programme-repositories.ts):
+- Added `activityDependencyRepository.updateInTransaction(tx, programmeId, dependencyId, { type, lag })`.
+  Does the authoritative identity check (dependency.programmeId === programmeId)
+  + update. Returns the updated row. Throws if not found in this programme.
+- NOTE: predecessor/successor are NOT updatable — they ARE the identity (U1).
+  To change the ordered pair, delete + create.
+
+SERVICE (src/application/programme-service.ts):
+- `updateDependency({ ctx, programmeId, dependencyId, type, lag })`
+  → `{ ok: true, schedule, programmeName, dependencies } | Err`
+- Flow (snapshot-at-lock — mirrors addDependency):
+    1. Pre-DB validation (pure): type ∈ {FS,SS,FF,SF}, lag finite → 422.
+    2. Pre-flight: programme exists (tenant-scoped read) → 404.
+    3. TRANSACTION:
+       a. SELECT FOR UPDATE on Programme row (lock).
+       b. Read activities + dependencies UNDER THE LOCK.
+       c. Find existing dependency by row ID → 404 if not found.
+       d. Build would-be snapshot (current graph, with this edge's type/lag
+          replaced by the new values; predecessor/successor unchanged — U1).
+       e. validateProgrammeSnapshot → if hasCycle → 422.
+       f. updateInTransaction (identity check + persist).
+    4. getProgrammeSchedule → return updated ScheduleResult + dependencies.
+- The cycle check runs inside the lock — authoritative against concurrent
+  mutations.
+
+DEPENDENCY VIEW (D2 — schedule API response enrichment):
+- Added `DependencyView` type: { id, programmeId, predecessorActivityId,
+  predecessorName, successorActivityId, successorName, type, lag }.
+- `getProgrammeSchedule` now returns `dependencies: DependencyView[]` in
+  BOTH revision and workspace modes. This carries the dependency row IDs
+  (which the schedule engine's SchedulePredecessor does not) so the UI can
+  PATCH type/lag by stable row identity.
+- All three mutation methods (updateActivityDuration, addDependency,
+  updateDependency) now also return `dependencies` so the UI gets the
+  updated list after any mutation.
+
+API ROUTE (src/app/api/programmes/[programmeId]/dependencies/[dependencyId]/route.ts):
+- PATCH → requireAuth → parse body → programmeService.updateDependency() → JSON.
+- 200 → { ok, schedule, programmeName, dependencies }
+- 404 → programme or dependency not found / wrong tenant
+- 422 → invalid type, non-finite lag, or cycle
+- Thin route: no domain logic, no CPM calculation.
+
+INTEGRATION TESTS (tests/integration/programme-dependency-update.test.ts — 9 tests, all passing):
+1. Update FS/0 → SS/2 → schedule changes (ACT_2: ES 5→2), exactly one edge
+   remains (same row ID, type=SS, lag=2).
+2. Finalized ProgrammeRevision unchanged after updating a dependency.
+3. Cross-tenant: Org B cannot update Org A dependency → 404.
+4. Cross-programme: dependency from Programme B → 404 (and unchanged).
+5. Missing dependency (nonexistent ID) → 404.
+6. NaN lag → 422 (and unchanged).
+7. Infinity lag → 422.
+8. Invalid type 'XX' → 422 (and unchanged).
+9. Concurrent update + finalization → both succeed, serialized by Programme
+   lock; revision is internally consistent (ES is either 5 or 7, not mixed).
+
+UI (src/components/views/programme/DependencyList.tsx):
+- New component: editable list of existing dependency edges.
+- Each row shows: predecessor → successor (read-only identity, U1) + type
+  (Select) + lag (Input). In workspace mode these are editable; in revision
+  mode they're read-only badges.
+- On commit (blur/Enter): PATCH → parent replaces ScheduleResult → row
+  remounts with fresh state (keyed by `${id}:${type}:${lag}` to avoid
+  setState-in-effect anti-pattern).
+- The UI edits only type/lag; the engine derives the schedule OUTPUTS.
+
+UI WIRING (ProgrammeGantt.tsx + ProgrammeTab.tsx):
+- ProgrammeGantt: new props `dependencies`, `onUpdateDependency`,
+  `savingDependencyId`. Renders <DependencyList /> below the AddDependencyForm.
+- ProgrammeTab: `handleUpdateDependency` → PATCH → replace schedule state
+  (including dependencies). No optimistic client-side CPM.
+
+HTTP VERIFICATION (authenticated curl):
+- PATCH FS/0 → SS/2: 200, duration 33→32 (SS/2: Foundation ES = 0+2=2),
+  dep count still 2 (same row updated), type=SS, lag=2. ✅
+- PATCH invalid type 'XX': 422, "Invalid dependency type: XX". ✅
+- PATCH NaN lag: 422. ✅
+- Restore to FS/0: 200. ✅
+- Dev log: PATCH 200, PATCH 422, PATCH 422, PATCH 200.
+
+BROWSER VERIFICATION (agent-browser eval, authenticated):
+- Before: type=FS, lag=0, duration=33.
+- PATCH SS/3: status=200.
+- After: type=SS, lag=3, duration=33, depCount=2 (same row, not duplicated). ✅
+- Restored to FS/0. ✅
+- (Duration stayed 33 because SS/3 gives Foundation ES=3, same as FS/0
+  which gives ES=EF_SiteClearing=3. The schedule logic is correct.)
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Dependency update integration (Neon) . 9 pass / 0 fail / 36 expect()
+- Schedule read integration (Neon) .... 11 pass / 0 fail (response shape OK)
+- HTTP: PATCH type/lag → 200 → schedule updates .. ✅
+- HTTP: invalid type → 422 → unchanged ........... ✅
+- HTTP: NaN lag → 422 → unchanged ................. ✅
+- Browser: PATCH via eval → 200 → dep updated .... ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE THIRD CONTROLLED SCHEDULE MUTATION IS NOW END-TO-END LIVE:
+  User edits type/lag → Enter → PATCH → engine recalculates → Gantt updates
+  The browser sends workspace INPUTS; the scheduling engine derives OUTPUTS.
+  The dependency ROW ID is the stable identity; type/lag are mutable properties.
+  The same row is updated — never a competing edge.
+
+U1 IDENTITY IS NOW FULLY OPERATIONAL:
+  Add A→B     → POST   (creates the relationship)
+  Update A→B  → PATCH  (changes type/lag on the SAME row)
+  [Delete A→B → DELETE (next milestone)]
+
+The scheduling graph is now coherent: one edge per ordered pair, with
+mutable type/lag properties. The next mutation (delete dependency) is the
+natural fourth graph operation, then activity rename/reorder and finally
+revision comparison.

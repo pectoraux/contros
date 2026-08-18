@@ -464,6 +464,58 @@ export const activityDependencyRepository = {
   },
 
   /**
+   * D2: Update a dependency's type and/or lag WITHIN a caller-held
+   * transaction. The dependency row ID is the stable identity (U1); type
+   * and lag are MUTABLE PROPERTIES of the relationship.
+   *
+   * The caller (ProgrammeService.updateDependency) has ALREADY:
+   *   - acquired the Programme row lock (SELECT FOR UPDATE)
+   *   - verified the dependency belongs to the programme + tenant
+   *   - validated finite lag + valid type
+   *   - built the would-be graph and validated no cycle
+   *
+   * This method does the authoritative identity check:
+   *   dependency.programmeId === programmeId
+   * (tenant ownership is verified via the Programme relation upstream).
+   *
+   * Returns the updated dependency row. Throws if the dependency is not
+   * found in this programme (404-equivalent at the repo boundary — the
+   * service converts this to a typed error).
+   *
+   * NOTE: predecessor/successor are NOT updatable here — they ARE the
+   * identity (U1). To change the ordered pair, delete + create.
+   */
+  async updateInTransaction(
+    tx: Tx,
+    programmeId: string,
+    dependencyId: string,
+    data: {
+      type: string
+      lag: number
+    },
+  ) {
+    // Identity check: the dependency must belong to this programme.
+    // This is the authoritative programme-membership enforcement.
+    const existing = await tx.activityDependency.findFirst({
+      where: { id: dependencyId, programmeId },
+      select: { id: true, programmeId: true },
+    })
+    if (!existing) {
+      throw new Error(
+        `Dependency "${dependencyId}" not found in programme "${programmeId}"`,
+      )
+    }
+
+    return tx.activityDependency.update({
+      where: { id: dependencyId },
+      data: {
+        type: data.type,
+        lag: data.lag,
+      },
+    })
+  },
+
+  /**
    * R1: Delete all dependencies for a programme. Takes the Programme row lock
    * first to serialize against concurrent finalization.
    */

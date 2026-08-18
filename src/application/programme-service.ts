@@ -65,6 +65,24 @@ import type { ScheduleResult } from '@/lib/engines/schedule-engine'
 type Err = { ok: false; error: string; status: number }
 
 /**
+ * D2: UI-facing view of a dependency edge. Carries the row ID (stable
+ * identity for PATCH) + predecessor/successor activity IDs + names + the
+ * mutable type/lag properties. The schedule engine's SchedulePredecessor
+ * only carries the predecessor activity ID, so this view gives the UI the
+ * stable row identity it needs to PATCH type/lag.
+ */
+export interface DependencyView {
+  id: string
+  programmeId: string
+  predecessorActivityId: string
+  predecessorName: string
+  successorActivityId: string
+  successorName: string
+  type: DependencyType
+  lag: number
+}
+
+/**
  * D1: Internal error class for dependency validation failures thrown inside
  * the locked transaction. The service catches these and converts them to
  * typed { ok: false, error, status } results. Other thrown errors (e.g. X3
@@ -308,6 +326,14 @@ export const programmeService = {
         scheduleEngineVersion: number
         schedule: ScheduleResult
         programmeName: string
+        /**
+         * D2: the dependency edges with their row IDs + predecessor/successor
+         * names + type/lag. The schedule engine's SchedulePredecessor only
+         * carries the predecessor activity ID (not the dependency row ID),
+         * so this array gives the UI the stable row identity it needs to
+         * PATCH type/lag. Returned for both revision and workspace modes.
+         */
+        dependencies: DependencyView[]
       }
     | Err
   > {
@@ -336,6 +362,23 @@ export const programmeService = {
       const snapshot = deserializeSnapshot(revision.snapshotJson)
       const schedule = replaySchedule(snapshot)
 
+      // D2: build the dependency views from the snapshot. The snapshot
+      // carries the full graph (activities + dependencies), so we can map
+      // row IDs + names for the UI.
+      const activityNameById = new Map(
+        snapshot.activities.map((a) => [a.id, a.name]),
+      )
+      const dependencyViews: DependencyView[] = snapshot.dependencies.map((d) => ({
+        id: d.id,
+        programmeId: snapshot.programmeId,
+        predecessorActivityId: d.predecessorActivityId,
+        predecessorName: activityNameById.get(d.predecessorActivityId) ?? '?',
+        successorActivityId: d.successorActivityId,
+        successorName: activityNameById.get(d.successorActivityId) ?? '?',
+        type: d.type,
+        lag: d.lag,
+      }))
+
       return {
         ok: true,
         mode: 'revision',
@@ -345,6 +388,7 @@ export const programmeService = {
         scheduleEngineVersion: revision.scheduleEngineVersion,
         schedule,
         programmeName: revision.programme.name,
+        dependencies: dependencyViews,
       }
     }
 
@@ -406,12 +450,30 @@ export const programmeService = {
 
     const schedule = replaySchedule(snapshot)
 
+    // D2: build the dependency views from the workspace graph. The
+    // programme.activities include names; programme.dependencies carry the
+    // row IDs. This gives the UI the stable row identity for PATCH.
+    const activityNameById = new Map(
+      programme.activities.map((a) => [a.id, a.name]),
+    )
+    const dependencyViews: DependencyView[] = programme.dependencies.map((d) => ({
+      id: d.id,
+      programmeId: programme.id,
+      predecessorActivityId: d.predecessorActivityId,
+      predecessorName: activityNameById.get(d.predecessorActivityId) ?? '?',
+      successorActivityId: d.successorActivityId,
+      successorName: activityNameById.get(d.successorActivityId) ?? '?',
+      type: d.type as DependencyType,
+      lag: d.lag,
+    }))
+
     return {
       ok: true,
       mode: 'workspace',
       scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
       schedule,
       programmeName: programme.name,
+      dependencies: dependencyViews,
     }
   },
 
@@ -449,6 +511,7 @@ export const programmeService = {
         ok: true
         schedule: ScheduleResult
         programmeName: string
+        dependencies: DependencyView[]
       }
     | Err
   > {
@@ -493,6 +556,7 @@ export const programmeService = {
       ok: true,
       schedule: scheduleResult.schedule,
       programmeName: scheduleResult.programmeName,
+      dependencies: scheduleResult.dependencies,
     }
   },
 
@@ -561,6 +625,7 @@ export const programmeService = {
         ok: true
         schedule: ScheduleResult
         programmeName: string
+        dependencies: DependencyView[]
       }
     | Err
   > {
@@ -760,6 +825,213 @@ export const programmeService = {
       ok: true,
       schedule: scheduleResult.schedule,
       programmeName: scheduleResult.programmeName,
+      dependencies: scheduleResult.dependencies,
+    }
+  },
+
+  /**
+   * D2: Update a dependency's type and/or lag — the third controlled
+   * schedule mutation.
+   *
+   * The dependency ROW ID is the stable identity (U1); type and lag are
+   * MUTABLE PROPERTIES. This method updates the SAME row — it never creates
+   * a competing edge. To change the ordered pair (predecessor/successor),
+   * delete + create.
+   *
+   * Flow (snapshot-at-lock — mirrors addDependency + finalizeProgramme):
+   *   RequestContext
+   *       ↓
+   *   validate type ∈ {FS,SS,FF,SF} + finite lag  (pure, pre-DB)
+   *       ↓
+   *   pre-flight: programme exists (tenant-scoped read)
+   *       ↓
+   *   TRANSACTION:
+   *     SELECT FOR UPDATE on Programme row  (lock)
+   *     read activities + dependencies UNDER THE LOCK
+   *     find existing dependency by row ID
+   *       → not found in this programme → 404
+   *     build would-be snapshot (current graph, with this edge's type/lag
+   *       replaced by the new values)
+   *     validateProgrammeSnapshot (cycle + finite) → 422 on cycle
+   *     activityDependencyRepository.updateInTransaction  (identity + persist)
+   *       ↓
+   *   getProgrammeSchedule (workspace preview with the updated edge)
+   *       ↓
+   *   updated ScheduleResult
+   *
+   * CONCURRENCY: the cycle check is authoritative because it runs INSIDE the
+   * Programme-row lock. A concurrent updateDependency or addDependency that
+   * would jointly form a cycle cannot both pass: the second sees the first's
+   * committed edge under the lock. This is the snapshot-at-lock discipline
+   * (Q1) applied to dependency mutation.
+   *
+   * Validation summary:
+   *   same tenant        — programmeRepository.getForOrganization (tenant scope)
+   *   same programme     — updateInTransaction checks dependency.programmeId === programmeId
+   *   dependency exists  — service checks under the lock → 404
+   *   finite lag         — service checks pre-DB (Number.isFinite) → 422
+   *   valid type         — service checks pre-DB (∈ {FS,SS,FF,SF}) → 422
+   *   no cycle           — validateProgrammeSnapshot under the lock → 422
+   *
+   * U1 NOTE: predecessor/successor are NOT updatable. They ARE the identity.
+   * This method only changes type and lag. The would-be graph uses the
+   * existing predecessor/successor with the new type/lag.
+   */
+  async updateDependency(
+    input: {
+      ctx: RequestContext
+      programmeId: string
+      dependencyId: string
+      type: DependencyType
+      lag: number
+    },
+  ): Promise<
+    | {
+        ok: true
+        schedule: ScheduleResult
+        programmeName: string
+        dependencies: DependencyView[]
+      }
+    | Err
+  > {
+    const { ctx, programmeId, dependencyId, type, lag } = input
+
+    // ── Pre-DB validation (pure) ──────────────────────────────────────────
+    const VALID_TYPES: DependencyType[] = ['FS', 'SS', 'FF', 'SF']
+    if (!VALID_TYPES.includes(type)) {
+      return { ok: false, error: `Invalid dependency type: ${type}`, status: 422 }
+    }
+    if (!Number.isFinite(lag)) {
+      return { ok: false, error: 'Lag must be a finite number', status: 422 }
+    }
+
+    // Pre-flight: verify the programme exists (tenant-scoped). The
+    // authoritative read is inside the transaction under the lock.
+    const programmeExists = await programmeRepository.getForOrganization(
+      ctx.organizationId,
+      programmeId,
+    )
+    if (!programmeExists) {
+      return { ok: false, error: 'Programme not found in this organization', status: 404 }
+    }
+
+    // ── Transaction: lock → read → validate → persist ─────────────────────
+    try {
+      await dbTx.$transaction(async (tx) => {
+        // Lock the Programme row FIRST (snapshot-at-lock, Q1).
+        await tx.$queryRaw`SELECT id FROM "Programme" WHERE id = ${programmeId} FOR UPDATE`
+
+        // Read activities + dependencies UNDER THE LOCK.
+        const [activities, dependencies] = await Promise.all([
+          activityRepository.listForProgrammeInTransaction(tx, ctx.organizationId, programmeId),
+          activityDependencyRepository.listForProgrammeInTransaction(tx, ctx.organizationId, programmeId),
+        ])
+
+        // Find the existing dependency by row ID. U1: the row ID is the
+        // stable identity; the ordered pair (predecessor, successor) is
+        // fixed for this edge.
+        const existingEdge = dependencies.find((d) => d.id === dependencyId)
+        if (!existingEdge) {
+          throw new DependencyValidationError(
+            `Dependency "${dependencyId}" not found in programme "${programmeId}"`,
+            404,
+          )
+        }
+
+        // Build the WOULD-BE snapshot: current graph, but with this edge's
+        // type/lag replaced by the new values. The predecessor/successor
+        // are unchanged (they ARE the identity — U1).
+        const wouldBeDependencies: ActivityDependency[] = dependencies.map((d) =>
+          d.id === dependencyId
+            ? {
+                id: d.id,
+                predecessorActivityId: d.predecessorActivityId,
+                successorActivityId: d.successorActivityId,
+                type,          // NEW
+                lag,           // NEW
+              }
+            : {
+                id: d.id,
+                predecessorActivityId: d.predecessorActivityId,
+                successorActivityId: d.successorActivityId,
+                type: d.type as DependencyType,
+                lag: d.lag,
+              },
+        )
+
+        const wouldBeActivities: ProgrammeActivity[] = activities.map((a) => ({
+          id: a.id,
+          name: a.name,
+          duration: a.duration,
+          constructionRefs: {
+            estimateLineId: a.estimateLineId,
+            workDefinitionVersionId: a.workDefinitionVersionId,
+            workPackageId: null,
+          },
+          plannedQuantity: a.plannedQuantity,
+          status: a.status as 'planned' | 'in-progress' | 'complete',
+          predecessorDependencies: [],
+        }))
+
+        const wouldBeSnapshot: ProgrammeSnapshot = {
+          programmeId,
+          programmeName: programmeExists.name,
+          revisionNo: 0,
+          scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
+          activities: wouldBeActivities,
+          dependencies: wouldBeDependencies,
+          finalizedAt: '',
+        }
+
+        // Validate the would-be graph. The cycle check is the novel
+        // validation: changing type/lag can turn a non-cyclic graph into
+        // a cyclic one (e.g. SS with a large lag could create a feedback
+        // loop through another edge).
+        const validation = validateProgrammeSnapshot(wouldBeSnapshot)
+        if (validation.hasCycle) {
+          throw new DependencyValidationError(
+            'Updated dependency would create a cycle — schedule is infeasible',
+            422,
+          )
+        }
+        if (!validation.ok) {
+          // Defensive: should not happen if the checks above passed.
+          throw new DependencyValidationError(
+            `Dependency validation failed: ${validation.errors.join('; ')}`,
+            422,
+          )
+        }
+
+        // Persist — updateInTransaction does the authoritative identity
+        // check (dependency.programmeId === programmeId) + update.
+        await activityDependencyRepository.updateInTransaction(
+          tx,
+          programmeId,
+          dependencyId,
+          { type, lag },
+        )
+      })
+    } catch (e) {
+      if (e instanceof DependencyValidationError) {
+        return { ok: false, error: e.message, status: e.status }
+      }
+      throw e
+    }
+
+    // Re-fetch the schedule to return the updated CPM result.
+    const scheduleResult = await this.getProgrammeSchedule({
+      ctx,
+      programmeId,
+    })
+    if (!scheduleResult.ok) {
+      return scheduleResult
+    }
+
+    return {
+      ok: true,
+      schedule: scheduleResult.schedule,
+      programmeName: scheduleResult.programmeName,
+      dependencies: scheduleResult.dependencies,
     }
   },
 }
