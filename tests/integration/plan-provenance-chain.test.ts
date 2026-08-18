@@ -34,9 +34,12 @@ const USER_A = 'test-pl-user-a'
 const USER_B = 'test-pl-user-b'
 const CLIENT_A = 'test-pl-client-a'
 const OPP_A = 'test-pl-opp-a'
+const OPP_B = 'test-pl-opp-b'
 const ESTIMATE_A = 'test-pl-estimate-a'
+const ESTIMATE_B = 'test-pl-estimate-b'
 const ESTIMATE_LINE_1 = 'test-pl-line-1'
 const ESTIMATE_LINE_2 = 'test-pl-line-2'
+const ESTIMATE_LINE_B = 'test-pl-line-b'
 
 const ctxA: RequestContext = {
   userId: USER_A, organizationId: ORG_A, role: 'estimator', isDemo: false,
@@ -70,13 +73,19 @@ describe('Plan domain integration tests — provenance chain', () => {
     await db.user.create({ data: { id: USER_A, organizationId: ORG_A, name: 'User A', email: 'a@pl.test', role: 'estimator' } })
     await db.client.create({ data: { id: CLIENT_A, organizationId: ORG_A, name: 'Client A' } })
     await db.opportunity.create({ data: { id: OPP_A, organizationId: ORG_A, clientId: CLIENT_A, title: 'Opp A', status: 'estimating' } })
+    // P2: Second opportunity in the SAME org (for cross-opportunity test).
+    await db.opportunity.create({ data: { id: OPP_B, organizationId: ORG_A, clientId: CLIENT_A, title: 'Opp B', status: 'estimating' } })
     await db.organization.create({ data: { id: ORG_B, name: 'PL Org B', currency: 'GHS' } })
     await db.user.create({ data: { id: USER_B, organizationId: ORG_B, name: 'User B', email: 'b@pl.test', role: 'estimator' } })
 
-    // Create an estimate + 2 estimate lines (for the measurement linkage).
+    // Create an estimate + 2 estimate lines in OPP_A (for the measurement linkage).
     await db.estimate.create({ data: { id: ESTIMATE_A, organizationId: ORG_A, opportunityId: OPP_A, version: 1, status: 'draft' } })
     await db.estimateLine.create({ data: { id: ESTIMATE_LINE_1, estimateId: ESTIMATE_A, description: 'Concrete supply', quantity: 184.6, unit: 'm2', executionStrategy: 'self-perform' } })
     await db.estimateLine.create({ data: { id: ESTIMATE_LINE_2, estimateId: ESTIMATE_A, description: 'Formwork', quantity: 184.6, unit: 'm2', executionStrategy: 'self-perform' } })
+
+    // P2: Create an estimate + line in OPP_B (for cross-opportunity test).
+    await db.estimate.create({ data: { id: ESTIMATE_B, organizationId: ORG_A, opportunityId: OPP_B, version: 1, status: 'draft' } })
+    await db.estimateLine.create({ data: { id: ESTIMATE_LINE_B, estimateId: ESTIMATE_B, description: 'Other project line', quantity: 50, unit: 'm2', executionStrategy: 'self-perform' } })
   }, 120000)
 
   afterAll(async () => {
@@ -339,5 +348,82 @@ describe('Plan domain integration tests — provenance chain', () => {
     // ESTIMATE_LINE_2 still points to the old measurement.
     const line2 = await db.estimateLine.findUnique({ where: { id: ESTIMATE_LINE_2 } })
     expect(line2!.currentMeasurementId).toBe(measurementId)
+  }, 60000)
+
+  // ── 12. P2: Cross-opportunity link (same tenant, different opportunity) → 422 ─
+
+  test('P2: cross-opportunity link (same tenant, different opportunity) → 422', async () => {
+    // The measurement belongs to OPP_A (via the artifact). The EstimateLine
+    // belongs to OPP_B (same org, different project). This must be rejected —
+    // a plan measurement from one project must NEVER become current lineage
+    // for a different project's commercial line merely because both belong to
+    // the same tenant.
+    const res = await planService.linkToEstimateLine({
+      ctx: ctxA,
+      estimateLineId: ESTIMATE_LINE_B, // belongs to OPP_B
+      planMeasurementId: measurementId, // belongs to OPP_A
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.status).toBe(422)
+    expect(res.error).toMatch(/same opportunity/i)
+  }, 60000)
+
+  // ── 13. P4: Invalid documentId → 422 ─────────────────────────────────────
+
+  test('P4: invalid documentId (wrong opportunity) → 422', async () => {
+    // Create a Document in OPP_B.
+    const docB = await db.document.create({
+      data: {
+        organizationId: ORG_A,
+        opportunityId: OPP_B,
+        kind: 'boq',
+        status: 'draft',
+      },
+    })
+
+    // Attempt to create an artifact in OPP_A with a documentId from OPP_B.
+    const res = await planService.createArtifact({
+      ctx: ctxA, opportunityId: OPP_A,
+      fileReference: '/storage/test.pdf',
+      fileName: 'test.pdf',
+      fileHash: 'testdocvalidation',
+      source: 'internal',
+      documentId: docB.id, // belongs to OPP_B, not OPP_A
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.status).toBe(422)
+    expect(res.error).toMatch(/Document does not belong/i)
+
+    // Clean up.
+    await db.document.delete({ where: { id: docB.id } }).catch(() => {})
+  }, 60000)
+
+  // ── 14. P4: Valid documentId (same opportunity) → succeeds ────────────────
+
+  test('P4: valid documentId (same opportunity) → succeeds', async () => {
+    // Create a Document in OPP_A.
+    const docA = await db.document.create({
+      data: {
+        organizationId: ORG_A,
+        opportunityId: OPP_A,
+        kind: 'boq',
+        status: 'draft',
+      },
+    })
+
+    const res = await planService.createArtifact({
+      ctx: ctxA, opportunityId: OPP_A,
+      fileReference: '/storage/test2.pdf',
+      fileName: 'test2.pdf',
+      fileHash: 'testdocvalid',
+      source: 'internal',
+      documentId: docA.id, // belongs to OPP_A — valid
+    })
+    expect(res.ok).toBe(true)
+
+    // Clean up.
+    await db.document.delete({ where: { id: docA.id } }).catch(() => {})
   }, 60000)
 })

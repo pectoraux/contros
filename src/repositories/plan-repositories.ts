@@ -14,7 +14,9 @@
  * deleted — they are historical evidence.
  */
 
-import { db } from '@/lib/db'
+import { db, dbTx } from '@/lib/db'
+
+type Tx = Parameters<Parameters<typeof dbTx.$transaction>[0]>[0]
 
 // ─── PlanArtifact Repository ────────────────────────────────────────────────
 
@@ -81,6 +83,39 @@ export const planArtifactRepository = {
         },
       },
     })
+  },
+
+  /**
+   * P1: Verify that an Opportunity belongs to this organization.
+   * Returns the opportunityId if it exists, null otherwise.
+   * Replaces the direct db.opportunity.findFirst in the service.
+   */
+  async verifyOpportunity(orgId: string, opportunityId: string) {
+    const opp = await db.opportunity.findFirst({
+      where: { id: opportunityId, organizationId: orgId },
+      select: { id: true },
+    })
+    return opp ? opp.id : null
+  },
+
+  /**
+   * P4: Verify that a Document belongs to the same opportunity + tenant.
+   * Returns true if the document exists and belongs to this org + opportunity.
+   */
+  async verifyDocumentOwnership(
+    orgId: string,
+    opportunityId: string,
+    documentId: string,
+  ) {
+    const doc = await db.document.findFirst({
+      where: {
+        id: documentId,
+        organizationId: orgId,
+        opportunityId,
+      },
+      select: { id: true },
+    })
+    return doc !== null
   },
 }
 
@@ -268,6 +303,100 @@ export const planMeasurementRepository = {
           select: { id: true, description: true },
         },
       },
+    })
+  },
+
+  /**
+   * P2: Get the link context for a PlanMeasurement — the measurement ID +
+   * its opportunityId (via the chain: measurement → revision → sheet →
+   * artifact → opportunityId). Used by the service to enforce the
+   * same-opportunity identity rule when linking to an EstimateLine.
+   *
+   * Returns null if the measurement is not found in this org.
+   */
+  async getLinkContext(orgId: string, measurementId: string) {
+    const measurement = await db.planMeasurement.findFirst({
+      where: {
+        id: measurementId,
+        planSheetRevision: {
+          planSheet: {
+            planArtifact: { organizationId: orgId },
+          },
+        },
+      },
+      select: {
+        id: true,
+        planSheetRevision: {
+          select: {
+            planSheet: {
+              select: {
+                planArtifact: {
+                  select: { opportunityId: true },
+                },
+              },
+            },
+          },
+        },
+      },
+    })
+    if (!measurement) return null
+    return {
+      id: measurement.id,
+      opportunityId: measurement.planSheetRevision.planSheet.planArtifact.opportunityId,
+    }
+  },
+}
+
+// ─── Plan EstimateLine Repository ───────────────────────────────────────────
+//
+// Cross-domain query methods for EstimateLine, specifically for the Plan
+// domain's linking use case. These are NOT general-purpose estimate line
+// methods — they exist to support the PlanMeasurement ↔ EstimateLine link
+// with proper same-opportunity enforcement.
+
+export const planEstimateLineRepository = {
+  /**
+   * P2: Get an EstimateLine for plan linking — the line ID + its
+   * opportunityId (via estimate → opportunityId). Used by the service
+   * to enforce the same-opportunity identity rule.
+   *
+   * Returns null if the EstimateLine is not found in this org.
+   */
+  async getForPlanLink(orgId: string, estimateLineId: string) {
+    const line = await db.estimateLine.findFirst({
+      where: {
+        id: estimateLineId,
+        estimate: { opportunity: { organizationId: orgId } },
+      },
+      select: {
+        id: true,
+        estimate: {
+          select: {
+            opportunityId: true,
+          },
+        },
+      },
+    })
+    if (!line) return null
+    return {
+      id: line.id,
+      opportunityId: line.estimate.opportunityId,
+    }
+  },
+
+  /**
+   * P3: Set EstimateLine.currentMeasurementId within a caller-held
+   * transaction. The service holds the transaction so the identity
+   * checks + pointer update form one atomic decision.
+   */
+  async setCurrentMeasurementInTransaction(
+    tx: Tx,
+    estimateLineId: string,
+    planMeasurementId: string,
+  ) {
+    return tx.estimateLine.update({
+      where: { id: estimateLineId },
+      data: { currentMeasurementId: planMeasurementId },
     })
   },
 }

@@ -6757,3 +6757,89 @@ NO CAD parser, IFC engine, PDF takeoff, AI extraction, or plan UI was added.
 The domain boundary is proven against PostgreSQL. The next step is the manual
 measurement UI, then format-specific adapters around the stable PlanMeasurement
 protocol.
+
+---
+Task ID: plan-boundary-hardening
+Agent: principal-engineer
+Task: Close the 4 boundary/identity gaps in the Plan persistence milestone before any UI work. P1: repository boundary (no direct db.* in service). P2: same-opportunity identity enforcement. P3: transactional link mutation. P4: documentId validation. No frozen code touched.
+
+P1 — REPOSITORY BOUNDARY:
+  Removed all direct db.* calls from PlanService:
+    db.opportunity.findFirst  → planArtifactRepository.verifyOpportunity()
+    db.estimateLine.findFirst → planEstimateLineRepository.getForPlanLink()
+    db.estimateLine.update    → planEstimateLineRepository.setCurrentMeasurementInTransaction()
+
+  The service now exclusively uses repository methods. The established
+  boundary is maintained:
+    UI / API → Application Service → Repository → Database
+
+  New repository methods added to plan-repositories.ts:
+    planArtifactRepository.verifyOpportunity(orgId, opportunityId)
+    planArtifactRepository.verifyDocumentOwnership(orgId, opportunityId, documentId)
+    planMeasurementRepository.getLinkContext(orgId, measurementId) — returns {id, opportunityId}
+    planEstimateLineRepository.getForPlanLink(orgId, estimateLineId) — returns {id, opportunityId}
+    planEstimateLineRepository.setCurrentMeasurementInTransaction(tx, estimateLineId, measurementId)
+
+P2 — SAME-OPPORTUNITY IDENTITY ENFORCEMENT:
+  linkToEstimateLine now enforces:
+    PlanMeasurement → PlanArtifact → Opportunity A
+    EstimateLine → Estimate → Opportunity A
+    A === A → link succeeds
+    A !== B → 422 "must belong to the same opportunity"
+
+  This prevents a plan measurement from one project becoming current lineage
+  for a different project's commercial line merely because both belong to the
+  same tenant. This is the same domain-identity discipline established for
+  BOQ ↔ EstimateLine and Programme ↔ Activity.
+
+P3 — TRANSACTIONAL LINK MUTATION:
+  The link operation now runs inside dbTx.$transaction:
+    verify measurement opportunity context
+    verify estimate line opportunity context
+    enforce same-opportunity identity
+    → all inside one transaction
+    → setCurrentMeasurementInTransaction(tx, ...)
+  The identity checks and pointer update form one atomic decision.
+
+P4 — DOCUMENT IDENTITY VALIDATION:
+  createArtifact now validates documentId (if provided):
+    planArtifactRepository.verifyDocumentOwnership(orgId, opportunityId, documentId)
+  An arbitrary documentId from a different opportunity or org is rejected
+  with 422. A valid documentId from the same opportunity is accepted.
+
+INTEGRATION TESTS (3 new, 17 total):
+12. P2: cross-opportunity link (same tenant, different opportunity) → 422.
+    Measurement from OPP_A, EstimateLine from OPP_B (same org). Rejected. ✅
+13. P4: invalid documentId (wrong opportunity) → 422.
+    Document from OPP_B, artifact in OPP_A. Rejected. ✅
+14. P4: valid documentId (same opportunity) → succeeds.
+    Document from OPP_A, artifact in OPP_A. Accepted. ✅
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 328 pass / 0 fail (0 regressions)
+- Plan provenance (Neon) .............. 17 pass / 0 fail / 55 expect()
+- HTTP: full chain → 200 ............... ✅
+- HTTP: link nonexistent line → 404 .... ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE EVIDENCE CHAIN IS NOW BOUNDARY-SAFE:
+  authenticated tenant
+  → upload/register PlanArtifact (documentId validated)
+  → create PlanSheet + immutable revision
+  → create manual PlanMeasurement (validated + content-hashed)
+  → link to EstimateLine (same-opportunity enforced, transactional)
+  → retrieve the complete provenance chain
+
+  drawing file (same opportunity)
+     ↓
+  sheet revision
+     ↓
+  measured fact
+     ↓
+  measurement provenance
+     ↓
+  EstimateLine (same opportunity, same tenant)
+
+A plan measurement from one project can NEVER become current lineage for a
+different project's commercial line. The evidence chain is trustworthy.

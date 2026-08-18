@@ -1374,4 +1374,5 @@ export {
   planSheetRepository,
   planSheetRevisionRepository,
   planMeasurementRepository,
+  planEstimateLineRepository,
 } from './plan-repositories'

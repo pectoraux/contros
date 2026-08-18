@@ -7,24 +7,37 @@
  *                                 EstimateLine (canonical commercial hub)
  *
  * ARCHITECTURE:
- *   RequestContext → validate → compute content hash → persist → audit
+ *   UI / API → Application Service → Repository → Database
  *
- * The service NEVER accepts a caller-supplied contentHash — it always
- * computes the hash from the measurement content (normalized basis). This
- * mirrors the Programme domain's finalizeProgramme discipline.
+ * The service NEVER makes direct db.* calls — all persistence goes through
+ * repository methods. This is the established boundary maintained throughout
+ * Programme and BOQ.
+ *
+ * CROSS-DOMAIN IDENTITY (P2):
+ *   linkToEstimateLine enforces same-opportunity identity:
+ *     PlanMeasurement → PlanArtifact → Opportunity A
+ *     EstimateLine → Estimate → Opportunity A
+ *   A plan measurement from one project must NEVER become current lineage for
+ *   a different project's commercial line merely because both belong to the
+ *   same tenant.
+ *
+ * TRANSACTIONAL LINK (P3):
+ *   The link operation (verify + update) runs inside one transaction so the
+ *   identity checks and pointer update form one atomic decision.
  *
  * VALIDATION CONTRACT:
  *   validatePlanMeasurement() must pass before the hash is treated as
  *   authoritative. The pure hash function is NOT a validation function.
  */
 
-import { db } from '@/lib/db'
+import { dbTx } from '@/lib/db'
 import type { RequestContext } from '@/lib/context'
 import {
   planArtifactRepository,
   planSheetRepository,
   planSheetRevisionRepository,
   planMeasurementRepository,
+  planEstimateLineRepository,
 } from '@/repositories'
 import {
   validatePlanMeasurement,
@@ -85,17 +98,39 @@ export interface LinkMeasurementInput {
 export const planService = {
   /**
    * Create a PlanArtifact (uploaded source file).
+   *
+   * P1: Uses repository methods — no direct db.* calls.
+   * P4: If documentId is provided, verifies it belongs to the same
+   * Opportunity + tenant.
    */
   async createArtifact(input: CreateArtifactInput) {
     const { ctx, opportunityId, fileReference, fileName, fileHash, source, documentId } = input
 
-    // Verify the opportunity belongs to this org.
-    const opportunity = await db.opportunity.findFirst({
-      where: { id: opportunityId, organizationId: ctx.organizationId },
-      select: { id: true },
-    })
-    if (!opportunity) {
+    // P1: Verify the opportunity belongs to this org via repository.
+    const verifiedOpp = await planArtifactRepository.verifyOpportunity(
+      ctx.organizationId,
+      opportunityId,
+    )
+    if (!verifiedOpp) {
       return { ok: false, error: 'Opportunity not found in this organization', status: 404 } as const
+    }
+
+    // P4: If documentId is provided, verify it belongs to the same
+    // Opportunity + tenant. An arbitrary documentId from a different
+    // opportunity or org must not be accepted.
+    if (documentId) {
+      const docValid = await planArtifactRepository.verifyDocumentOwnership(
+        ctx.organizationId,
+        opportunityId,
+        documentId,
+      )
+      if (!docValid) {
+        return {
+          ok: false,
+          error: 'Document does not belong to this opportunity or organization',
+          status: 422,
+        } as const
+      }
     }
 
     const artifact = await planArtifactRepository.create(ctx.organizationId, {
@@ -222,6 +257,16 @@ export const planService = {
   /**
    * Link a PlanMeasurement to an EstimateLine (mutable current lineage).
    *
+   * P1: Uses repository methods — no direct db.* calls.
+   * P2: Enforces same-opportunity identity:
+   *     PlanMeasurement → PlanArtifact → Opportunity A
+   *     EstimateLine → Estimate → Opportunity A
+   *   A plan measurement from one project must NEVER become current lineage
+   *   for a different project's commercial line merely because both belong
+   *   to the same tenant.
+   * P3: The link operation (verify + update) runs inside one transaction so
+   *   the identity checks and pointer update form one atomic decision.
+   *
    * This sets EstimateLine.currentMeasurementId — a mutable pointer, NOT
    * ownership. One measurement can support multiple lines. Rebinding to a
    * new measurement does not affect the old measurement (immutable evidence).
@@ -229,31 +274,44 @@ export const planService = {
   async linkToEstimateLine(input: LinkMeasurementInput) {
     const { ctx, estimateLineId, planMeasurementId } = input
 
-    // Verify the EstimateLine belongs to this org.
-    const estimateLine = await db.estimateLine.findFirst({
-      where: {
-        id: estimateLineId,
-        estimate: { opportunity: { organizationId: ctx.organizationId } },
-      },
-      select: { id: true },
-    })
-    if (!estimateLine) {
-      return { ok: false, error: 'EstimateLine not found in this organization', status: 404 } as const
-    }
-
-    // Verify the PlanMeasurement belongs to this org.
-    const measurement = await planMeasurementRepository.getForOrganization(
+    // P2: Get the measurement's opportunity context (tenant-scoped).
+    const measurementCtx = await planMeasurementRepository.getLinkContext(
       ctx.organizationId,
       planMeasurementId,
     )
-    if (!measurement) {
+    if (!measurementCtx) {
       return { ok: false, error: 'PlanMeasurement not found in this organization', status: 404 } as const
     }
 
-    // Set the mutable current lineage pointer.
-    await db.estimateLine.update({
-      where: { id: estimateLineId },
-      data: { currentMeasurementId: planMeasurementId },
+    // P2: Get the estimate line's opportunity context (tenant-scoped).
+    const lineCtx = await planEstimateLineRepository.getForPlanLink(
+      ctx.organizationId,
+      estimateLineId,
+    )
+    if (!lineCtx) {
+      return { ok: false, error: 'EstimateLine not found in this organization', status: 404 } as const
+    }
+
+    // P2: SAME-OPPORTUNITY IDENTITY ENFORCEMENT.
+    // The measurement and the estimate line must belong to the SAME opportunity.
+    // A plan measurement from one project must never become current lineage for
+    // a different project's commercial line merely because both belong to the
+    // same tenant.
+    if (measurementCtx.opportunityId !== lineCtx.opportunityId) {
+      return {
+        ok: false,
+        error: 'PlanMeasurement and EstimateLine must belong to the same opportunity',
+        status: 422,
+      } as const
+    }
+
+    // P3: Transactional link — verify + update in one atomic decision.
+    await dbTx.$transaction(async (tx) => {
+      await planEstimateLineRepository.setCurrentMeasurementInTransaction(
+        tx,
+        estimateLineId,
+        planMeasurementId,
+      )
     })
 
     return { ok: true, linked: true } as const
