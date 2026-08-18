@@ -6180,3 +6180,283 @@ The first schema decision is: what is a PlanElement?
   - Does it link forward to BoqItem (client's code) or EstimateLine (our line)?
 
 Those questions should be answered before any schema work.
+
+---
+Task ID: plan-measurement-reconnaissance
+Agent: principal-engineer
+Task: Plan/Measurement domain reconnaissance (no schema changes). Answer the 9 specific questions from the review about source artifact identity, sheet/revision identity, measurement provenance, units, methods, link targets, cardinality, additivity, and revision invalidation. Determine whether Document can serve as PlanArtifact or a separate model is needed.
+
+METHODOLOGY:
+  Read ScopeEvidence, ResourcePriceObservation, ProductivityObservation,
+  BoqImport, BoqItem, BoqBinding, Document, DocumentVersion, EstimateLine,
+  WorkDefinition/WDV. Examined the existing "observation" pattern (BoqItem
+  is explicitly an OBSERVATION, not canonical truth). Examined the existing
+  provenance patterns (ResourcePriceObservation.provenance, sourceReference).
+  No code changes.
+
+═══════════════════════════════════════════════════════════════════════════
+FINDING 1: ScopeEvidence is evidence, not a first-class drawing domain
+═══════════════════════════════════════════════════════════════════════════
+
+ScopeEvidence (type: rfq | drawing | specification | client-boq | photo | email | note | ai-extraction):
+  - It's a flat evidence record attached to a ScopePackage.
+  - Fields: type, reference (string?), summary (string).
+  - No sheet, no revision, no geometry, no measured quantity, no binding.
+  - A drawing can be REFERENCED as evidence, but the system has nowhere to
+    represent the drawing's internal structure (sheets, revisions, objects,
+    measured quantities).
+
+  VERDICT: ScopeEvidence confirms the user's revised statement — "Drawing/
+  plan evidence exists, but there is no first-class drawing/geometry domain."
+
+═══════════════════════════════════════════════════════════════════════════
+FINDING 2: The "observation" pattern is already established
+═══════════════════════════════════════════════════════════════════════════
+
+BoqItem is explicitly documented as an OBSERVATION:
+  "BoqItem is an OBSERVATION (what the client spreadsheet said), NOT
+   canonical commercial state. EstimateLine remains the canonical object."
+
+ResourcePriceObservation and ProductivityObservation follow the same pattern:
+  - They record WHAT WAS OBSERVED (price, productivity)
+  - They carry provenance (supplier-quote | invoice | market-survey | manual | historical-bid)
+  - They carry sourceReference (quote #, invoice #, etc.)
+  - They are append-only — observations are never edited, only superseded
+
+PlanMeasurement should follow this SAME pattern:
+  - It's an OBSERVATION (what was measured from a drawing)
+  - It carries provenance (which sheet, which revision, what method)
+  - It's append-only — a new measurement on a revised drawing is a NEW
+    observation, not an edit of the old one
+
+═══════════════════════════════════════════════════════════════════════════
+FINDING 3: Document is NOT suitable as PlanArtifact
+═══════════════════════════════════════════════════════════════════════════
+
+Document has: @@unique([opportunityId, kind]) — one document per kind per
+opportunity. This is wrong for drawings — an opportunity has MANY drawings
+(A-101, A-102, S-001, etc.), not one "drawing document."
+
+DocumentVersion has snapshotJson — immutable assembled content. This is
+designed for generated documents (method statements, BOQ exports), not for
+ingested source artifacts.
+
+BoqImport is closer to the right pattern:
+  - organizationId, opportunityId (optional)
+  - fileReference, fileName, fileHash (storage + identity)
+  - source (client | consultant | tender-portal | internal | other)
+  - status (pending | parsed | failed)
+  - createdById, createdAt
+
+PlanArtifact should mirror BoqImport's file-ingestion pattern, not Document's
+generated-document pattern.
+
+═══════════════════════════════════════════════════════════════════════════
+ANSWERS TO THE 9 RECONNAISSANCE QUESTIONS
+═══════════════════════════════════════════════════════════════════════════
+
+1. SOURCE ARTIFACT IDENTITY
+   An artifact is identified by: (organizationId, opportunityId, drawingNumber,
+   sheetNumber). The drawingNumber + sheetNumber pair is the contractor's
+   external identifier (e.g. "DWG-2024-001" / "A-102"). The fileHash (SHA-256
+   of the file contents) is the content-addressed identity — same file = same
+   hash, regardless of name. The PlanArtifact.id (cuid) is the internal
+   durable identity.
+
+   Pattern to mirror: BoqImport (fileReference + fileName + fileHash + source).
+
+2. SHEET IDENTITY
+   A sheet is a sub-artifact: (PlanArtifact, sheetNumber). A drawing file
+   (PDF, DWG) may contain multiple sheets. Each sheet has its own number
+   (A-101, A-102, S-001) and title. Sheet identity is:
+   (planArtifactId, sheetNumber) — unique within the artifact.
+
+   If the source is a single-sheet PDF, there's one sheet with sheetNumber
+   derived from the file or assigned manually. If it's a multi-sheet DWG,
+   each sheet is a separate row.
+
+3. REVISION IDENTITY
+   Revisions are TIME-INDEXED versions of a sheet. The contractor's external
+   revision identifier is a string ("Rev C", "Rev 3", "2024-08-15"). The
+   internal identity is: (planSheetId, revision) — unique within the sheet.
+
+   A new revision does NOT edit the old one — it creates a new PlanSheetRevision
+   row. The old revision's measurements remain as historical observations
+   (append-only). A revision can be marked as "superseded" but never deleted.
+
+   Pattern to mirror: ProgrammeRevision (revisionNo monotonic, status: draft |
+   baseline | superseded) and DocumentVersion (revisionNo, status: draft |
+   finalized, immutable when finalized).
+
+4. MEASUREMENT PROVENANCE
+   A PlanMeasurement carries:
+   - planSheetRevisionId (which sheet revision it was measured from)
+   - elementReference (string — e.g. "wall-grid-B7", "room-101-floor",
+     "beam-3F-2") — the contractor's reference to the drawn element
+   - measurementMethod (manual | cad-extraction | pdf-takeoff | bim-export |
+     ai-extraction) — how the measurement was obtained
+   - measuredById (who measured it)
+   - measuredAt (when)
+
+   Pattern to mirror: ResourcePriceObservation (provenance string +
+   sourceReference string + observedAt + recordedById).
+
+5. MEASUREMENT UNITS
+   unit is a string (m2 | m3 | m | nr | ton | kg | m2-vertical | m2-horizontal
+   | m-running | etc.). This mirrors WorkDefinition.unit and EstimateLine.unit.
+
+   IMPORTANT: the measurement unit may DIFFER from the commercial unit. A
+   wall might be measured as m2 (area) on the drawing but priced as m (running
+   meters) in the estimate. The PlanMeasurement records the MEASURED unit;
+   the EstimateLine records the COMMERCIAL unit. A conversion factor (if
+   needed) lives in the binding, not in the measurement.
+
+6. MEASUREMENT METHOD
+   measurementMethod is an enum string:
+   - manual          (someone measured it by hand from a print/PDF)
+   - pdf-takeoff     (measured from a PDF using on-screen tools)
+   - cad-extraction  (extracted from a DWG/DXF via an adapter)
+   - bim-export      (exported from an IFC/BIM model)
+   - ai-extraction   (AI-assisted extraction from a drawing image)
+
+   This is the provenance of HOW the number was obtained — critical for
+   auditability. Pattern: ResourcePriceObservation.provenance.
+
+7. LINK TARGET: BoqItem vs EstimateLine
+   PlanMeasurement should link to EstimateLine (not BoqItem), because:
+   - EstimateLine is the canonical commercial hub (9 models reference it)
+   - BoqItem is an OBSERVATION (the client's spreadsheet line) — linking
+     two observations (measurement → BoqItem) doesn't connect to canonical truth
+   - The binding should be: PlanMeasurement → EstimateLine (optional, 1:1 or 1:N)
+
+   HOWEVER: the PlanMeasurement can ALSO carry a boqItemCode (string) for
+   reconciliation with the client's BOQ — without a FK to BoqItem. This lets
+   the measurement be matched to a BoqItem later without coupling.
+
+8. WHETHER ONE MEASUREMENT CAN SUPPORT MULTIPLE BOQ LINES
+   YES. One PlanMeasurement (e.g. "slab area = 184.6 m2") can be referenced
+   by multiple EstimateLines (e.g. concrete supply, formwork, reinforcement
+   all derive from the same slab area). So the link is:
+   - PlanMeasurement.estimateLineId is NOT on the measurement (that would
+     make it 1:1).
+   - Instead, EstimateLine.planMeasurementId (optional) points to the
+     measurement. Multiple EstimateLines can point to the same measurement.
+   - OR: a PlanMeasurementBinding join table (planMeasurementId, estimateLineId)
+     with a conversionFactor and sharePct.
+
+   RECOMMENDATION: start with EstimateLine.planMeasurementId (optional FK) —
+   simpler, and matches the existing Activity.estimateLineId pattern. Add a
+   join table later if multi-binding is needed.
+
+9. HOW REVISIONS INVALIDATE OR SUPERSEDE MEASUREMENTS
+   Measurements are APPEND-ONLY. When a sheet is revised:
+   - The old PlanSheetRevision is marked status = "superseded".
+   - Its PlanMeasurements remain in the database as historical observations.
+   - They are NOT deleted — they are evidence of what was measured from the
+     old revision.
+   - New measurements are created against the new PlanSheetRevision.
+   - The EstimateLine.planMeasurementId can be updated to point to the new
+     measurement (the EstimateLine is mutable; the measurement is not).
+
+   This mirrors the ProgrammeRevision pattern: old revisions are immutable,
+   new revisions supersede them, but the old data remains as history.
+
+═══════════════════════════════════════════════════════════════════════════
+PROPOSED DOMAIN SHAPE (for discussion, not implementation)
+═══════════════════════════════════════════════════════════════════════════
+
+  PlanArtifact (the drawing file: PDF, DWG, IFC)
+    - id, organizationId, opportunityId
+    - drawingNumber, title
+    - fileReference, fileName, fileHash
+    - source (client | consultant | internal)
+    - status (pending | parsed | failed)
+    - createdAt, createdById
+
+      ↓ 1:N
+
+  PlanSheet (a sheet within the artifact)
+    - id, planArtifactId
+    - sheetNumber (A-101, S-001), title
+    - @@unique([planArtifactId, sheetNumber])
+
+      ↓ 1:N
+
+  PlanSheetRevision (a revision of a sheet — append-only)
+    - id, planSheetId
+    - revision (Rev C, Rev 3), revisionDate
+    - fileReference (the specific file for this sheet revision, if separate)
+    - status (current | superseded)
+    - @@unique([planSheetId, revision])
+
+      ↓ 1:N
+
+  PlanMeasurement (a measured fact from a sheet revision — append-only)
+    - id, planSheetRevisionId
+    - elementReference (wall-grid-B7, room-101-floor)
+    - measurementType (length | area | volume | count)
+    - quantity, unit
+    - measurementMethod (manual | pdf-takeoff | cad-extraction | bim-export | ai-extraction)
+    - measuredById, measuredAt
+    - boqItemCode (optional string — for reconciliation, not a FK)
+
+      ↓ (linked via EstimateLine.planMeasurementId, optional)
+
+  EstimateLine (canonical commercial hub — already exists)
+    - planMeasurementId (optional FK — multiple lines can share one measurement)
+
+═══════════════════════════════════════════════════════════════════════════
+THE LONG-TERM GRAPH (confirmed)
+═══════════════════════════════════════════════════════════════════════════
+
+  Plan / BIM / CAD artifact (NEW)
+        ↓
+  Plan sheet + revision (NEW)
+        ↓
+  Plan measurement evidence (NEW — append-only observation)
+        ↓ [EstimateLine.planMeasurementId]
+  EstimateLine (canonical commercial hub — exists)
+        ↓ [Activity.estimateLineId]
+  ProgrammeActivity (schedule truth — exists)
+        ↓ [ProjectActual.estimateLineId]
+  ProjectActual (execution evidence — exists)
+
+  None of these replaces the others as authority:
+    - The plan is the MEASUREMENT authority (what was measured)
+    - The BOQ is the CLIENT'S OBSERVATION (what they asked for)
+    - The EstimateLine is the COMMERCIAL authority (what it costs)
+    - The ProgrammeActivity is the SCHEDULE authority (when it happens)
+    - The ProjectActual is the EXECUTION authority (what actually happened)
+
+═══════════════════════════════════════════════════════════════════════════
+ADAPTER STRATEGY (confirmed)
+═══════════════════════════════════════════════════════════════════════════
+
+  All adapters produce the SAME PlanMeasurement domain object:
+    - PDF drawing → pdf-takeoff adapter → PlanMeasurement (method=pdf-takeoff)
+    - DWG file → cad-extraction adapter → PlanMeasurement (method=cad-extraction)
+    - IFC/BIM → bim-export adapter → PlanMeasurement (method=bim-export)
+    - Manual → manual UI → PlanMeasurement (method=manual)
+    - AI → ai-extraction → PlanMeasurement (method=ai-extraction)
+
+  The measurement is domain-neutral. The adapter is the only thing that
+  knows about the source format. This lets us support real contractor value
+  early (upload PDF, measure slab area, bind to estimate line) without owning
+  a full CAD geometry kernel.
+
+═══════════════════════════════════════════════════════════════════════════
+IMPLEMENTATION SEQUENCE (confirmed, from the review)
+═══════════════════════════════════════════════════════════════════════════
+
+  1. PlanArtifact ingestion (upload a drawing file)
+  2. PlanSheet / revision identity (model sheets + revisions)
+  3. Measurement extraction protocol (PlanMeasurement contract)
+  4. Manual measurement UI (measure from a PDF/image)
+  5. BOQ binding (link measurement → EstimateLine)
+  6. Estimate linkage (EstimateLine.planMeasurementId)
+  7. Programme linkage (Activity already links to EstimateLine — transitive)
+  8. Only then: deeper CAD/BIM interoperability (DWG/IFC adapters)
+
+NEXT STEP: define the PlanArtifact + PlanSheet + PlanSheetRevision +
+PlanMeasurement contracts (types only, no schema yet), then the first
+schema migration.
