@@ -6,7 +6,7 @@ import type { OpportunityDetail } from '@/lib/api'
 import { ProgrammeGantt } from '@/components/views/programme/ProgrammeGantt'
 import type { ScheduleResult } from '@/lib/engines/schedule-engine'
 import type { DependencyType } from '@/lib/programme'
-import type { DependencyItem } from '@/components/views/programme/DependencyList'
+import type { DependencyItem, DependencyPatch } from '@/components/views/programme/DependencyList'
 import { Info, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -46,6 +46,7 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
   const [savingActivityId, setSavingActivityId] = useState<string | null>(null)
   const [savingDependency, setSavingDependency] = useState(false)
   const [savingDependencyId, setSavingDependencyId] = useState<string | null>(null)
+  const [deletingDependencyId, setDeletingDependencyId] = useState<string | null>(null)
 
   useEffect(() => {
     // Try to fetch the programme schedule from the API.
@@ -216,9 +217,9 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
   )
 
   /**
-   * Commit a dependency type/lag update. The flow is:
+   * Commit a dependency type and/or lag update (PARTIAL). The flow is:
    *
-   *   type + lag
+   *   { type? } and/or { lag? }
    *       ↓
    *   PATCH /api/programmes/:programmeId/dependencies/:dependencyId
    *       ↓
@@ -227,17 +228,16 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
    *   replace Gantt state
    *
    * The dependency ROW ID is the stable identity (U1); type and lag are
-   * MUTABLE PROPERTIES. This updates the SAME row — it never creates a
-   * competing edge. The UI sends only the property inputs; the server
-   * validates (same-tenant, same-programme, dependency exists, finite lag,
-   * valid type, no cycle) inside the Programme-row lock and returns the
-   * engine's recomputed ScheduleResult + updated dependencies list.
+   * INDEPENDENTLY MUTABLE properties. The UI sends only the changed
+   * property (or both); the server loads the existing edge under the lock,
+   * merges the supplied values, validates the complete resulting edge, and
+   * persists. This never creates a competing edge.
    *
    * Returns true on success (the row keeps its values), false on failure
    * (the row reverts to the committed values).
    */
   const handleUpdateDependency = useCallback(
-    async (dependencyId: string, type: DependencyType, lag: number): Promise<boolean> => {
+    async (dependencyId: string, patch: DependencyPatch): Promise<boolean> => {
       if (!programmeId) return false
       setSavingDependencyId(dependencyId)
       try {
@@ -246,7 +246,7 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
           {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type, lag }),
+            body: JSON.stringify(patch),
           },
         )
         const data: DependencyResponse = await res.json().catch(() => ({}))
@@ -275,6 +275,57 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
         return false
       } finally {
         setSavingDependencyId(null)
+      }
+    },
+    [programmeId],
+  )
+
+  /**
+   * Delete a dependency edge. The flow is:
+   *
+   *   DELETE /api/programmes/:programmeId/dependencies/:dependencyId
+   *       ↓
+   *   updated ScheduleResult (with the edge removed)
+   *       ↓
+   *   replace Gantt state
+   *
+   * Removes the edge from the workspace graph. The engine then derives the
+   * OUTPUTS from the reduced graph. The dependency ROW ID is the stable
+   * identity; the edge is deleted, not replaced.
+   *
+   * Returns true on success, false on failure.
+   */
+  const handleDeleteDependency = useCallback(
+    async (dependencyId: string): Promise<boolean> => {
+      if (!programmeId) return false
+      setDeletingDependencyId(dependencyId)
+      try {
+        const res = await fetch(
+          `/api/programmes/${programmeId}/dependencies/${dependencyId}`,
+          { method: 'DELETE' },
+        )
+        const data: DependencyResponse = await res.json().catch(() => ({}))
+        if (res.ok && data.ok && data.schedule) {
+          setSchedule((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  schedule: data.schedule!,
+                  programmeName: data.programmeName ?? prev.programmeName,
+                  dependencies: data.dependencies ?? prev.dependencies,
+                }
+              : prev,
+          )
+          toast.success('Dependency deleted.')
+          return true
+        }
+        toast.error(data.error ?? 'Could not delete dependency.')
+        return false
+      } catch {
+        toast.error('Network error while deleting dependency.')
+        return false
+      } finally {
+        setDeletingDependencyId(null)
       }
     },
     [programmeId],
@@ -356,6 +407,8 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
         dependencies={schedule.dependencies}
         onUpdateDependency={isWorkspace ? handleUpdateDependency : undefined}
         savingDependencyId={savingDependencyId}
+        onDeleteDependency={isWorkspace ? handleDeleteDependency : undefined}
+        deletingDependencyId={deletingDependencyId}
       />
     </div>
   )

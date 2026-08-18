@@ -516,6 +516,35 @@ export const activityDependencyRepository = {
   },
 
   /**
+   * D3: Delete a single dependency WITHIN a caller-held transaction.
+   *
+   * The caller (ProgrammeService.deleteDependency) has ALREADY acquired the
+   * Programme row lock. This method does the authoritative identity check
+   * (dependency.programmeId === programmeId) + delete.
+   *
+   * Returns the deleted dependency row (or null if not found in this
+   * programme — the service converts this to a 404).
+   */
+  async deleteInTransaction(
+    tx: Tx,
+    programmeId: string,
+    dependencyId: string,
+  ) {
+    // Identity check: the dependency must belong to this programme.
+    const existing = await tx.activityDependency.findFirst({
+      where: { id: dependencyId, programmeId },
+      select: { id: true, programmeId: true },
+    })
+    if (!existing) {
+      return null
+    }
+
+    return tx.activityDependency.delete({
+      where: { id: dependencyId },
+    })
+  },
+
+  /**
    * R1: Delete all dependencies for a programme. Takes the Programme row lock
    * first to serialize against concurrent finalization.
    */

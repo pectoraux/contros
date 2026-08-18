@@ -41,7 +41,7 @@ import { Loader2, Lock } from 'lucide-react'
 import type { ScheduleResult, ScheduledActivity } from '@/lib/engines/schedule-engine'
 import type { DependencyType } from '@/lib/programme'
 import { AddDependencyForm } from './AddDependencyForm'
-import { DependencyList, type DependencyItem } from './DependencyList'
+import { DependencyList, type DependencyItem, type DependencyPatch } from './DependencyList'
 
 interface ProgrammeGanttProps {
   schedule: ScheduleResult
@@ -60,10 +60,12 @@ interface ProgrammeGanttProps {
     lag: number
   }) => Promise<boolean>
   savingDependency?: boolean
-  /** D2: existing dependency edges (with row IDs for PATCH). */
+  /** D2: existing dependency edges (with row IDs for PATCH/DELETE). */
   dependencies?: DependencyItem[]
-  onUpdateDependency?: (dependencyId: string, type: DependencyType, lag: number) => Promise<boolean>
+  onUpdateDependency?: (dependencyId: string, patch: DependencyPatch) => Promise<boolean>
   savingDependencyId?: string | null
+  onDeleteDependency?: (dependencyId: string) => Promise<boolean>
+  deletingDependencyId?: string | null
 }
 
 // Pixel width per day.
@@ -86,6 +88,8 @@ export function ProgrammeGantt({
   dependencies = [],
   onUpdateDependency,
   savingDependencyId = null,
+  onDeleteDependency,
+  deletingDependencyId = null,
 }: ProgrammeGanttProps) {
   const { activities, projectDuration, criticalPath } = schedule
   const totalWidth = Math.max(projectDuration * DAY_WIDTH, 200)
@@ -212,7 +216,9 @@ export function ProgrammeGantt({
             dependencies={dependencies}
             editable={editable}
             savingDependencyId={savingDependencyId}
+            deletingDependencyId={deletingDependencyId}
             onCommitUpdate={onUpdateDependency}
+            onDelete={onDeleteDependency}
           />
         </div>
       )}

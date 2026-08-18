@@ -314,4 +314,74 @@ describe('Programme dependency update integration tests', () => {
       type: 'FS', lag: 0,
     })
   }, 120000)
+
+  // ── 9. Partial update: type only ─────────────────────────────────────────
+
+  test('partial update: type only (FS→SS, lag stays 0)', async () => {
+    // Before: DEP_1 is FS/0.
+    const before = await db.activityDependency.findUnique({ where: { id: DEP_1 } })
+    expect(before!.type).toBe('FS')
+    expect(before!.lag).toBe(0)
+
+    // Patch type only — do NOT supply lag. The service should merge: keep
+    // the existing lag (0), change type to SS.
+    const res = await programmeService.updateDependency({
+      ctx: ctxA, programmeId: PROG_A, dependencyId: DEP_1,
+      type: 'SS',
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+
+    // Verify: type changed to SS, lag UNCHANGED at 0.
+    const after = await db.activityDependency.findUnique({ where: { id: DEP_1 } })
+    expect(after!.type).toBe('SS')
+    expect(after!.lag).toBe(0)
+
+    // Restore.
+    await programmeService.updateDependency({
+      ctx: ctxA, programmeId: PROG_A, dependencyId: DEP_1,
+      type: 'FS',
+    })
+  }, 60000)
+
+  // ── 10. Partial update: lag only ─────────────────────────────────────────
+
+  test('partial update: lag only (0→5, type stays FS)', async () => {
+    // Before: DEP_1 is FS/0.
+    const before = await db.activityDependency.findUnique({ where: { id: DEP_1 } })
+    expect(before!.type).toBe('FS')
+    expect(before!.lag).toBe(0)
+
+    // Patch lag only — do NOT supply type. The service should merge: keep
+    // the existing type (FS), change lag to 5.
+    const res = await programmeService.updateDependency({
+      ctx: ctxA, programmeId: PROG_A, dependencyId: DEP_1,
+      lag: 5,
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+
+    // Verify: lag changed to 5, type UNCHANGED at FS.
+    const after = await db.activityDependency.findUnique({ where: { id: DEP_1 } })
+    expect(after!.type).toBe('FS')
+    expect(after!.lag).toBe(5)
+
+    // Restore.
+    await programmeService.updateDependency({
+      ctx: ctxA, programmeId: PROG_A, dependencyId: DEP_1,
+      lag: 0,
+    })
+  }, 60000)
+
+  // ── 11. Neither field → rejected ─────────────────────────────────────────
+
+  test('neither type nor lag → 422', async () => {
+    const res = await programmeService.updateDependency({
+      ctx: ctxA, programmeId: PROG_A, dependencyId: DEP_1,
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.status).toBe(422)
+    expect(res.error).toMatch(/at least one/i)
+  }, 60000)
 })

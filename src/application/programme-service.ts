@@ -869,21 +869,32 @@ export const programmeService = {
    *   same tenant        — programmeRepository.getForOrganization (tenant scope)
    *   same programme     — updateInTransaction checks dependency.programmeId === programmeId
    *   dependency exists  — service checks under the lock → 404
-   *   finite lag         — service checks pre-DB (Number.isFinite) → 422
-   *   valid type         — service checks pre-DB (∈ {FS,SS,FF,SF}) → 422
+   *   at least one field — service checks pre-DB (type or lag provided) → 422
+   *   finite lag         — service checks pre-DB (if lag provided, Number.isFinite) → 422
+   *   valid type         — service checks pre-DB (if type provided, ∈ {FS,SS,FF,SF}) → 422
    *   no cycle           — validateProgrammeSnapshot under the lock → 422
    *
    * U1 NOTE: predecessor/successor are NOT updatable. They ARE the identity.
-   * This method only changes type and lag. The would-be graph uses the
-   * existing predecessor/successor with the new type/lag.
+   * This method only changes type and/or lag. The would-be graph uses the
+   * existing predecessor/successor with the merged type/lag.
+   *
+   * PARTIAL UPDATE: type and lag are INDEPENDENTLY MUTABLE properties. The
+   * caller may supply either, both, or (reject) neither. The service loads
+   * the existing edge under the lock, merges the supplied values, then
+   * validates and persists the complete resulting edge:
+   *
+   *   { type: 'SS' }              → change type, keep existing lag
+   *   { lag: 3 }                  → change lag, keep existing type
+   *   { type: 'SS', lag: 3 }      → change both
+   *   {}                          → 422 (nothing to update)
    */
   async updateDependency(
     input: {
       ctx: RequestContext
       programmeId: string
       dependencyId: string
-      type: DependencyType
-      lag: number
+      type?: DependencyType
+      lag?: number
     },
   ): Promise<
     | {
@@ -897,11 +908,15 @@ export const programmeService = {
     const { ctx, programmeId, dependencyId, type, lag } = input
 
     // ── Pre-DB validation (pure) ──────────────────────────────────────────
+    // At least one property must be supplied.
+    if (type === undefined && lag === undefined) {
+      return { ok: false, error: 'At least one of type or lag must be provided', status: 422 }
+    }
     const VALID_TYPES: DependencyType[] = ['FS', 'SS', 'FF', 'SF']
-    if (!VALID_TYPES.includes(type)) {
+    if (type !== undefined && !VALID_TYPES.includes(type)) {
       return { ok: false, error: `Invalid dependency type: ${type}`, status: 422 }
     }
-    if (!Number.isFinite(lag)) {
+    if (lag !== undefined && !Number.isFinite(lag)) {
       return { ok: false, error: 'Lag must be a finite number', status: 422 }
     }
 
@@ -915,7 +930,7 @@ export const programmeService = {
       return { ok: false, error: 'Programme not found in this organization', status: 404 }
     }
 
-    // ── Transaction: lock → read → validate → persist ─────────────────────
+    // ── Transaction: lock → read → merge → validate → persist ─────────────
     try {
       await dbTx.$transaction(async (tx) => {
         // Lock the Programme row FIRST (snapshot-at-lock, Q1).
@@ -938,8 +953,13 @@ export const programmeService = {
           )
         }
 
+        // MERGE: the supplied values override the existing ones. Unsupplied
+        // fields keep their current value. This is the partial-update merge.
+        const mergedType = type ?? (existingEdge.type as DependencyType)
+        const mergedLag = lag ?? existingEdge.lag
+
         // Build the WOULD-BE snapshot: current graph, but with this edge's
-        // type/lag replaced by the new values. The predecessor/successor
+        // type/lag replaced by the MERGED values. The predecessor/successor
         // are unchanged (they ARE the identity — U1).
         const wouldBeDependencies: ActivityDependency[] = dependencies.map((d) =>
           d.id === dependencyId
@@ -947,8 +967,8 @@ export const programmeService = {
                 id: d.id,
                 predecessorActivityId: d.predecessorActivityId,
                 successorActivityId: d.successorActivityId,
-                type,          // NEW
-                lag,           // NEW
+                type: mergedType,   // MERGED
+                lag: mergedLag,     // MERGED
               }
             : {
                 id: d.id,
@@ -1003,13 +1023,114 @@ export const programmeService = {
         }
 
         // Persist — updateInTransaction does the authoritative identity
-        // check (dependency.programmeId === programmeId) + update.
+        // check (dependency.programmeId === programmeId) + update with
+        // the MERGED values.
         await activityDependencyRepository.updateInTransaction(
           tx,
           programmeId,
           dependencyId,
-          { type, lag },
+          { type: mergedType, lag: mergedLag },
         )
+      })
+    } catch (e) {
+      if (e instanceof DependencyValidationError) {
+        return { ok: false, error: e.message, status: e.status }
+      }
+      throw e
+    }
+
+    // Re-fetch the schedule to return the updated CPM result.
+    const scheduleResult = await this.getProgrammeSchedule({
+      ctx,
+      programmeId,
+    })
+    if (!scheduleResult.ok) {
+      return scheduleResult
+    }
+
+    return {
+      ok: true,
+      schedule: scheduleResult.schedule,
+      programmeName: scheduleResult.programmeName,
+      dependencies: scheduleResult.dependencies,
+    }
+  },
+
+  /**
+   * D3: Delete a dependency edge — the fourth controlled schedule mutation.
+   *
+   * Removes the edge from the workspace graph. The scheduling engine
+   * (replaySchedule) then derives the OUTPUTS (start, finish, float,
+   * critical path) from the reduced graph.
+   *
+   * Flow (snapshot-at-lock):
+   *   RequestContext
+   *       ↓
+   *   pre-flight: programme exists (tenant-scoped read)
+   *       ↓
+   *   TRANSACTION:
+   *     SELECT FOR UPDATE on Programme row  (lock)
+   *     deleteInTransaction (identity check + delete)
+   *       → not found in this programme → 404
+   *       ↓
+   *   getProgrammeSchedule (workspace preview without the deleted edge)
+   *       ↓
+   *   updated ScheduleResult + dependencies
+   *
+   * CONCURRENCY: the delete serializes against concurrent finalization and
+   * other mutations via the Programme-row lock.
+   *
+   * Validation summary:
+   *   same tenant        — programmeRepository.getForOrganization (tenant scope)
+   *   same programme     — deleteInTransaction checks dependency.programmeId === programmeId
+   *   dependency exists  — deleteInTransaction returns null → 404
+   */
+  async deleteDependency(
+    input: {
+      ctx: RequestContext
+      programmeId: string
+      dependencyId: string
+    },
+  ): Promise<
+    | {
+        ok: true
+        schedule: ScheduleResult
+        programmeName: string
+        dependencies: DependencyView[]
+      }
+    | Err
+  > {
+    const { ctx, programmeId, dependencyId } = input
+
+    // Pre-flight: verify the programme exists (tenant-scoped). The
+    // authoritative read is inside the transaction under the lock.
+    const programmeExists = await programmeRepository.getForOrganization(
+      ctx.organizationId,
+      programmeId,
+    )
+    if (!programmeExists) {
+      return { ok: false, error: 'Programme not found in this organization', status: 404 }
+    }
+
+    // ── Transaction: lock → delete ────────────────────────────────────────
+    try {
+      await dbTx.$transaction(async (tx) => {
+        // Lock the Programme row FIRST (snapshot-at-lock, Q1).
+        await tx.$queryRaw`SELECT id FROM "Programme" WHERE id = ${programmeId} FOR UPDATE`
+
+        // Delete — deleteInTransaction does the authoritative identity
+        // check (dependency.programmeId === programmeId) + delete.
+        const deleted = await activityDependencyRepository.deleteInTransaction(
+          tx,
+          programmeId,
+          dependencyId,
+        )
+        if (!deleted) {
+          throw new DependencyValidationError(
+            `Dependency "${dependencyId}" not found in programme "${programmeId}"`,
+            404,
+          )
+        }
       })
     } catch (e) {
       if (e instanceof DependencyValidationError) {

@@ -5347,3 +5347,93 @@ The scheduling graph is now coherent: one edge per ordered pair, with
 mutable type/lag properties. The next mutation (delete dependency) is the
 natural fourth graph operation, then activity rename/reorder and finally
 revision comparison.
+
+---
+Task ID: programme-dependency-partial-update-and-delete
+Agent: principal-engineer
+Task: D2-partial + D3 — Refactor PATCH to partial update (type? and/or lag?) + implement DELETE dependency. The fourth controlled schedule mutation. Service + repo + API route + 9 integration tests (3 partial + 6 delete) + UI (independent partial commits + delete button) + HTTP verification. No frozen code touched.
+
+PARTIAL UPDATE (D2-partial):
+- Refactored `updateDependency` to accept `type?: DependencyType` and `lag?: number`
+  (both optional). At least one must be provided → 422 if neither.
+- The service loads the existing edge under the Programme-row lock, MERGES
+  the supplied values (type ?? existing.type, lag ?? existing.lag), validates
+  the COMPLETE resulting edge (finite lag, valid type, no cycle), and persists
+  the merged values. This never creates a competing edge.
+- Body contract:
+    { "type": "SS" }           → change type, keep existing lag
+    { "lag": 3 }               → change lag, keep existing type
+    { "type": "SS", "lag": 3 } → change both
+    {}                         → 422 (nothing to update)
+- Updated PATCH route to accept partial body; 422 if neither field provided.
+
+DELETE (D3):
+- Added `activityDependencyRepository.deleteInTransaction(tx, programmeId, dependencyId)`:
+  identity check (dependency.programmeId === programmeId) + delete. Returns
+  null if not found (service converts to 404).
+- Added `programmeService.deleteDependency({ ctx, programmeId, dependencyId })`:
+  pre-flight programme exists → TRANSACTION: lock Programme row →
+  deleteInTransaction (identity + delete) → 404 if not found →
+  getProgrammeSchedule (reduced graph) → return ScheduleResult + dependencies.
+- Added DELETE handler to the route file: thin route, no domain logic.
+
+UI (DependencyList.tsx):
+- Type Select now commits { type } immediately on change (partial update).
+- Lag Input commits { lag } on blur/Enter (partial update).
+- Each property commits independently — matches "independently mutable"
+  semantics. No need to echo the unchanged value.
+- Added a delete button (trash icon) to each dependency row in workspace
+  mode. In revision mode, no controls are rendered (read-only).
+- The `onCommitUpdate` callback now accepts `DependencyPatch` ({ type?, lag? })
+  instead of (type, lag).
+- Added `onDelete` callback + `deletingDependencyId` state.
+
+INTEGRATION TESTS:
+- programme-dependency-update.test.ts: 12 tests (9 existing + 3 new):
+  10. partial update: type only (FS→SS, lag stays 0)
+  11. partial update: lag only (0→5, type stays FS)
+  12. neither type nor lag → 422
+- programme-dependency-delete.test.ts: 6 tests (all new):
+  1. valid delete → 200, schedule recalculates (35→20 days), edge removed
+  2. finalized ProgrammeRevision unchanged after delete
+  3. cross-tenant → 404
+  4. cross-programme → 404 (and unchanged)
+  5. missing dependency → 404
+  6. concurrent delete + finalization → serialized by Programme lock
+
+HTTP VERIFICATION (authenticated curl):
+- Partial PATCH type only (FS→SS): 200, type=SS, lag=0 (lag unchanged). ✅
+- Partial PATCH lag only (0→7): 200, type=SS, lag=7 (type unchanged). ✅
+- Neither field: 422. ✅
+- Restore to FS/0: 200. ✅
+- DELETE: 200, duration 33→23 (FS Site Clearing→Structure removed, Structure
+  no longer depends on it), deps 3→2. ✅
+- DELETE nonexistent: 404. ✅
+- Dev log: PATCH 200, PATCH 200, PATCH 422, PATCH 200, DELETE 200, DELETE 404.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Dependency update integration (Neon) . 12 pass / 0 fail (3 new partial tests)
+- Dependency delete integration (Neon) .. 6 pass / 0 fail / 27 expect()
+- HTTP: partial PATCH type only → 200 → lag unchanged .. ✅
+- HTTP: partial PATCH lag only → 200 → type unchanged .. ✅
+- HTTP: neither field → 422 .............................. ✅
+- HTTP: DELETE → 200 → schedule recalculates ............. ✅
+- HTTP: DELETE nonexistent → 404 ......................... ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE DEPENDENCY RELATIONSHIP LIFECYCLE IS NOW COMPLETE:
+  POST    create A→B     (creates the relationship)
+  PATCH   modify type/lag (partial update — independently mutable properties)
+  DELETE  remove A→B     (deletes the edge)
+
+The scheduling graph has the full relationship lifecycle. The dependency
+ROW ID is the stable identity; type and lag are independently mutable
+properties. Each mutation runs inside the Programme-row lock and returns
+the engine's recomputed ScheduleResult + updated dependencies list.
+
+NEXT (per review sequence):
+  - activity rename + explicit activity ordering
+  - workspace save/finalization polish
+  - revision comparison
