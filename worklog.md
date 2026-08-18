@@ -5437,3 +5437,135 @@ NEXT (per review sequence):
   - activity rename + explicit activity ordering
   - workspace save/finalization polish
   - revision comparison
+
+---
+Task ID: activity-rename-ordering
+Agent: principal-engineer
+Task: R1 — Activity rename + explicit ordering. `sequence` is a mutable PRESENTATION property, NOT a scheduling input. The CPM engine receives activities by identity + dependency graph; sequence only affects display order and snapshot determinism. Ordering is NOT scheduling. Schema + types + repo + service + route + 12 integration tests + UI (editable name + move up/down). No frozen code touched.
+
+ARCHITECTURAL DECISION:
+  Activity.id       = immutable identity
+  Activity.name     = mutable semantic label
+  Activity.sequence = mutable presentation/work-sequence property (non-negative integer, unique within Programme)
+
+  Ordering is NOT scheduling — replaySchedule() still determines dates, float,
+  and critical path exclusively from duration + dependency inputs. The user can
+  rearrange the programme sequence without affecting the CPM computation.
+
+SCHEMA (prisma/schema.prisma):
+- Added `sequence Int @default(0)` to Activity model.
+- Added `@@unique([programmeId, sequence])` — enforces uniqueness within a Programme.
+- Two-step migration: (1) added column without constraint, pushed; (2) assigned
+  distinct sequences to existing activities based on (createdAt, id); (3) added
+  unique constraint, pushed.
+
+TYPES (src/lib/programme/types.ts + src/lib/engines/schedule-engine.ts):
+- Added `sequence: number` to `ProgrammeActivity` (part of the snapshot, affects
+  content hash for deterministic ordering).
+- Added `sequence?: number` to `ScheduleActivity` (optional — the engine carries
+  it through but does NOT use it for CPM computation).
+
+SNAPSHOT (src/lib/programme/snapshot.ts):
+- `mapToScheduleAndCompute` now sets `sequence: activity.sequence` when mapping
+  ProgrammeActivity → ScheduleActivity. The engine ignores it; the UI reads it.
+
+REPO (src/repositories/programme-repositories.ts):
+- `listForProgramme` and `listForProgrammeInTransaction`: orderBy changed from
+  `{ createdAt: 'asc' }` to `[{ sequence: 'asc' }, { id: 'asc' }]`.
+- `getForOrganization`: activities include orderBy changed to (sequence, id).
+- `activityRepository.create`: assigns `sequence = count of existing activities`
+  (so new activities get the next sequence slot).
+- Added `activityRepository.updateInTransaction(tx, programmeId, activityId, data)`:
+  identity check (activity belongs to programme) + update. Does NOT lock (caller
+  holds the Programme-row lock).
+
+SERVICE (src/application/programme-service.ts):
+- `updateActivity({ ctx, programmeId, activityId, name?, sequence? })` — partial
+  update (matching the dependency PATCH pattern).
+- Validation: at least one of name/sequence → 422 if neither. If name: non-empty
+  string → 422. If sequence: non-negative integer → 422.
+- SWAP-ON-SET for sequence conflicts: if PATCHing `{ sequence: N }` and another
+  activity in the programme already has sequence N, the service atomically swaps
+  their sequences. Uses a 3-step temporary-sequence approach to avoid P2002:
+    1. Move conflicting to temp slot (maxSeq + 1, guaranteed free)
+    2. Set target to the requested sequence
+    3. Set conflicting to target's old sequence
+  All under the Programme-row lock.
+- Snapshot sorting: activities sorted by (sequence, id) when building the
+  snapshot in both `getProgrammeSchedule` and `finalizeProgramme`. This ensures
+  the snapshotContentHash is deterministic regardless of DB row order.
+
+ROUTE (src/app/api/programmes/[programmeId]/activities/[activityId]/route.ts):
+- Extended PATCH to handle `{ duration?, name?, sequence? }`:
+  - If `duration` present: calls `updateActivityDuration` (existing, V2).
+  - If `name` or `sequence` present: calls `updateActivity` (new, R1).
+  - If both: calls both services (duration first, then name/sequence).
+  - If none: 422.
+- Body contract:
+    { name: "X" }                    → rename only (schedule UNCHANGED)
+    { sequence: 2 }                  → reorder only (swap-on-set; schedule UNCHANGED)
+    { name: "X", sequence: 2 }       → both rename + reorder
+    { duration: 5 }                  → duration update (existing, recomputes schedule)
+    { duration: 5, name: "X" }       → duration + rename
+    {}                               → 422
+
+UI (src/components/views/programme/ProgrammeGantt.tsx):
+- ActivityRow now has an editable NameCell (Input) in workspace mode — commits
+  `{ name }` on blur/Enter. In revision mode, renders plain text.
+- Move up/down buttons (ArrowUp/ArrowDown icons) in workspace mode. "Move up"
+  calls `onCommitActivityUpdate(activityId, { sequence: prevActivity.sequence })`
+  (swap-on-set). "Move down" calls with next activity's sequence.
+- Activities are rendered in (sequence, id) order from the schedule response.
+- Row key includes `${activity.id}:${activity.name}:${activity.sequence}` so the
+  row remounts with fresh state after a successful PATCH.
+
+UI WIRING (src/components/views/opportunity-tabs/ProgrammeTab.tsx):
+- `handleCommitActivityUpdate` callback: PATCH → replace schedule state.
+  No optimistic UI — the server returns the full ScheduleResult.
+
+INTEGRATION TESTS (tests/integration/programme-activity-rename-order.test.ts — 12 tests):
+1. Rename → name changes, schedule UNCHANGED (ordering is NOT scheduling).
+2. Reorder (swap-on-set) → sequences swap, schedule UNCHANGED.
+3. Reorder to unoccupied sequence → sequence changes.
+4. NaN sequence → 422.
+5. Negative sequence → 422.
+6. Non-integer sequence (1.5) → 422.
+7. Empty name → 422.
+8. Neither name nor sequence → 422.
+9. Cross-tenant → 404.
+10. Cross-programme → 404.
+11. Finalized revision unchanged after rename/reorder.
+12. Concurrent activity edit + finalization → serialized by Programme lock.
+
+HTTP VERIFICATION (authenticated curl):
+- Rename (partial {name} only): 200, name changed to "Site Clearance & Grading". ✅
+- Reorder (partial {sequence} only — swap-on-set): 200, ACT1 swapped with ACT2.
+  Foundation moved to seq 0, Site Clearance to seq 1. Duration UNCHANGED (23). ✅
+  (Ordering is NOT scheduling — the CPM dates didn't change.)
+- Neither field: 422. ✅
+- Restore: 200. ✅
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Activity rename/order (Neon) ....... 12 pass / 0 fail / 32 expect()
+- HTTP: rename → 200 → name changed .................. ✅
+- HTTP: reorder → 200 → swap-on-set, schedule unchanged .. ✅
+- HTTP: neither → 422 ................................. ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE ACTIVITY LIFECYCLE IS NOW:
+  Create activity    (activityRepository.create — auto-assigns sequence)
+  Rename activity    (PATCH { name } — schedule UNCHANGED)
+  Reorder activity   (PATCH { sequence } — swap-on-set, schedule UNCHANGED)
+  Edit duration      (PATCH { duration } — schedule recalculates)
+  [Delete activity   — future milestone]
+
+KEY PRINCIPLE: Ordering is NOT scheduling. The user can rearrange the programme
+sequence, but replaySchedule() still determines dates, float, and critical path
+exclusively from duration + dependency inputs. The snapshot hash is deterministic
+(sorted by sequence, then id) regardless of DB row order.
+
+NEXT (per review sequence):
+  - workspace save/finalization UX
+  - revision comparison

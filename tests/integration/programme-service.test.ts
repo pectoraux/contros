@@ -83,8 +83,8 @@ describe('Programme domain integration tests', () => {
       data: { id: PROG_A, organizationId: ORG_A, opportunityId: OPP_A, name: 'Programme A', status: 'draft' },
     })
     // Activities
-    await db.activity.create({ data: { id: 'test-prog-act-1', programmeId: PROG_A, name: 'Excavation', duration: 5, status: 'planned', estimateLineId: LINE_A, workDefinitionVersionId: WDV_A } })
-    await db.activity.create({ data: { id: 'test-prog-act-2', programmeId: PROG_A, name: 'Foundation', duration: 10, status: 'planned' } })
+    await db.activity.create({ data: { id: 'test-prog-act-1', programmeId: PROG_A, name: 'Excavation', duration: 5, status: 'planned', estimateLineId: LINE_A, workDefinitionVersionId: WDV_A, sequence: 0 } })
+    await db.activity.create({ data: { id: 'test-prog-act-2', programmeId: PROG_A, name: 'Foundation', duration: 10, status: 'planned', sequence: 1 } })
     await db.activityDependency.create({ data: { id: 'test-prog-dep-1', programmeId: PROG_A, predecessorActivityId: 'test-prog-act-1', successorActivityId: 'test-prog-act-2', type: 'FS', lag: 0 } })
   }, 120000)
 

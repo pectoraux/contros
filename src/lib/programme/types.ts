@@ -162,6 +162,14 @@ export interface ProgrammeActivity {
   name: string
   /** Duration in days (planned). */
   duration: number
+  /**
+   * R1 — PRESENTATION ORDER: a mutable, non-negative integer that determines
+   * display order within the programme. DISTINCT from scheduling — the CPM
+   * engine receives activities by identity + dependency graph; sequence only
+   * affects display order and snapshot determinism (sorted by sequence, then
+   * id). Ordering is NOT scheduling.
+   */
+  sequence: number
   /** Construction-identity relationships (all optional). */
   constructionRefs: ActivityConstructionRefs
   /**

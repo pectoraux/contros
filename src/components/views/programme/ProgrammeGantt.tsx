@@ -37,7 +37,7 @@
  */
 
 import { useState, useEffect, useRef } from 'react'
-import { Loader2, Lock } from 'lucide-react'
+import { Loader2, Lock, ArrowUp, ArrowDown } from 'lucide-react'
 import type { ScheduleResult, ScheduledActivity } from '@/lib/engines/schedule-engine'
 import type { DependencyType } from '@/lib/programme'
 import { AddDependencyForm } from './AddDependencyForm'
@@ -66,6 +66,9 @@ interface ProgrammeGanttProps {
   savingDependencyId?: string | null
   onDeleteDependency?: (dependencyId: string) => Promise<boolean>
   deletingDependencyId?: string | null
+  /** R1: partial update for activity name and/or sequence. */
+  onCommitActivityUpdate?: (activityId: string, patch: { name?: string; sequence?: number }) => Promise<boolean>
+  savingActivityUpdateId?: string | null
 }
 
 // Pixel width per day.
@@ -90,6 +93,8 @@ export function ProgrammeGantt({
   savingDependencyId = null,
   onDeleteDependency,
   deletingDependencyId = null,
+  onCommitActivityUpdate,
+  savingActivityUpdateId = null,
 }: ProgrammeGanttProps) {
   const { activities, projectDuration, criticalPath } = schedule
   const totalWidth = Math.max(projectDuration * DAY_WIDTH, 200)
@@ -154,15 +159,21 @@ export function ProgrammeGantt({
               No activities in this programme.
             </div>
           ) : (
-            activities.map((activity) => (
+            activities.map((activity, index) => (
               <ActivityRow
-                key={activity.id}
+                key={`${activity.id}:${activity.name}:${activity.sequence}`}
                 activity={activity}
                 isCritical={criticalPath.includes(activity.id)}
                 totalDuration={projectDuration}
                 editable={editable}
                 saving={savingActivityId === activity.id}
                 onCommitDuration={onCommitDuration}
+                onCommitActivityUpdate={onCommitActivityUpdate}
+                savingActivityUpdate={savingActivityUpdateId === activity.id}
+                canMoveUp={index > 0}
+                canMoveDown={index < activities.length - 1}
+                prevSequence={index > 0 ? activities[index - 1].sequence : undefined}
+                nextSequence={index < activities.length - 1 ? activities[index + 1].sequence : undefined}
               />
             ))
           )}
@@ -233,6 +244,12 @@ function ActivityRow({
   editable,
   saving,
   onCommitDuration,
+  onCommitActivityUpdate,
+  savingActivityUpdate,
+  canMoveUp,
+  canMoveDown,
+  prevSequence,
+  nextSequence,
 }: {
   activity: ScheduledActivity
   isCritical: boolean
@@ -240,15 +257,49 @@ function ActivityRow({
   editable: boolean
   saving: boolean
   onCommitDuration?: (activityId: string, duration: number) => Promise<boolean>
+  onCommitActivityUpdate?: (activityId: string, patch: { name?: string; sequence?: number }) => Promise<boolean>
+  savingActivityUpdate: boolean
+  canMoveUp: boolean
+  canMoveDown: boolean
+  prevSequence?: number
+  nextSequence?: number
 }) {
   const barLeft = activity.earlyStart * DAY_WIDTH
   const barWidth = Math.max(activity.duration * DAY_WIDTH, 2)
   const floatBarWidth = Math.max(activity.totalFloat * DAY_WIDTH, 0)
+  const busy = saving || savingActivityUpdate
 
   return (
     <div className="flex border-b border-border text-sm hover:bg-muted/30" style={{ height: ROW_HEIGHT }}>
-      <div className="w-48 shrink-0 border-r border-border px-3 py-1 truncate" title={activity.name}>
-        {activity.name}
+      {/* Activity name — editable in workspace mode */}
+      <div className="w-48 shrink-0 border-r border-border px-1 py-0.5 flex items-center gap-0.5">
+        {editable && onCommitActivityUpdate && (
+          <div className="flex flex-col shrink-0">
+            <button
+              className="text-muted-foreground/50 hover:text-foreground disabled:opacity-20 leading-none"
+              disabled={busy || !canMoveUp}
+              onClick={() => prevSequence !== undefined && onCommitActivityUpdate?.(activity.id, { sequence: prevSequence })}
+              title="Move up"
+            >
+              <ArrowUp className="h-3 w-3" />
+            </button>
+            <button
+              className="text-muted-foreground/50 hover:text-foreground disabled:opacity-20 leading-none"
+              disabled={busy || !canMoveDown}
+              onClick={() => nextSequence !== undefined && onCommitActivityUpdate?.(activity.id, { sequence: nextSequence })}
+              title="Move down"
+            >
+              <ArrowDown className="h-3 w-3" />
+            </button>
+          </div>
+        )}
+        <NameCell
+          activityId={activity.id}
+          committedName={activity.name}
+          editable={editable && !!onCommitActivityUpdate}
+          saving={savingActivityUpdate}
+          onCommitName={(name) => onCommitActivityUpdate?.(activity.id, { name })}
+        />
       </div>
       <div className="w-20 shrink-0 border-r border-border px-1 py-0.5 flex items-center justify-end">
         <DurationCell
@@ -300,7 +351,72 @@ function ActivityRow({
 }
 
 /**
- * DurationCell — the ONLY editable cell.
+ * NameCell — editable activity name (R1: rename).
+ *
+ * In workspace mode, renders an Input that commits { name } on blur/Enter.
+ * In revision mode, renders plain text. The name is a semantic label —
+ * renaming does NOT alter the schedule (ordering is NOT scheduling).
+ *
+ * Uses the same key-remount pattern as DurationCell: the parent keys the
+ * row by `${activity.id}:${activity.name}:${activity.sequence}` so the
+ * cell remounts with fresh state after a successful PATCH.
+ */
+function NameCell({
+  committedName,
+  editable,
+  saving,
+  onCommitName,
+}: {
+  activityId: string
+  committedName: string
+  editable: boolean
+  saving: boolean
+  onCommitName: (name: string) => Promise<boolean>
+}) {
+  const [val, setVal] = useState<string>(committedName)
+
+  if (!editable) {
+    return (
+      <span className="truncate px-2 text-sm" title={committedName}>
+        {committedName}
+      </span>
+    )
+  }
+
+  const commit = async () => {
+    const trimmed = val.trim()
+    if (trimmed === '' || trimmed === committedName) {
+      setVal(committedName)
+      return
+    }
+    await onCommitName(trimmed)
+  }
+
+  return (
+    <input
+      type="text"
+      value={val}
+      disabled={saving}
+      onChange={(e) => setVal(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault()
+          ;(e.target as HTMLInputElement).blur()
+        } else if (e.key === 'Escape') {
+          e.preventDefault()
+          setVal(committedName)
+          ;(e.target as HTMLInputElement).blur()
+        }
+      }}
+      className="h-7 w-full min-w-0 rounded border border-transparent bg-transparent px-2 py-0 text-sm outline-none transition-colors hover:border-border focus:border-ring focus:bg-background focus:ring-[2px] focus:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-60"
+      title={saving ? 'Saving…' : 'Activity name (press Enter to commit)'}
+    />
+  )
+}
+
+/**
+ * DurationCell — editable duration.
  *
  * Local input state keeps typing responsive. On blur/Enter, the value is
  * committed to the server via `onCommitDuration`. The CPM-derived cells

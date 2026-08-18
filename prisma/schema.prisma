@@ -912,6 +912,13 @@ model Activity {
   status                   String   @default("planned") // planned | in-progress | complete
   estimateLineId           String?  // relationship — does NOT carry commercial values
   workDefinitionVersionId  String?  // relationship — construction work identity
+  // R1 — ACTIVITY ORDERING: sequence is a mutable presentation/work-sequence
+  // property, DISTINCT from scheduling. The CPM engine receives activities by
+  // identity + dependency graph; sequence only affects display order and
+  // snapshot determinism (sorted by sequence, then id). Ordering is NOT
+  // scheduling — replaySchedule() still determines dates, float, and critical
+  // path exclusively from duration + dependency inputs.
+  sequence                 Int      @default(0) // non-negative; unique within Programme
   createdAt                DateTime @default(now())
   updatedAt                DateTime @updatedAt
 
@@ -923,6 +930,7 @@ model Activity {
   predecessorDependencies  ActivityDependency[] @relation("SuccessorActivity")
   successorDependencies    ActivityDependency[] @relation("PredecessorActivity")
 
+  @@unique([programmeId, sequence])
   @@index([programmeId])
   @@index([estimateLineId])
   @@index([workDefinitionVersionId])

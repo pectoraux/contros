@@ -223,11 +223,16 @@ function mapToScheduleAndCompute(snapshot: ProgrammeSnapshot): ScheduleResult {
   }
 
   // Map to ScheduleActivity.
+  // R1: `sequence` is carried through as a presentation property — the CPM
+  // engine does NOT use it for computation. The caller is responsible for
+  // sorting activities by `(sequence, id)` BEFORE building the snapshot if
+  // determinism is required (see programme-service.ts).
   const scheduleActivities: ScheduleActivity[] = snapshot.activities.map(
     (activity: ProgrammeActivity) => ({
       id: activity.id,
       name: activity.name,
       duration: activity.duration,
+      sequence: activity.sequence,
       predecessors: (predecessorsByActivity.get(activity.id) ?? []).map(
         (dep) => ({
           id: dep.predecessorActivityId,

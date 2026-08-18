@@ -47,6 +47,7 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
   const [savingDependency, setSavingDependency] = useState(false)
   const [savingDependencyId, setSavingDependencyId] = useState<string | null>(null)
   const [deletingDependencyId, setDeletingDependencyId] = useState<string | null>(null)
+  const [savingActivityUpdateId, setSavingActivityUpdateId] = useState<string | null>(null)
 
   useEffect(() => {
     // Try to fetch the programme schedule from the API.
@@ -144,6 +145,61 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
         return false
       } finally {
         setSavingActivityId(null)
+      }
+    },
+    [programmeId],
+  )
+
+  /**
+   * Commit an activity rename and/or reorder (R1 — partial update).
+   *
+   *   { name? } and/or { sequence? }
+   *       ↓
+   *   PATCH /api/programmes/:programmeId/activities/:activityId
+   *       ↓
+   *   updated ScheduleResult (schedule UNCHANGED by rename/reorder —
+   *   ordering is NOT scheduling)
+   *       ↓
+   *   replace Gantt state
+   *
+   * For sequence: swap-on-set semantics — if the target sequence is taken
+   * by another activity, the server atomically swaps their sequences under
+   * the Programme-row lock.
+   */
+  const handleCommitActivityUpdate = useCallback(
+    async (activityId: string, patch: { name?: string; sequence?: number }): Promise<boolean> => {
+      if (!programmeId) return false
+      setSavingActivityUpdateId(activityId)
+      try {
+        const res = await fetch(
+          `/api/programmes/${programmeId}/activities/${activityId}`,
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(patch),
+          },
+        )
+        const data: PatchResponse = await res.json().catch(() => ({}))
+        if (res.ok && data.ok && data.schedule) {
+          setSchedule((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  schedule: data.schedule!,
+                  programmeName: data.programmeName ?? prev.programmeName,
+                  dependencies: data.dependencies ?? prev.dependencies,
+                }
+              : prev,
+          )
+          return true
+        }
+        toast.error(data.error ?? 'Could not update activity.')
+        return false
+      } catch {
+        toast.error('Network error while updating activity.')
+        return false
+      } finally {
+        setSavingActivityUpdateId(null)
       }
     },
     [programmeId],
@@ -409,6 +465,8 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
         savingDependencyId={savingDependencyId}
         onDeleteDependency={isWorkspace ? handleDeleteDependency : undefined}
         deletingDependencyId={deletingDependencyId}
+        onCommitActivityUpdate={isWorkspace ? handleCommitActivityUpdate : undefined}
+        savingActivityUpdateId={savingActivityUpdateId}
       />
     </div>
   )

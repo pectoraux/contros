@@ -60,8 +60,8 @@ describe('Programme schedule read service integration tests', () => {
     await db.user.create({ data: { id: USER_B, organizationId: ORG_B, name: 'User B', email: 'b@ps.test', role: 'estimator' } })
 
     await db.programme.create({ data: { id: PROG_A, organizationId: ORG_A, opportunityId: OPP_A, name: 'Programme A', status: 'draft' } })
-    await db.activity.create({ data: { id: 'test-ps-act-1', programmeId: PROG_A, name: 'Excavation', duration: 5, status: 'planned' } })
-    await db.activity.create({ data: { id: 'test-ps-act-2', programmeId: PROG_A, name: 'Foundation', duration: 10, status: 'planned' } })
+    await db.activity.create({ data: { id: 'test-ps-act-1', programmeId: PROG_A, name: 'Excavation', duration: 5, status: 'planned', sequence: 0 } })
+    await db.activity.create({ data: { id: 'test-ps-act-2', programmeId: PROG_A, name: 'Foundation', duration: 10, status: 'planned', sequence: 1 } })
     await db.activityDependency.create({ data: { id: 'test-ps-dep-1', programmeId: PROG_A, predecessorActivityId: 'test-ps-act-1', successorActivityId: 'test-ps-act-2', type: 'FS', lag: 0 } })
 
     // Finalize a revision.

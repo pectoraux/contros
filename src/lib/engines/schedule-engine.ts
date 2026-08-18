@@ -29,6 +29,20 @@ export interface ScheduleActivity {
   /** Duration in days. */
   duration: number;
   predecessors: SchedulePredecessor[];
+  /**
+   * R1 — ACTIVITY ORDERING: optional presentation/work-sequence property.
+   *
+   * The engine does NOT use `sequence` for computation — CPM dates, float,
+   * and critical path are derived exclusively from `duration` + `predecessors`.
+   * The field is carried through so that callers can preserve a stable
+   * display order across `ProgrammeActivity` → `ScheduleActivity` mappings
+   * without an additional lookup. Omit if you don't need it.
+   *
+   * Ordering is NOT scheduling. The caller is responsible for sorting
+   * activities by `(sequence, id)` BEFORE building a snapshot if determinism
+   * is required.
+   */
+  sequence?: number;
 }
 
 /** A scheduled activity with CPM dates and floats. */

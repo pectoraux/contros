@@ -169,11 +169,20 @@ export const programmeService = {
         activityDependencyRepository.listForProgrammeInTransaction(tx, ctx.organizationId, programmeId),
       ])
 
+      // R1: defensive sort by (sequence, id) so the snapshot hash is
+      // deterministic regardless of DB row order. The repository already
+      // orders by (sequence, id), but we sort here too so the snapshot is
+      // stable even if a future caller bypasses the ordered repository.
+      const sortedActivities = [...activities].sort(
+        (a, b) => a.sequence - b.sequence || (a.id < b.id ? -1 : 1),
+      )
+
       // Build the snapshot from the locked workspace state.
-      const snapshotActivities: ProgrammeActivity[] = activities.map((a) => ({
+      const snapshotActivities: ProgrammeActivity[] = sortedActivities.map((a) => ({
         id: a.id,
         name: a.name,
         duration: a.duration,
+        sequence: a.sequence,
         constructionRefs: {
           estimateLineId: a.estimateLineId,
           workDefinitionVersionId: a.workDefinitionVersionId,
@@ -405,10 +414,19 @@ export const programmeService = {
     // this is a read-only preview, not a finalization. The schedule may
     // change if the workspace is edited concurrently, which is acceptable for
     // a live preview.)
-    const activities: ProgrammeActivity[] = programme.activities.map((a) => ({
+    //
+    // R1: defensive sort by (sequence, id) so display order and snapshot
+    // hash are stable regardless of DB row order. The repository already
+    // orders by (sequence, id); this sort is a defense-in-depth guarantee.
+    const sortedWorkspaceActivities = [...programme.activities].sort(
+      (a, b) => a.sequence - b.sequence || (a.id < b.id ? -1 : 1),
+    )
+
+    const activities: ProgrammeActivity[] = sortedWorkspaceActivities.map((a) => ({
       id: a.id,
       name: a.name,
       duration: a.duration,
+      sequence: a.sequence,
       constructionRefs: {
         estimateLineId: a.estimateLineId,
         workDefinitionVersionId: a.workDefinitionVersionId,
@@ -742,6 +760,7 @@ export const programmeService = {
           id: a.id,
           name: a.name,
           duration: a.duration,
+          sequence: a.sequence,
           constructionRefs: {
             estimateLineId: a.estimateLineId,
             workDefinitionVersionId: a.workDefinitionVersionId,
@@ -983,6 +1002,7 @@ export const programmeService = {
           id: a.id,
           name: a.name,
           duration: a.duration,
+          sequence: a.sequence,
           constructionRefs: {
             estimateLineId: a.estimateLineId,
             workDefinitionVersionId: a.workDefinitionVersionId,
@@ -1140,6 +1160,257 @@ export const programmeService = {
     }
 
     // Re-fetch the schedule to return the updated CPM result.
+    const scheduleResult = await this.getProgrammeSchedule({
+      ctx,
+      programmeId,
+    })
+    if (!scheduleResult.ok) {
+      return scheduleResult
+    }
+
+    return {
+      ok: true,
+      schedule: scheduleResult.schedule,
+      programmeName: scheduleResult.programmeName,
+      dependencies: scheduleResult.dependencies,
+    }
+  },
+
+  /**
+   * R1: Rename an activity and/or change its sequence — the fifth controlled
+   * schedule mutation. (Duration is the first; dependency add/update/delete
+   * are the second through fourth.)
+   *
+   * Architectural rule (NON-NEGOTIABLE):
+   *   - `sequence` is a mutable PRESENTATION property, NOT a scheduling
+   *     input. The CPM engine (`replaySchedule`) receives activities by
+   *     identity + dependency graph. `sequence` only affects:
+   *       - display order in the Gantt
+   *       - snapshot determinism (sorted by (sequence, id) before hashing)
+   *   - Ordering is NOT scheduling. The user can rearrange the programme
+   *     sequence, but `replaySchedule()` still determines dates, float, and
+   *     critical path exclusively from duration + dependency inputs.
+   *   - `name` is a semantic label on the Activity row. It MUST NOT alter
+   *     EstimateLine, WorkDefinitionVersion, ProgrammeRevision, or any
+   *     commercial value.
+   *
+   * Swap-on-set semantics for sequence conflicts: when PATCHing
+   * `{ sequence: N }`, if another activity in the same programme already
+   * has sequence N, the service ATOMICALLY SWAPS — the target activity gets
+   * N, the conflicting activity gets the target's old sequence. All in one
+   * transaction under the Programme-row lock. This gives clean UX for
+   * "move up/down" without requiring a separate swap endpoint.
+   *
+   * PARTIAL PATCH contract (mirrors updateDependency):
+   *   { name: "New Name" }           → rename only
+   *   { sequence: 2 }                → reorder only (swap-on-set if conflict)
+   *   { name: "X", sequence: 2 }     → both
+   *   {}                             → 422 (nothing to update)
+   *
+   * Flow (snapshot-at-lock — mirrors updateDependency):
+   *   RequestContext
+   *       ↓
+   *   validate name (if provided) + sequence (if provided)  (pure, pre-DB)
+   *       ↓
+   *   pre-flight: programme exists (tenant-scoped read)
+   *       ↓
+   *   TRANSACTION:
+   *     SELECT FOR UPDATE on Programme row  (lock)
+   *     read activities UNDER THE LOCK (sorted by sequence, id)
+   *     find existing activity by row ID
+   *       → not found in this programme → 404
+   *     if `sequence` provided and differs from current:
+   *       find conflicting activity in this programme with that sequence
+   *         if conflict: SWAP — set conflicting's sequence to target's
+   *                      old sequence, and target's sequence to the
+   *                      requested value (both updates in this transaction)
+   *         if no conflict: set target's sequence to the requested value
+   *     if `name` provided: update target's name
+   *     activityRepository.updateInTransaction  (identity + persist, no lock)
+   *       ↓
+   *   getProgrammeSchedule (workspace preview with updated name/sequence)
+   *       ↓
+   *   updated ScheduleResult
+   *
+   * CONCURRENCY: the swap-on-set logic runs INSIDE the Programme-row lock.
+   * Two concurrent reorderings cannot both succeed in producing a duplicate
+   * sequence — the second sees the first's committed state under the lock
+   * and re-evaluates its swap against the updated sequences. The DB-level
+   * `@@unique([programmeId, sequence])` constraint is the final guard.
+   *
+   * Validation summary:
+   *   same tenant        — programmeRepository.getForOrganization (tenant scope)
+   *   same programme     — updateInTransaction checks activity.programmeId === programmeId
+   *   activity exists    — service checks under the lock → 404
+   *   at least one field — service checks pre-DB (name or sequence provided) → 422
+   *   valid name         — service checks pre-DB (if name provided, non-empty) → 422
+   *   valid sequence     — service checks pre-DB (if sequence provided,
+   *                        Number.isInteger && >= 0) → 422
+   *
+   * SCHEDULE UNCHANGED: this method NEVER changes the schedule outputs
+   * (projectDuration, ES/EF/float/critical path) — those are derived from
+   * duration + dependency inputs, neither of which is touched here. The
+   * post-call ScheduleResult is identical to the pre-call result; only the
+   * name and/or sequence on the activity row(s) change.
+   */
+  async updateActivity(
+    input: {
+      ctx: RequestContext
+      programmeId: string
+      activityId: string
+      name?: string
+      sequence?: number
+    },
+  ): Promise<
+    | {
+        ok: true
+        schedule: ScheduleResult
+        programmeName: string
+        dependencies: DependencyView[]
+      }
+    | Err
+  > {
+    const { ctx, programmeId, activityId, name, sequence } = input
+
+    // ── Pre-DB validation (pure) ──────────────────────────────────────────
+    // At least one property must be supplied.
+    if (name === undefined && sequence === undefined) {
+      return {
+        ok: false,
+        error: 'At least one of name or sequence must be provided',
+        status: 422,
+      }
+    }
+    // If name is provided, it must be a non-empty string (after trim).
+    if (name !== undefined) {
+      if (typeof name !== 'string' || name.trim() === '') {
+        return {
+          ok: false,
+          error: 'Name must be a non-empty string',
+          status: 422,
+        }
+      }
+    }
+    // If sequence is provided, it must be a non-negative integer.
+    if (sequence !== undefined) {
+      if (!Number.isInteger(sequence) || sequence < 0) {
+        return {
+          ok: false,
+          error: 'Sequence must be a non-negative integer',
+          status: 422,
+        }
+      }
+    }
+
+    // Pre-flight: verify the programme exists (tenant-scoped). The
+    // authoritative read is inside the transaction under the lock.
+    const programmeExists = await programmeRepository.getForOrganization(
+      ctx.organizationId,
+      programmeId,
+    )
+    if (!programmeExists) {
+      return { ok: false, error: 'Programme not found in this organization', status: 404 }
+    }
+
+    // ── Transaction: lock → read → resolve conflict (swap) → persist ──────
+    try {
+      await dbTx.$transaction(async (tx) => {
+        // Lock the Programme row FIRST (snapshot-at-lock, Q1).
+        await tx.$queryRaw`SELECT id FROM "Programme" WHERE id = ${programmeId} FOR UPDATE`
+
+        // Read activities UNDER THE LOCK (sorted by sequence, id).
+        const activities = await activityRepository.listForProgrammeInTransaction(
+          tx,
+          ctx.organizationId,
+          programmeId,
+        )
+
+        // Find the target activity by row ID.
+        const target = activities.find((a) => a.id === activityId)
+        if (!target) {
+          throw new DependencyValidationError(
+            `Activity "${activityId}" not found in programme "${programmeId}"`,
+            404,
+          )
+        }
+
+        // ── Swap-on-set sequence resolution ───────────────────────────────
+        // If `sequence` is provided and differs from the target's current
+        // sequence, find a conflicting activity (another activity in this
+        // programme holding the requested sequence). If found, swap their
+        // sequences using a 3-step temporary-sequence approach to avoid
+        // the P2002 unique constraint violation that would occur on
+        // intermediate states.
+        if (sequence !== undefined && sequence !== target.sequence) {
+          const conflicting = activities.find(
+            (a) => a.id !== activityId && a.sequence === sequence,
+          )
+          if (conflicting) {
+            // SWAP via 3 steps using a temporary sequence:
+            // 1. Move conflicting to a temp slot (guaranteed free: max+1)
+            // 2. Set target to the requested sequence
+            // 3. Set conflicting to target's old sequence
+            const maxSeq = Math.max(...activities.map((a) => a.sequence))
+            const tempSeq = maxSeq + 1
+            await activityRepository.updateInTransaction(
+              tx, programmeId, conflicting.id, { sequence: tempSeq },
+            )
+            const targetUpdate: { name?: string; sequence?: number } = { sequence }
+            if (name !== undefined) targetUpdate.name = name
+            await activityRepository.updateInTransaction(
+              tx, programmeId, activityId, targetUpdate,
+            )
+            await activityRepository.updateInTransaction(
+              tx, programmeId, conflicting.id, { sequence: target.sequence },
+            )
+          } else {
+            // No conflict — update target's sequence (and name if provided).
+            const targetUpdate: { name?: string; sequence?: number } = {}
+            if (name !== undefined) targetUpdate.name = name
+            targetUpdate.sequence = sequence
+            await activityRepository.updateInTransaction(
+              tx, programmeId, activityId, targetUpdate,
+            )
+          }
+        } else if (name !== undefined) {
+          // Only name update (no sequence change).
+          await activityRepository.updateInTransaction(
+            tx, programmeId, activityId, { name },
+          )
+        }
+      })
+    } catch (e) {
+      if (e instanceof DependencyValidationError) {
+        return { ok: false, error: e.message, status: e.status }
+      }
+      // R1 backstop: if the DB-level unique constraint
+      // @@unique([programmeId, sequence]) fires (P2002), convert it to a
+      // clean 409. This should never happen in normal flow — the swap-on-set
+      // logic under the lock resolves conflicts before persisting. But if a
+      // caller bypasses the service (direct repo call) or a race slips
+      // through, the DB constraint is the final guard.
+      if (
+        e !== null &&
+        typeof e === 'object' &&
+        'code' in e &&
+        (e as { code: string }).code === 'P2002'
+      ) {
+        return {
+          ok: false,
+          error:
+            'A sequence conflict occurred. Reload the programme and retry the reorder.',
+          status: 409,
+        }
+      }
+      throw e
+    }
+
+    // Re-fetch the schedule to return the updated CPM result. Note: the
+    // schedule itself (projectDuration, ES/EF/float, critical path) is
+    // UNCHANGED by this mutation — ordering is not scheduling. Only the
+    // activity's `name`/`sequence` changed, which the schedule reflects
+    // through the activity list (renamed) and the ordering (sorted by
+    // sequence, id) but NOT through any CPM-derived value.
     const scheduleResult = await this.getProgrammeSchedule({
       ctx,
       programmeId,

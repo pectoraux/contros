@@ -56,7 +56,11 @@ export const programmeRepository = {
     return db.programme.findFirst({
       where: { id: programmeId, organizationId: orgId },
       include: {
-        activities: { orderBy: { createdAt: 'asc' } },
+        // R1: activities are ordered by (sequence, id) so display order and
+        // snapshot determinism follow the user's arrangement of the
+        // programme — not DB row insertion order. sequence is unique within
+        // the programme (DB constraint), so the order is total.
+        activities: { orderBy: [{ sequence: 'asc' }, { id: 'asc' }] },
         dependencies: true,
         revisions: { orderBy: { revisionNo: 'desc' } },
       },
@@ -225,7 +229,21 @@ export const programmeRevisionRepo = {
 // ─── Activity Repository ────────────────────────────────────────────────────
 
 export const activityRepository = {
-  /** Create an activity within a transaction. */
+  /**
+   * Create an activity within a transaction.
+   *
+   * R1: `sequence` is assigned automatically to the next available slot
+   * (the count of existing activities in the programme), so a newly created
+   * activity always lands at the bottom of the Gantt and never collides
+   * with the `@@unique([programmeId, sequence])` constraint. The count is
+   * read inside the caller's transaction, so concurrent creates serialize
+   * on the Programme-row lock (the caller holds it).
+   *
+   * NOTE: callers must already hold the Programme-row lock (SELECT FOR
+   * UPDATE) before invoking this, to ensure the count is consistent with
+   * the eventual insert. The X3 path in `activityDependencyRepository`
+   * documents the same caller-holds-lock contract.
+   */
   async create(
     tx: Tx,
     programmeId: string,
@@ -237,6 +255,12 @@ export const activityRepository = {
       workDefinitionVersionId?: string | null
     },
   ) {
+    // R1: count existing activities in the programme → next sequence slot.
+    // Read inside the caller's transaction (caller holds the Programme lock).
+    const existingCount = await tx.activity.count({
+      where: { programmeId },
+    })
+
     return tx.activity.create({
       data: {
         programmeId,
@@ -246,6 +270,7 @@ export const activityRepository = {
         status: 'planned',
         estimateLineId: data.estimateLineId ?? null,
         workDefinitionVersionId: data.workDefinitionVersionId ?? null,
+        sequence: existingCount,
       },
     })
   },
@@ -253,6 +278,7 @@ export const activityRepository = {
   /**
    * List activities for a programme within a transaction (for snapshot-at-lock).
    * Q1: used inside the finalization transaction after the Programme row is locked.
+   * R1: ordered by (sequence, id) for snapshot determinism.
    */
   async listForProgrammeInTransaction(
     tx: Tx,
@@ -264,18 +290,21 @@ export const activityRepository = {
         programmeId,
         programme: { organizationId: orgId },
       },
-      orderBy: { createdAt: 'asc' },
+      orderBy: [{ sequence: 'asc' }, { id: 'asc' }],
     })
   },
 
-  /** List activities for a programme (tenant-scoped via programme). */
+  /**
+   * List activities for a programme (tenant-scoped via programme).
+   * R1: ordered by (sequence, id) for snapshot determinism.
+   */
   async listForProgramme(orgId: string, programmeId: string) {
     return db.activity.findMany({
       where: {
         programmeId,
         programme: { organizationId: orgId },
       },
-      orderBy: { createdAt: 'asc' },
+      orderBy: [{ sequence: 'asc' }, { id: 'asc' }],
     })
   },
 
@@ -284,6 +313,13 @@ export const activityRepository = {
    * serialize against concurrent finalization. The lock ensures that a
    * finalization running in parallel either sees the pre-edit or post-edit
    * state, never a partially-mixed snapshot.
+   *
+   * R1: `sequence` is included in the updatable fields. It is a mutable
+   * presentation property; callers handle swap-on-set semantics at the
+   * service layer to honour the `@@unique([programmeId, sequence])`
+   * constraint. Direct callers of this method that set `sequence` must
+   * ensure no other activity in the programme currently holds that value
+   * (otherwise the DB will reject with P2002).
    */
   async update(orgId: string, activityId: string, data: {
     name?: string
@@ -292,6 +328,7 @@ export const activityRepository = {
     status?: string
     estimateLineId?: string | null
     workDefinitionVersionId?: string | null
+    sequence?: number
   }) {
     return dbTx.$transaction(async (tx) => {
       // Q2: Lock the Programme row. First find the activity's programmeId.
@@ -309,6 +346,46 @@ export const activityRepository = {
         where: { id: activityId },
         data,
       })
+    })
+  },
+
+  /**
+   * R1: Update an activity WITHIN a caller-held transaction. The caller
+   * (ProgrammeService.updateActivity) has ALREADY acquired the Programme
+   * row lock (SELECT FOR UPDATE) and resolved any sequence conflict via
+   * swap-on-set semantics. This method does NOT lock — the caller holds
+   * the lock.
+   *
+   * Mirrors `activityDependencyRepository.updateInTransaction`:
+   *   - identity check (activity belongs to programme)
+   *   - update with the supplied fields (no lock)
+   *
+   * Used for activity rename + reorder so the swap-on-set logic runs in a
+   * single transaction with both row updates (the target activity's new
+   * sequence + the conflicting activity's old sequence).
+   */
+  async updateInTransaction(
+    tx: Tx,
+    programmeId: string,
+    activityId: string,
+    data: {
+      name?: string
+      sequence?: number
+    },
+  ) {
+    // Identity check: the activity must belong to this programme.
+    const existing = await tx.activity.findFirst({
+      where: { id: activityId, programmeId },
+      select: { id: true, programmeId: true },
+    })
+    if (!existing) {
+      throw new Error(
+        `Activity "${activityId}" not found in programme "${programmeId}"`,
+      )
+    }
+    return tx.activity.update({
+      where: { id: activityId },
+      data,
     })
   },
 }

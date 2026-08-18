@@ -38,6 +38,7 @@ function makeActivity(
     id: 'act-1',
     name: 'Excavation',
     duration: 5,
+    sequence: 0,
     constructionRefs: {
       estimateLineId: 'line-1',
       workDefinitionVersionId: 'wdv-1',
@@ -115,8 +116,8 @@ describe('Programme — schedule reproducibility (the core invariant)', () => {
     const replayed = replaySchedule(snapshot)
     // Build the same schedule directly via the engine.
     const direct = computeSchedule([
-      { id: 'a', name: 'Excavation', duration: 5, predecessors: [] },
-      { id: 'b', name: 'Excavation', duration: 3, predecessors: [{ id: 'a', type: 'FS', lag: 2 }] },
+      { id: 'a', name: 'Excavation', duration: 5, sequence: 0, predecessors: [] },
+      { id: 'b', name: 'Excavation', duration: 3, sequence: 0, predecessors: [{ id: 'a', type: 'FS', lag: 2 }] },
     ])
     expect(schedulesMatch(replayed, direct)).toBe(true)
   })

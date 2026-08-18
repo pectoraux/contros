@@ -65,9 +65,9 @@ describe('Programme dependency delete integration tests', () => {
     await db.user.create({ data: { id: USER_B, organizationId: ORG_B, name: 'User B', email: 'b@dd.test', role: 'estimator' } })
 
     await db.programme.create({ data: { id: PROG_A, organizationId: ORG_A, opportunityId: OPP_A, name: 'Programme A', status: 'draft' } })
-    await db.activity.create({ data: { id: ACT_1, programmeId: PROG_A, name: 'Excavation', duration: 5, status: 'planned' } })
-    await db.activity.create({ data: { id: ACT_2, programmeId: PROG_A, name: 'Foundation', duration: 10, status: 'planned' } })
-    await db.activity.create({ data: { id: ACT_3, programmeId: PROG_A, name: 'Structure', duration: 20, status: 'planned' } })
+    await db.activity.create({ data: { id: ACT_1, programmeId: PROG_A, name: 'Excavation', duration: 5, status: 'planned', sequence: 0 } })
+    await db.activity.create({ data: { id: ACT_2, programmeId: PROG_A, name: 'Foundation', duration: 10, status: 'planned', sequence: 1 } })
+    await db.activity.create({ data: { id: ACT_3, programmeId: PROG_A, name: 'Structure', duration: 20, status: 'planned', sequence: 2 } })
     // FS chain: ACT_1 → ACT_2 → ACT_3 (all lag 0). Duration = 5+10+20 = 35.
     await db.activityDependency.create({ data: { id: DEP_1, programmeId: PROG_A, predecessorActivityId: ACT_1, successorActivityId: ACT_2, type: 'FS', lag: 0 } })
     await db.activityDependency.create({ data: { id: DEP_2, programmeId: PROG_A, predecessorActivityId: ACT_2, successorActivityId: ACT_3, type: 'FS', lag: 0 } })
@@ -180,8 +180,8 @@ describe('Programme dependency delete integration tests', () => {
     const prog2 = await db.programme.create({
       data: { id: 'test-dd-programme-b', organizationId: ORG_A, name: 'Programme B', status: 'draft' },
     })
-    await db.activity.create({ data: { id: 'test-dd-act-b1', programmeId: prog2.id, name: 'B1', duration: 3, status: 'planned' } })
-    await db.activity.create({ data: { id: 'test-dd-act-b2', programmeId: prog2.id, name: 'B2', duration: 4, status: 'planned' } })
+    await db.activity.create({ data: { id: 'test-dd-act-b1', programmeId: prog2.id, name: 'B1', duration: 3, status: 'planned', sequence: 0 } })
+    await db.activity.create({ data: { id: 'test-dd-act-b2', programmeId: prog2.id, name: 'B2', duration: 4, status: 'planned', sequence: 1 } })
     const dep2 = await db.activityDependency.create({
       data: { id: 'test-dd-dep-b', programmeId: prog2.id, predecessorActivityId: 'test-dd-act-b1', successorActivityId: 'test-dd-act-b2', type: 'FS', lag: 0 },
     })
