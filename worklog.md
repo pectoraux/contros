@@ -5967,3 +5967,216 @@ NEXT (per review): the plan ↔ BOQ ↔ programme linkage model:
   EstimateLine → ProgrammeActivity → execution evidence.
 That is the architectural path toward the integrated AutoCAD/Archicad +
 BOQ + Microsoft Project-style system, while keeping each domain authoritative.
+
+---
+Task ID: plan-boq-programme-reconnaissance
+Agent: principal-engineer
+Task: Reconnaissance (no schema changes) — survey the existing domain models to answer: what existing identifiers can serve as durable construction identity across the plan ↔ BOQ ↔ programme graph? We should not invent a new "universal construction object" until the repository proves one is actually needed.
+
+METHODOLOGY:
+  Read the full Prisma schema (41 models) + repository exports + service
+  imports. Mapped every `estimateLineId`, `workDefinitionVersionId`,
+  `scopeItemId`, and `boqItemId` reference. No code changes.
+
+═══════════════════════════════════════════════════════════════════════════
+FINDING 1: EstimateLine is ALREADY the de facto commercial hub
+═══════════════════════════════════════════════════════════════════════════
+
+EstimateLine is referenced by 9 models:
+  - ExecutionSegment        (execution strategy split: self-perform vs subcontract)
+  - SubcontractPackage      (scope reconciliation)
+  - SubcontractPackageLine  (subcontract scope line)
+  - KnowledgeAlert          (calibration/learning)
+  - CommercialException     (pricing exceptions)
+  - ProjectActual           (execution evidence — variance tracking)
+  - BoqBinding              (1:1 BoqItem ↔ EstimateLine matching)
+  - ProgrammeRevision       (snapshot — carries estimateLineId in the snapshot JSON)
+  - Activity                (programme activity ↔ estimate line link)
+
+EstimateLine is the node the graph already pivots on. It carries:
+  - quantity + unit (commercial measurement)
+  - workDefinitionId + workDefinitionVersionId (construction work identity)
+  - scopeItemId (scope package link)
+  - full cost build-up (material, labour, plant, subcontract, fee, risk, overhead, profit)
+  - sellPrice + unitRate (commercial truth)
+  - provenanceSummary (human-readable lineage)
+
+═══════════════════════════════════════════════════════════════════════════
+FINDING 2: WorkDefinitionVersion is the construction-work identity
+═══════════════════════════════════════════════════════════════════════════
+
+WorkDefinitionVersion is referenced by 7 models:
+  - ProductivityObservation  (actual productivity evidence)
+  - Resource                 (resource requirements)
+  - ResourcePriceObservation (price evidence)
+  - EstimateRevision         (snapshot — carries WDV IDs in snapshot JSON)
+  - EstimateLine             (construction work identity)
+  - ProgrammeRevision        (snapshot — carries WDV IDs in snapshot JSON)
+  - Activity                 (programme activity ↔ WDV link)
+
+WorkDefinition (parent) carries:
+  - code (e.g. "WD-STRUCT-014") — a durable, human-readable identifier
+  - name, category, unit
+  - approvalState (draft | in-review | approved | deprecated)
+  - currentVersionId (points to the latest approved version)
+
+WorkDefinitionVersion (immutable when approved) carries:
+  - measurementRule, costRecipeJson, productivityRule
+  - crewComposition, equipment, wastage
+  - sequencing, methodStatementFragment
+  - hazards, controls, qualityChecklist
+
+So WorkDefinition.code is a durable cross-domain identifier — it identifies
+"the kind of construction work" regardless of which revision of the recipe
+is current. The WDV ID pins a specific version of that recipe.
+
+═══════════════════════════════════════════════════════════════════════════
+FINDING 3: The BOQ ↔ EstimateLine link ALREADY EXISTS via BoqBinding
+═══════════════════════════════════════════════════════════════════════════
+
+BoqBinding is a 1:1 relationship: one BoqItem ↔ one EstimateLine.
+  - boqItemId String @unique  (one binding per BoqItem)
+  - estimateLineId String?    (the matched EstimateLine, if any)
+  - status: MATCHED | AMBIGUOUS | UNMATCHED | REJECTED
+  - matchMethod: CODE_EXACT | DESCRIPTION_UNIT_EXACT | WORK_DEFINITION | CANDIDATE_SELECTED | MANUAL
+
+BoqItem carries:
+  - rawCode / normalizedCode (the BOQ item code — e.g. "1.2.3.a")
+  - rawDescription / normalizedDescription
+  - rawQuantity / normalizedQuantity
+  - rawUnit / normalizedUnit
+  - rawRate / normalizedRate
+
+So the BOQ → EstimateLine link is already modeled. The BoqItem.rawCode is a
+durable identifier within the BOQ domain (the client/consultant's code),
+and BoqBinding bridges it to EstimateLine.
+
+═══════════════════════════════════════════════════════════════════════════
+FINDING 4: The ProgrammeActivity ↔ EstimateLine link ALREADY EXISTS
+═══════════════════════════════════════════════════════════════════════════
+
+Activity.estimateLineId (optional) links a programme activity to an
+EstimateLine. Activity.workDefinitionVersionId (optional) links it to a
+WDV. These are relationships — the Activity does NOT copy commercial values.
+
+This means the chain EstimateLine → Activity is already modeled:
+  EstimateLine (commercial truth)
+      ↓ Activity.estimateLineId
+  ProgrammeActivity (schedule truth)
+
+═══════════════════════════════════════════════════════════════════════════
+FINDING 5: ProjectActual ↔ EstimateLine ALREADY EXISTS
+═══════════════════════════════════════════════════════════════════════════
+
+ProjectActual.estimateLineId (required) links execution evidence to an
+EstimateLine. It carries:
+  - quantityCompleted, daysTaken, crewSize
+  - materialConsumed, materialCost, subcontractFinalCost
+  - plannedProductivity, actualProductivity, productivityVariance
+  - plannedCost, actualCost, costVariance
+
+So the chain EstimateLine → ProjectActual is already modeled:
+  EstimateLine (commercial truth)
+      ↓ ProjectActual.estimateLineId
+  Execution evidence (actual vs planned)
+
+═══════════════════════════════════════════════════════════════════════════
+FINDING 6: THE GAP — no Plan/Drawing artifact exists
+═══════════════════════════════════════════════════════════════════════════
+
+There is NO model for:
+  - construction plans / drawings
+  - plan elements / measured quantities from drawings
+  - CAD/Archicad sheet references
+  - drawing ↔ BOQ item links
+
+The Document model has kinds: boq | method-statement | jha | cover-letter |
+assumptions | clarifications | certificate. There is no "drawing" or "plan"
+kind. BoqImport has an optional documentId, but that's for the BOQ
+spreadsheet file, not a drawing.
+
+THIS IS THE MISSING LINK in the chain:
+  Drawing/Plan artifact → ??? → BoqItem
+
+The current chain starts at BoqImport (the uploaded BOQ spreadsheet).
+There is no upstream "plan" or "drawing" domain.
+
+═══════════════════════════════════════════════════════════════════════════
+THE EXISTING GRAPH (as-is)
+═══════════════════════════════════════════════════════════════════════════
+
+  [GAP: no Drawing/Plan artifact]
+        ↓ ??? (missing)
+  BoqImport (uploaded BOQ spreadsheet)
+      ↓ 1:N
+  BoqItem (raw BOQ line: code, description, qty, unit, rate)
+      ↓ 1:1 via BoqBinding
+  EstimateLine (commercial truth: cost build-up, sellPrice, quantity)
+      ├── ← Activity.estimateLineId (programme schedule)
+      ├── ← ProjectActual.estimateLineId (execution evidence)
+      ├── ← ExecutionSegment.estimateLineId (execution strategy)
+      ├── ← SubcontractPackageLine.estimateLineId (subcontract scope)
+      ├── ← KnowledgeAlert.estimateLineId (calibration)
+      └── ← CommercialException.estimateLineId (pricing)
+      │
+      ├── workDefinitionId → WorkDefinition (code, name, category, unit)
+      │       ↓ 1:N
+      │   WorkDefinitionVersion (recipe: measurement, cost, productivity)
+      │       ↑ referenced by Activity.workDefinitionVersionId
+      │
+      └── scopeItemId → ScopeItem (scope package line)
+
+═══════════════════════════════════════════════════════════════════════════
+THE IDENTITY QUESTION
+═══════════════════════════════════════════════════════════════════════════
+
+Three candidate durable identifiers exist, each at a different level:
+
+1. WorkDefinition.code (e.g. "WD-STRUCT-014")
+   - Identifies the KIND of construction work (blockwork, plastering, etc.)
+   - Durable across revisions of the recipe
+   - Organization-scoped (each org has its own work library)
+   - Already referenced by EstimateLine + Activity
+   - GOOD FOR: "what kind of work is this?" grouping across domains
+
+2. EstimateLine.id (cuid)
+   - Identifies a specific commercial line item in a specific estimate
+   - The de facto hub — 9 models reference it
+   - GOOD FOR: linking commercial truth to schedule + execution
+   - LIMITATION: it's estimate-scoped, not drawing-scoped
+
+3. BoqItem.normalizedCode (e.g. "1.2.3.a")
+   - The client/consultant's BOQ item code
+   - Durable within the BOQ document
+   - GOOD FOR: matching external BOQ to internal estimate
+   - LIMITATION: BOQ codes are not standardized across clients/projects
+
+═══════════════════════════════════════════════════════════════════════════
+RECOMMENDATION (for the next discussion, not for implementation yet)
+═══════════════════════════════════════════════════════════════════════════
+
+Do NOT invent a "universal construction object." The existing graph already
+has durable identity at two levels:
+
+  WorkDefinition.code  = "what kind of work" (cross-project, org-scoped)
+  EstimateLine.id      = "this specific commercial line" (project-scoped)
+
+The missing piece is the DRAWING/PLAN layer — the upstream source of
+measured quantities. The chain should be:
+
+  Drawing/Plan (artifact: sheet, drawing number)
+      ↓
+  PlanElement (measured quantity from a drawing: e.g. "wall A = 45m²")
+      ↓ [NEW LINK: PlanElement → BoqItem or PlanElement → EstimateLine]
+  BoqItem (client's BOQ line) / EstimateLine (our commercial line)
+      ↓ (existing)
+  ProgrammeActivity (schedule)
+      ↓ (existing)
+  ProjectActual (execution evidence)
+
+The first schema decision is: what is a PlanElement?
+  - Does it carry its own measured quantity (from CAD takeoff)?
+  - Does it link to a Drawing (sheet number, revision)?
+  - Does it link forward to BoqItem (client's code) or EstimateLine (our line)?
+
+Those questions should be answered before any schema work.
