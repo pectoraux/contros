@@ -198,4 +198,39 @@ describe('Programme schedule read service integration tests', () => {
     expect(res.error).toMatch(/not finalized/i)
     await db.programmeRevision.delete({ where: { id: draftRev.id } })
   }, 60000)
+
+  // ── T1: programmeId ↔ revisionId identity validation ─────────────────────
+
+  test('T1: mismatched programmeId + revisionId → 404', async () => {
+    // Create a second programme in Org A.
+    const prog2 = await db.programme.create({
+      data: { id: 'test-ps-programme-b', organizationId: ORG_A, name: 'Programme B', status: 'draft' },
+    })
+    // Request: programmeId = Programme B, revisionId = Revision A (belongs to Programme A).
+    // This must be REJECTED — the revision does not belong to the requested programme.
+    const res = await programmeService.getProgrammeSchedule({
+      ctx: ctxA,
+      programmeId: prog2.id,
+      revisionId, // belongs to PROG_A, not prog2
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.status).toBe(404)
+    expect(res.error).toMatch(/does not belong to this programme/i)
+    // Clean up.
+    await db.programme.delete({ where: { id: prog2.id } }).catch(() => {})
+  }, 60000)
+
+  test('T1: matching programmeId + revisionId → success', async () => {
+    // The positive case: programmeId matches the revision's programme.
+    const res = await programmeService.getProgrammeSchedule({
+      ctx: ctxA,
+      programmeId: PROG_A,
+      revisionId, // belongs to PROG_A
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.mode).toBe('revision')
+    expect(res.schedule.projectDuration).toBe(15)
+  }, 60000)
 }, 600000)

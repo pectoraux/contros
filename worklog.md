@@ -4735,3 +4735,36 @@ THE READ SERVICE ESTABLISHES:
   Read-only Gantt view (renders, does not calculate)
 
 NEXT: the Gantt UI component (read-only, renders ScheduleResult).
+
+---
+Task ID: programme-schedule-identity-fix
+Agent: principal-engineer
+Task: T1 — validate programmeId ↔ revisionId match in getProgrammeSchedule revision mode. No frozen code touched.
+
+T1 — programmeId ↔ revisionId identity validation.
+- In revision mode, after loading the revision (tenant-scoped), the service
+  now checks: revision.programmeId === programmeId. If they mismatch, returns
+  404 with "Programme revision does not belong to this programme."
+- This prevents a caller in the same org from requesting Programme B's
+  schedule while passing Programme A's ID + Programme A's revisionId — an
+  identity mismatch that should fail safely.
+- The (programmeId, revisionId) pair must identify one exact programme revision.
+
+TESTS (2 new, 11 total — all passing):
+- T1: mismatched programmeId + revisionId → 404 (Programme B ID + Revision A
+  → rejected).
+- T1: matching programmeId + revisionId → success (Programme A ID + Revision A
+  → schedule returned).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Programme schedule read (Neon) ...... 11 pass / 0 fail / 37 expect()
+- Frozen Phase 1 code ................. UNTOUCHED
+
+THE READ SERVICE IS NOW IDENTITY-SAFE:
+  (programmeId, revisionId) must identify one exact programme revision.
+  Mismatch → 404 (not a schedule from the wrong programme).
+  Tenant isolation → 404 (not a schedule from the wrong org).
+  Non-finalized → 422 (not a schedule from a mutable draft).
+  Workspace mode → validated live preview (not a historical truth).

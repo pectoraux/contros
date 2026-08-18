@@ -310,6 +310,13 @@ export const programmeService = {
       if (revision.status !== 'finalized') {
         return { ok: false, error: 'Programme revision is not finalized', status: 422 }
       }
+      // T1: Validate that the revision belongs to the requested programme.
+      // A caller in the same org could otherwise request Programme B's revision
+      // while passing Programme A's ID — an identity mismatch that should fail
+      // safely with 404 rather than returning the wrong programme's schedule.
+      if (revision.programmeId !== programmeId) {
+        return { ok: false, error: 'Programme revision does not belong to this programme', status: 404 }
+      }
 
       const snapshot = deserializeSnapshot(revision.snapshotJson)
       const schedule = replaySchedule(snapshot)
