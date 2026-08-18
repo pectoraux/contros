@@ -173,7 +173,9 @@ export function ProgrammeGantt({
           <h4 className="mb-1 text-sm font-medium">Add dependency</h4>
           <p className="mb-3 text-xs text-muted-foreground">
             Add a precedence edge. The server validates same-programme, no
-            self-reference, finite lag, and no resulting cycle before persisting.
+            self-reference, finite lag, no resulting cycle, and no duplicate
+            edge before persisting. Between any two activities there is exactly
+            one dependency — change its type or lag rather than adding another.
           </p>
           <AddDependencyForm
             programmeId={programmeId ?? ''}

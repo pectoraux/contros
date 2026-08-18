@@ -940,7 +940,24 @@ model ActivityDependency {
   predecessorActivity   Activity  @relation("PredecessorActivity", fields: [predecessorActivityId], references: [id])
   successorActivity     Activity  @relation("SuccessorActivity", fields: [successorActivityId], references: [id])
 
-  @@unique([predecessorActivityId, successorActivityId, type])
+  // U1 — DEPENDENCY IDENTITY:
+  // A dependency relationship is identified by the ordered pair
+  // (predecessor, successor) WITHIN a programme. Between any two activities
+  // there is exactly ONE dependency relationship; type and lag are MUTABLE
+  // PROPERTIES of that relationship, not part of its identity.
+  //
+  // This means:
+  //   - Adding A→B when A→B already exists (even with a different type/lag)
+  //     is REJECTED (409 Conflict). The caller must PATCH the existing edge.
+  //   - "Change type" and "change lag" mutate the existing edge rather than
+  //     creating a competing one.
+  //   - The relationship is ORDERED: A→B ≠ B→A (though the cycle checker
+  //     would reject B→A if A→B exists).
+  //
+  // The previous constraint included `type` in the unique key, which allowed
+  // A→B FS and A→B SS to coexist as separate edges — ambiguous authority.
+  // type/lag are now properties, not identity.
+  @@unique([programmeId, predecessorActivityId, successorActivityId])
   @@index([programmeId])
   @@index([predecessorActivityId])
   @@index([successorActivityId])

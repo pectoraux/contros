@@ -538,6 +538,14 @@ export const programmeService = {
    *   finite lag         — service checks pre-DB (Number.isFinite) → 422
    *   valid type         — service checks pre-DB (∈ {FS,SS,FF,SF}) → 422
    *   no cycle           — validateProgrammeSnapshot under the lock → 422
+   *   no duplicate edge  — U1: service checks under the lock → 409
+   *
+   * U1 — DEPENDENCY IDENTITY: a dependency is identified by the ordered pair
+   * (predecessor, successor) within a programme. type and lag are MUTABLE
+   * PROPERTIES, not part of the identity. Adding A→B when A→B already exists
+   * (even with a different type/lag) is rejected with 409 Conflict. The
+   * caller must PATCH the existing edge. The DB enforces this via
+   * @@unique([programmeId, predecessorActivityId, successorActivityId]).
    */
   async addDependency(
     input: {
@@ -616,6 +624,31 @@ export const programmeService = {
           )
         }
 
+        // U1 — DEPENDENCY IDENTITY: check for an existing duplicate edge.
+        // A dependency relationship is identified by the ordered pair
+        // (predecessor, successor) within a programme. Between any two
+        // activities there is exactly ONE dependency relationship; type and
+        // lag are MUTABLE PROPERTIES, not part of the identity.
+        //
+        // If an A→B edge already exists (regardless of its current type/lag),
+        // reject with 409 Conflict. The caller must PATCH the existing edge
+        // to change its type or lag — not create a competing one.
+        //
+        // This check runs inside the Programme-row lock, so it is
+        // authoritative: a concurrent addDependency cannot create a duplicate
+        // between the check and the insert.
+        const existingEdge = dependencies.find(
+          (d) =>
+            d.predecessorActivityId === predecessorActivityId &&
+            d.successorActivityId === successorActivityId,
+        )
+        if (existingEdge) {
+          throw new DependencyValidationError(
+            `A dependency from "${predecessorActivityId}" to "${successorActivityId}" already exists (type: ${existingEdge.type}, lag: ${existingEdge.lag}). Update the existing dependency to change its type or lag.`,
+            409,
+          )
+        }
+
         // Build the WOULD-BE snapshot (current graph + the new edge) and
         // validate it. validateProgrammeSnapshot catches:
         //   - cycles (via the schedule engine's cycle detection)
@@ -691,6 +724,25 @@ export const programmeService = {
     } catch (e) {
       if (e instanceof DependencyValidationError) {
         return { ok: false, error: e.message, status: e.status }
+      }
+      // U1 backstop: if the DB-level unique constraint
+      // @@unique([programmeId, predecessorActivityId, successorActivityId])
+      // fires (P2002), convert it to a clean 409. This should never happen
+      // in normal flow — the service checks for duplicates under the lock
+      // before persisting. But if a caller bypasses the service (direct repo
+      // call) or a race slips through, the DB constraint is the final guard.
+      if (
+        e !== null &&
+        typeof e === 'object' &&
+        'code' in e &&
+        (e as { code: string }).code === 'P2002'
+      ) {
+        return {
+          ok: false,
+          error:
+            'A dependency between these two activities already exists. Update the existing dependency to change its type or lag.',
+          status: 409,
+        }
       }
       throw e
     }

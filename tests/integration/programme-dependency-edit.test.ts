@@ -293,4 +293,32 @@ describe('Programme dependency editing integration tests', () => {
     })
     expect(persisted).toBeNull()
   }, 60000)
+
+  // ── 10. Duplicate edge → rejected (U1) ────────────────────────────────────
+
+  test('duplicate edge: add A→B again with different type/lag → 409', async () => {
+    // The workspace has ACT_1 → ACT_2 (FS, lag 0, DEP_1).
+    // U1: a dependency is identified by the ordered pair (predecessor, successor),
+    // NOT by (predecessor, successor, type, lag). Adding ACT_1 → ACT_2 again —
+    // even with a different type/lag — must be rejected with 409 Conflict.
+    // The caller must PATCH the existing edge to change its type or lag.
+    const res = await programmeService.addDependency({
+      ctx: ctxA, programmeId: PROG_A,
+      predecessorActivityId: ACT_1, successorActivityId: ACT_2,
+      type: 'SS', lag: 5, // different type + lag from the existing FS lag 0
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.status).toBe(409)
+    expect(res.error).toMatch(/already exists/i)
+
+    // Verify no second edge was persisted — the original FS lag 0 edge is
+    // unchanged, and no SS lag 5 edge was created.
+    const edges = await db.activityDependency.findMany({
+      where: { programmeId: PROG_A, predecessorActivityId: ACT_1, successorActivityId: ACT_2 },
+    })
+    expect(edges.length).toBe(1)
+    expect(edges[0].type).toBe('FS')
+    expect(edges[0].lag).toBe(0)
+  }, 60000)
 })

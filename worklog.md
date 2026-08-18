@@ -5121,3 +5121,109 @@ NEXT (per review sequence): the remaining edit primitives toward a real
 Microsoft Project-like scheduler — change dependency type, change lag,
 reorder/rename activities — then save → finalize → compare revisions.
 Each mutation follows the same model: UI edits INPUTS, engine derives OUTPUTS.
+
+---
+Task ID: programme-dependency-identity
+Agent: principal-engineer
+Task: U1 — Dependency identity: close the duplicate-edge gap. A dependency is identified by the ordered pair (predecessor, successor) within a programme; type and lag are MUTABLE PROPERTIES, not part of the identity. Schema unique constraint + service-level duplicate check (409) + P2002 backstop + integration test + HTTP/browser verification. No frozen code touched.
+
+DECISION (per review):
+  A → B = one dependency relationship (identified by ordered pair)
+  type / lag = mutable properties of that relationship
+
+This means:
+  - Adding A→B when A→B already exists (even with different type/lag) → 409 Conflict
+  - Future "change type" and "change lag" mutations PATCH the existing edge
+    rather than creating a competing one
+  - The relationship is ORDERED: A→B ≠ B→A (though the cycle checker
+    would reject B→A if A→B exists)
+
+SCHEMA (prisma/schema.prisma — ActivityDependency model):
+- Changed the unique constraint from:
+    @@unique([predecessorActivityId, successorActivityId, type])
+  to:
+    @@unique([programmeId, predecessorActivityId, successorActivityId])
+- The old constraint included `type` in the unique key, which allowed
+  A→B FS and A→B SS to coexist as separate edges — ambiguous authority.
+  type/lag are now properties, not identity.
+- Added programmeId to the unique key for explicitness (activity IDs are
+  globally unique cuids, so programmeId is technically redundant, but it
+  makes the intent explicit and is good practice).
+- Applied via `bun run db:push` — no existing duplicate edges found, so
+  the constraint applied cleanly.
+
+SERVICE (src/application/programme-service.ts — addDependency):
+- Added duplicate-edge check INSIDE the Programme-row lock, after the
+  self-reference check and before the cycle check:
+    const existingEdge = dependencies.find(
+      (d) => d.predecessorActivityId === predecessorActivityId &&
+            d.successorActivityId === successorActivityId,
+    )
+    if (existingEdge) → 409 Conflict
+- The error message includes the existing edge's type and lag so the
+  caller knows what to PATCH:
+    "A dependency from A to B already exists (type: FS, lag: 0).
+     Update the existing dependency to change its type or lag."
+- This check is authoritative: it runs inside the lock, so a concurrent
+  addDependency cannot create a duplicate between the check and the insert.
+- Added P2002 backstop: if the DB-level unique constraint fires (e.g. a
+  caller bypasses the service), the service catches Prisma's P2002 error
+  and converts it to a clean 409. Defense in depth — the service check
+  should always fire first under the lock.
+- Updated docstrings (service + API route) to document the 409 response
+  and the U1 identity rule.
+
+INTEGRATION TEST (tests/integration/programme-dependency-edit.test.ts):
+- Added test #11: "duplicate edge: add A→B again with different type/lag → 409"
+  - Workspace has ACT_1→ACT_2 (FS, lag 0, DEP_1).
+  - Try to add ACT_1→ACT_2 again with type SS, lag 5.
+  - Expect: 409, error matches /already exists/i.
+  - Verify: only 1 edge persisted (the original FS lag 0, unchanged).
+- All 11 dependency tests pass.
+
+VERIFICATION (3 levels):
+1. Service-level (PostgreSQL integration):
+   - 11 tests pass / 0 fail / 38 expect()
+   - Includes: happy path, finalized-revision-unchanged, cross-tenant,
+     cross-programme, self-ref, missing activity, NaN lag, Infinity lag,
+     invalid type, cycle rejection, DUPLICATE REJECTION (new).
+
+2. HTTP-level (authenticated curl):
+   - Login via NextAuth credentials flow (kwesi@adomconstruction.gh).
+   - GET programme list → programme ID.
+   - GET schedule → activity IDs + initial duration (33 days).
+   - POST duplicate (ACT1→ACT2, SS, lag 5) → HTTP 409:
+     {"error":"A dependency from ... to ... already exists (type: FS,
+      lag: 0). Update the existing dependency to change its type or lag."}
+   - GET schedule after → duration still 33 (unchanged).
+   - Edge count between ACT1→ACT2: still 1 (no duplicate persisted).
+   - Dev log: POST .../dependencies 409 in 6.0s.
+
+3. Browser-level (agent-browser eval):
+   - Logged in as Director Kwesi via the browser UI.
+   - Navigated to Opportunities → Office Complex.
+   - Used agent-browser eval to make an authenticated fetch from the
+     browser context:
+       POST /api/programmes/.../dependencies { type: 'SS', lag: 5 }
+     → status=409 ok=false error="A dependency from ... already exists..."
+   - Dev log: POST .../dependencies 409 in 6.3s.
+   - This proves the full browser → authenticated HTTP → PostgreSQL path.
+
+REGRESSION CHECK:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Dependency edit integration (Neon) .. 11 pass / 0 fail / 38 expect()
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE DEPENDENCY IDENTITY IS NOW SETTLED:
+  (programmeId, predecessorActivityId, successorActivityId) = unique identity
+  type / lag = mutable properties of that relationship
+
+  Adding A→B when A→B exists → 409 (not a second edge)
+  Future "change type" → PATCH the existing A→B edge
+  Future "change lag" → PATCH the existing A→B edge
+  Future "delete dependency" → DELETE the A→B edge
+
+This gives us a coherent scheduling graph instead of gradually
+accumulating ambiguous edge records. The next mutations (change type,
+change lag, delete) now have a clean target: one edge per ordered pair.

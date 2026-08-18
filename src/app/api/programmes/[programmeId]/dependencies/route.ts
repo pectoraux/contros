@@ -24,11 +24,12 @@ import { programmeService } from '@/application/programme-service'
  *
  * The server validates (inside the Programme-row lock):
  *   same tenant · same programme · activities exist · no self-reference
- *   finite lag · valid type · resulting graph has no cycle
+ *   finite lag · valid type · resulting graph has no cycle · no duplicate edge
  *
  * Response:
  *   200 → { ok: true, schedule, programmeName }
  *   404 → programme or activity not found / wrong tenant
+ *   409 → a dependency between these two activities already exists (U1)
  *   422 → invalid type, non-finite lag, self-reference, or cycle
  *   401/403 → auth errors
  */
