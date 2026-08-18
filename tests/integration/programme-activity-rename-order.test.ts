@@ -337,4 +337,90 @@ describe('Programme activity rename + ordering integration tests', () => {
       name: 'Excavation',
     })
   }, 120000)
+
+  // ── 11. Combined atomic: duration + name + sequence in one transaction ───
+
+  test('combined atomic: duration + name + sequence → all succeed in one transaction', async () => {
+    // Before: ACT_1 = Excavation, dur=5, seq=0.
+    const before = await programmeService.getProgrammeSchedule({ ctx: ctxA, programmeId: PROG_A })
+    expect(before.ok).toBe(true)
+    if (!before.ok) return
+    const beforeDur = before.schedule.projectDuration // 35
+
+    // Combined PATCH: duration 5→8, name→'Site Prep', sequence 0→2 (swap with ACT_3).
+    const res = await programmeService.updateActivity({
+      ctx: ctxA, programmeId: PROG_A, activityId: ACT_1,
+      duration: 8, name: 'Site Prep', sequence: 2,
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+
+    // All three fields changed.
+    const act1 = await db.activity.findUnique({ where: { id: ACT_1 } })
+    expect(act1!.name).toBe('Site Prep')
+    expect(act1!.duration).toBe(8)
+    expect(act1!.sequence).toBe(2)
+
+    // ACT_3 (was seq 2) swapped to ACT_1's old seq (0).
+    const act3 = await db.activity.findUnique({ where: { id: ACT_3 } })
+    expect(act3!.sequence).toBe(0)
+
+    // Schedule recomputed (duration changed): 8+10+20 = 38.
+    expect(res.schedule.projectDuration).toBe(38)
+
+    // Restore.
+    await programmeService.updateActivity({
+      ctx: ctxA, programmeId: PROG_A, activityId: ACT_1,
+      duration: 5, name: 'Excavation', sequence: 0,
+    })
+    // Restore ACT_3's sequence (it was swapped to 0, needs to go back to 2).
+    await db.activity.update({ where: { id: ACT_3 }, data: { sequence: 2 } })
+  }, 60000)
+
+  // ── 12. Atomic partial failure: invalid sequence + valid duration → both rejected ─
+
+  test('atomic: invalid sequence + valid duration → 422, duration UNCHANGED', async () => {
+    // Before: ACT_1 = dur 5.
+    const before = await db.activity.findUnique({ where: { id: ACT_1 } })
+    expect(before!.duration).toBe(5)
+
+    // Combined PATCH: valid duration (5→10) + INVALID sequence (-1).
+    // The pre-DB validation catches the invalid sequence → 422 BEFORE any
+    // DB write. Duration must NOT have changed.
+    const res = await programmeService.updateActivity({
+      ctx: ctxA, programmeId: PROG_A, activityId: ACT_1,
+      duration: 10, sequence: -1,
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.status).toBe(422)
+
+    // Duration UNCHANGED — the atomic transaction did not commit.
+    const after = await db.activity.findUnique({ where: { id: ACT_1 } })
+    expect(after!.duration).toBe(5)
+  }, 60000)
+
+  // ── 13. Atomic: duration + name only (no sequence) → both succeed ────────
+
+  test('combined atomic: duration + name (no sequence) → both succeed', async () => {
+    const res = await programmeService.updateActivity({
+      ctx: ctxA, programmeId: PROG_A, activityId: ACT_2,
+      duration: 15, name: 'Footings',
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+
+    const act2 = await db.activity.findUnique({ where: { id: ACT_2 } })
+    expect(act2!.name).toBe('Footings')
+    expect(act2!.duration).toBe(15)
+
+    // Schedule recomputed: 5+15+20 = 40.
+    expect(res.schedule.projectDuration).toBe(40)
+
+    // Restore.
+    await programmeService.updateActivity({
+      ctx: ctxA, programmeId: PROG_A, activityId: ACT_2,
+      duration: 10, name: 'Foundation',
+    })
+  }, 60000)
 })

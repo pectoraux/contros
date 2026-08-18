@@ -5569,3 +5569,83 @@ exclusively from duration + dependency inputs. The snapshot hash is deterministi
 NEXT (per review sequence):
   - workspace save/finalization UX
   - revision comparison
+
+---
+Task ID: activity-atomic-patch
+Agent: principal-engineer
+Task: Close the atomic PATCH hazard. The activity PATCH route previously called two separate service methods (updateActivityDuration + updateActivity) in two separate transactions, creating a partial-update hazard (duration could succeed while sequence failed). Refactored to a single atomic transaction: one HTTP PATCH = one Programme transaction = atomic workspace mutation. No frozen code touched.
+
+ISSUE (per review):
+  Combined PATCH {duration, name, sequence} was implemented as:
+    updateActivityDuration()  → transaction 1 / Programme lock
+    updateActivity()          → transaction 2 / Programme lock
+  If duration succeeded but sequence failed, the workspace was left in a
+  partial state that the user never intended.
+
+FIX:
+  Refactored `updateActivity` to accept `duration?: number` alongside
+  `name?` and `sequence?`. All supplied fields are now updated in ONE
+  transaction under the Programme-row lock. If any validation fails (pre-DB
+  or in-transaction), the whole transaction rolls back — no partial state.
+
+  The invariant is now:
+    one HTTP PATCH = one Programme transaction = atomic workspace mutation
+
+SERVICE (src/application/programme-service.ts):
+- `updateActivity` now accepts `{ ctx, programmeId, activityId, name?, sequence?, duration? }`.
+- Pre-DB validation: at least one field → 422. If name: non-empty → 422.
+  If sequence: non-negative integer → 422. If duration: finite + >= 0 → 422.
+- Single transaction: lock Programme row → read activities → find target →
+  swap-on-set (if sequence conflict) → update target's name/sequence/duration
+  in one `updateInTransaction` call → commit.
+- The swap-on-set logic now includes duration in the target update alongside
+  name and sequence.
+- `updateActivityDuration` is retained for backward compatibility (existing
+  tests use it), but the route now calls only `updateActivity`.
+
+ROUTE (src/app/api/programmes/[programmeId]/activities/[activityId]/route.ts):
+- Simplified to a single `programmeService.updateActivity()` call with all
+  supplied fields. No more two-step dispatch.
+- Body contract unchanged: { duration?, name?, sequence? } — any subset,
+  at least one required.
+
+INTEGRATION TESTS (3 new, 15 total in programme-activity-rename-order.test.ts):
+11. Combined atomic: duration + name + sequence → all succeed in one
+    transaction. Duration 5→8, name→'Site Prep', sequence 0→2 (swap with
+    ACT_3). All three changed; schedule recomputed (35→38).
+12. Atomic partial failure: invalid sequence (-1) + valid duration (10) →
+    422. Duration UNCHANGED (stayed at 5) — the atomic transaction did not
+    commit.
+13. Combined atomic: duration + name (no sequence) → both succeed.
+    Duration 10→15, name→'Footings'. Schedule recomputed (35→40).
+
+HTTP VERIFICATION (authenticated curl):
+- Combined atomic {duration:8, name:'Site Prep', sequence:2}: 200.
+  Site Clearing→Site Prep (dur 3→8, seq 0→2 swapped with Structure).
+  Duration 33→38. ✅
+- Atomic partial failure {duration:99, sequence:-1}: 422.
+  Duration stayed at 8 (NOT 99) — atomic rollback worked. ✅
+- Restore: 200. ✅
+- Dev log: PATCH 200, PATCH 422, PATCH 200.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Activity rename/order (Neon) ....... 15 pass / 0 fail / 50 expect()
+  (12 existing + 3 new atomic tests)
+- HTTP: combined atomic → 200 → all fields changed .. ✅
+- HTTP: partial failure → 422 → duration UNCHANGED .. ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE ATOMIC PATCH INVARIANT IS NOW ENFORCED:
+  one HTTP PATCH = one Programme transaction = atomic workspace mutation
+
+  If any field validation fails, NO field is written — the workspace never
+  enters a partial state. This is the right foundation for finalization UX,
+  because the browser can never produce an intermediate workspace state
+  that was never intended by the user.
+
+NEXT: workspace save/finalization UX — the crucial distinction between
+  Current workspace (mutable, unsaved/working plan)
+  Finalize → ProgrammeRevision (immutable historical schedule)
+with a "what changed since last revision?" surface.

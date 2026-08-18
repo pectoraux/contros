@@ -1177,9 +1177,9 @@ export const programmeService = {
   },
 
   /**
-   * R1: Rename an activity and/or change its sequence — the fifth controlled
-   * schedule mutation. (Duration is the first; dependency add/update/delete
-   * are the second through fourth.)
+   * R1/V2: Update an activity's name, sequence, and/or duration — the
+   * unified controlled schedule mutation. Combines rename (R1), reorder
+   * (R1), and duration edit (V2) into a SINGLE atomic transaction.
    *
    * Architectural rule (NON-NEGOTIABLE):
    *   - `sequence` is a mutable PRESENTATION property, NOT a scheduling
@@ -1193,6 +1193,14 @@ export const programmeService = {
    *   - `name` is a semantic label on the Activity row. It MUST NOT alter
    *     EstimateLine, WorkDefinitionVersion, ProgrammeRevision, or any
    *     commercial value.
+   *   - `duration` IS a scheduling input — changing it DOES recompute the
+   *     schedule outputs (start, finish, float, critical path).
+   *
+   * ATOMIC: all supplied fields (name, sequence, duration) are updated in
+   * ONE transaction under the Programme-row lock. If any validation fails
+   * inside the transaction, the whole thing rolls back — no partial state.
+   *
+   *   one HTTP PATCH = one Programme transaction = atomic workspace mutation
    *
    * Swap-on-set semantics for sequence conflicts: when PATCHing
    * `{ sequence: N }`, if another activity in the same programme already
@@ -1202,19 +1210,23 @@ export const programmeService = {
    * "move up/down" without requiring a separate swap endpoint.
    *
    * PARTIAL PATCH contract (mirrors updateDependency):
-   *   { name: "New Name" }           → rename only
-   *   { sequence: 2 }                → reorder only (swap-on-set if conflict)
-   *   { name: "X", sequence: 2 }     → both
+   *   { name: "New Name" }           → rename only (schedule UNCHANGED)
+   *   { sequence: 2 }                → reorder only (swap-on-set; schedule UNCHANGED)
+   *   { duration: 5 }                → duration only (schedule RECOMPUTED)
+   *   { name: "X", sequence: 2 }     → rename + reorder (schedule UNCHANGED)
+   *   { duration: 5, name: "X" }     → duration + rename (schedule RECOMPUTED)
+   *   { duration: 5, sequence: 2 }   → duration + reorder (schedule RECOMPUTED)
+   *   { duration: 5, name: "X", sequence: 2 } → all three
    *   {}                             → 422 (nothing to update)
    *
    * Flow (snapshot-at-lock — mirrors updateDependency):
    *   RequestContext
    *       ↓
-   *   validate name (if provided) + sequence (if provided)  (pure, pre-DB)
+   *   validate name + sequence + duration (if provided)  (pure, pre-DB)
    *       ↓
    *   pre-flight: programme exists (tenant-scoped read)
    *       ↓
-   *   TRANSACTION:
+   *   TRANSACTION (ATOMIC — all fields in one transaction):
    *     SELECT FOR UPDATE on Programme row  (lock)
    *     read activities UNDER THE LOCK (sorted by sequence, id)
    *     find existing activity by row ID
@@ -1226,9 +1238,10 @@ export const programmeService = {
    *                      requested value (both updates in this transaction)
    *         if no conflict: set target's sequence to the requested value
    *     if `name` provided: update target's name
+   *     if `duration` provided: update target's duration
    *     activityRepository.updateInTransaction  (identity + persist, no lock)
    *       ↓
-   *   getProgrammeSchedule (workspace preview with updated name/sequence)
+   *   getProgrammeSchedule (workspace preview with all updates applied)
    *       ↓
    *   updated ScheduleResult
    *
@@ -1242,16 +1255,16 @@ export const programmeService = {
    *   same tenant        — programmeRepository.getForOrganization (tenant scope)
    *   same programme     — updateInTransaction checks activity.programmeId === programmeId
    *   activity exists    — service checks under the lock → 404
-   *   at least one field — service checks pre-DB (name or sequence provided) → 422
+   *   at least one field — service checks pre-DB (name/sequence/duration provided) → 422
    *   valid name         — service checks pre-DB (if name provided, non-empty) → 422
    *   valid sequence     — service checks pre-DB (if sequence provided,
    *                        Number.isInteger && >= 0) → 422
+   *   valid duration     — service checks pre-DB (if duration provided,
+   *                        Number.isFinite && >= 0) → 422
    *
-   * SCHEDULE UNCHANGED: this method NEVER changes the schedule outputs
-   * (projectDuration, ES/EF/float/critical path) — those are derived from
-   * duration + dependency inputs, neither of which is touched here. The
-   * post-call ScheduleResult is identical to the pre-call result; only the
-   * name and/or sequence on the activity row(s) change.
+   * SCHEDULE: if `duration` is supplied, the schedule IS recomputed (duration
+   * is a scheduling input). If only `name`/`sequence` are supplied, the
+   * schedule is UNCHANGED — ordering and naming are NOT scheduling.
    */
   async updateActivity(
     input: {
@@ -1260,6 +1273,7 @@ export const programmeService = {
       activityId: string
       name?: string
       sequence?: number
+      duration?: number
     },
   ): Promise<
     | {
@@ -1270,14 +1284,14 @@ export const programmeService = {
       }
     | Err
   > {
-    const { ctx, programmeId, activityId, name, sequence } = input
+    const { ctx, programmeId, activityId, name, sequence, duration } = input
 
     // ── Pre-DB validation (pure) ──────────────────────────────────────────
     // At least one property must be supplied.
-    if (name === undefined && sequence === undefined) {
+    if (name === undefined && sequence === undefined && duration === undefined) {
       return {
         ok: false,
-        error: 'At least one of name or sequence must be provided',
+        error: 'At least one of name, sequence, or duration must be provided',
         status: 422,
       }
     }
@@ -1301,6 +1315,23 @@ export const programmeService = {
         }
       }
     }
+    // If duration is provided, it must be finite and >= 0.
+    if (duration !== undefined) {
+      if (!Number.isFinite(duration)) {
+        return {
+          ok: false,
+          error: 'Duration must be a finite number',
+          status: 422,
+        }
+      }
+      if (duration < 0) {
+        return {
+          ok: false,
+          error: 'Duration must be >= 0',
+          status: 422,
+        }
+      }
+    }
 
     // Pre-flight: verify the programme exists (tenant-scoped). The
     // authoritative read is inside the transaction under the lock.
@@ -1313,6 +1344,11 @@ export const programmeService = {
     }
 
     // ── Transaction: lock → read → resolve conflict (swap) → persist ──────
+    // ATOMIC: all supplied fields (name, sequence, duration) are updated in
+    // ONE transaction under the Programme-row lock. If any validation fails
+    // inside the transaction, the whole thing rolls back — no partial state.
+    // This is the "one HTTP PATCH = one Programme transaction = atomic
+    // workspace mutation" invariant.
     try {
       await dbTx.$transaction(async (tx) => {
         // Lock the Programme row FIRST (snapshot-at-lock, Q1).
@@ -1348,15 +1384,16 @@ export const programmeService = {
           if (conflicting) {
             // SWAP via 3 steps using a temporary sequence:
             // 1. Move conflicting to a temp slot (guaranteed free: max+1)
-            // 2. Set target to the requested sequence
+            // 2. Set target to the requested sequence (+ name/duration if provided)
             // 3. Set conflicting to target's old sequence
             const maxSeq = Math.max(...activities.map((a) => a.sequence))
             const tempSeq = maxSeq + 1
             await activityRepository.updateInTransaction(
               tx, programmeId, conflicting.id, { sequence: tempSeq },
             )
-            const targetUpdate: { name?: string; sequence?: number } = { sequence }
+            const targetUpdate: { name?: string; sequence?: number; duration?: number } = { sequence }
             if (name !== undefined) targetUpdate.name = name
+            if (duration !== undefined) targetUpdate.duration = duration
             await activityRepository.updateInTransaction(
               tx, programmeId, activityId, targetUpdate,
             )
@@ -1364,19 +1401,25 @@ export const programmeService = {
               tx, programmeId, conflicting.id, { sequence: target.sequence },
             )
           } else {
-            // No conflict — update target's sequence (and name if provided).
-            const targetUpdate: { name?: string; sequence?: number } = {}
+            // No conflict — update target's sequence (+ name/duration if provided).
+            const targetUpdate: { name?: string; sequence?: number; duration?: number } = {}
             if (name !== undefined) targetUpdate.name = name
+            if (duration !== undefined) targetUpdate.duration = duration
             targetUpdate.sequence = sequence
             await activityRepository.updateInTransaction(
               tx, programmeId, activityId, targetUpdate,
             )
           }
-        } else if (name !== undefined) {
-          // Only name update (no sequence change).
-          await activityRepository.updateInTransaction(
-            tx, programmeId, activityId, { name },
-          )
+        } else {
+          // No sequence change — update name and/or duration only.
+          const targetUpdate: { name?: string; duration?: number } = {}
+          if (name !== undefined) targetUpdate.name = name
+          if (duration !== undefined) targetUpdate.duration = duration
+          if (Object.keys(targetUpdate).length > 0) {
+            await activityRepository.updateInTransaction(
+              tx, programmeId, activityId, targetUpdate,
+            )
+          }
         }
       })
     } catch (e) {
