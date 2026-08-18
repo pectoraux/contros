@@ -40,6 +40,7 @@ model Organization {
   productivityObservations ProductivityObservation[]
   boqImports     BoqImport[]
   programmes     Programme[]
+  planArtifacts  PlanArtifact[]
 }
 
 model User {
@@ -124,6 +125,7 @@ model Opportunity {
   subcontractPackages SubcontractPackage[]
   bid                Bid?
   documents          Document[]
+  planArtifacts      PlanArtifact[]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -391,6 +393,14 @@ model EstimateLine {
   unsourcedRationale    String?
   unsourcedConfidence   Float?
   acknowledged          Boolean  @default(false)
+  // PLAN LINKAGE: optional mutable current lineage to a PlanMeasurement.
+  // This is NOT ownership — it's a "current measurement reference" pointer.
+  // One PlanMeasurement can support multiple EstimateLines (e.g. slab area →
+  // concrete + formwork + reinforcement). The measurement is evidence; the
+  // EstimateLine is the canonical commercial hub. This pointer is mutable:
+  // rebinding to a new measurement does not affect the old measurement
+  // (which is immutable evidence).
+  currentMeasurementId  String?
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 
@@ -404,6 +414,7 @@ model EstimateLine {
   actuals               ProjectActual[]
   boqBindings           BoqBinding[]
   programmeActivities   Activity[]
+  currentMeasurement    PlanMeasurement?      @relation("EstimateLineCurrentMeasurement", fields: [currentMeasurementId], references: [id])
 }
 
 // P0-5 fix: hybrid execution needs explicit allocation, never a 50% heuristic.
@@ -969,4 +980,104 @@ model ActivityDependency {
   @@index([programmeId])
   @@index([predecessorActivityId])
   @@index([successorActivityId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plan Domain — drawing artifacts, sheets, revisions, and measurements.
+//
+// ARCHITECTURE:
+//   PlanArtifact (uploaded source: PDF, DWG, IFC)
+//       ↓ 1:N
+//   PlanSheet (logical sheet: A-101, S-001)
+//       ↓ 1:N (append-only, immutable revisions)
+//   PlanSheetRevision (immutable revision: Rev C)
+//       ↓ 1:N (append-only observations)
+//   PlanMeasurement (measured fact — evidence, content-addressed)
+//       ↓ [EstimateLine.currentMeasurementId — mutable current lineage]
+//
+// FOUR REFINEMENTS:
+// 1. PlanMeasurement is EVIDENCE, not EstimateLine-owned truth.
+// 2. PlanSheetRevision is immutable — no status field ("current" is derived).
+// 3. File identity (PlanArtifact) is separate from drawing identity (PlanSheet).
+// 4. PlanMeasurement carries measurementBasisJson (provenance payload).
+//
+// The domain is format-neutral. Adapters (PDF, DWG, IFC, BIM, AI, Manual)
+// all produce the same PlanMeasurement domain object.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PlanArtifact {
+  id              String   @id @default(cuid())
+  organizationId  String
+  opportunityId   String
+  fileReference   String   // storage path / key for the uploaded file
+  fileName        String   // original file name
+  fileHash        String   // SHA-256 of file contents — content identity + duplicate detection
+  source          String   @default("client") // client | consultant | tender-portal | internal | other
+  documentId      String?  // optional link to Document (if tracked as a document)
+  createdAt       DateTime @default(now())
+  createdById     String
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  opportunity     Opportunity  @relation(fields: [opportunityId], references: [id])
+  sheets          PlanSheet[]
+
+  @@index([organizationId])
+  @@index([opportunityId])
+  @@index([organizationId, fileHash])
+}
+
+model PlanSheet {
+  id              String   @id @default(cuid())
+  planArtifactId  String
+  sheetNumber     String   // e.g. "A-101", "S-001"
+  drawingNumber   String?  // contractor's external drawing number (may be shared across artifacts)
+  title           String?  // human-readable title (e.g. "Ground Floor Plan")
+  createdAt       DateTime @default(now())
+
+  planArtifact    PlanArtifact       @relation(fields: [planArtifactId], references: [id])
+  revisions       PlanSheetRevision[]
+
+  @@unique([planArtifactId, sheetNumber])
+  @@index([planArtifactId])
+}
+
+model PlanSheetRevision {
+  id              String   @id @default(cuid())
+  planSheetId     String
+  revision        String   // e.g. "Rev C", "Rev 3", "2024-08-15"
+  fileReference   String?  // optional: specific file/page for this sheet revision
+  fileHash        String?  // optional: SHA-256 of the sheet revision content
+  createdAt       DateTime @default(now())
+  createdById     String
+
+  planSheet       PlanSheet          @relation(fields: [planSheetId], references: [id])
+  measurements    PlanMeasurement[]
+
+  // NO status field — "current" is a DERIVED selection (latest revision for a
+  // PlanSheet), not a mutable status. This keeps historical reconstruction
+  // deterministic. Each revision is immutable once created.
+
+  @@unique([planSheetId, revision])
+  @@index([planSheetId])
+}
+
+model PlanMeasurement {
+  id                       String   @id @default(cuid())
+  planSheetRevisionId      String
+  elementReference         String?  // e.g. "wall-grid-B7", "room-101-floor"
+  measurementMethod        String   // manual | pdf-takeoff | cad-extraction | bim-export | ai-extraction
+  quantity                 Float    // measured quantity (finite, >= 0)
+  unit                     String   // m2 | m3 | m | nr | ton | etc.
+  measurementBasisJson     String   @default("{}") // provenance payload: HOW the quantity was obtained
+  measurementEngineVersion Int      @default(1) // measurement algorithm version
+  contentHash              String   // SHA-256 of normalized content projection
+  measuredById             String
+  measuredAt               DateTime @default(now())
+  createdAt                DateTime @default(now())
+
+  planSheetRevision        PlanSheetRevision @relation(fields: [planSheetRevisionId], references: [id])
+  estimateLines            EstimateLine[]    @relation("EstimateLineCurrentMeasurement")
+
+  @@index([planSheetRevisionId])
+  @@index([contentHash])
 }

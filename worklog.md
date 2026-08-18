@@ -6652,3 +6652,108 @@ READY FOR SCHEMA MIGRATION:
   PlanArtifact → PlanSheet → PlanSheetRevision → PlanMeasurement
   with EstimateLine.currentMeasurementId as optional mutable lineage
   (not required ownership).
+
+---
+Task ID: plan-persistence-milestone
+Agent: principal-engineer
+Task: First persistence milestone — prove the Plan domain evidence chain against PostgreSQL. Schema migration (4 models + EstimateLine.currentMeasurementId), tenant-scoped repository, application service (validate + content-hash + persist + link), 6 API routes, 14 integration tests, HTTP verification. No frozen code touched.
+
+SCHEMA (prisma/schema.prisma):
+- Added 4 models: PlanArtifact, PlanSheet, PlanSheetRevision, PlanMeasurement.
+- Added EstimateLine.currentMeasurementId (optional FK — mutable current
+  lineage, NOT ownership).
+- PlanSheetRevision has NO status field — "current" is derived (latest revision),
+  not mutable (refinement 2).
+- @@unique([planArtifactId, sheetNumber]) for sheets.
+- @@unique([planSheetId, revision]) for revisions.
+- All models are tenant-scoped via PlanArtifact.organizationId.
+- Applied via db:push.
+
+REPOSITORY (src/repositories/plan-repositories.ts):
+- planArtifactRepository: create, getForOrganization, listForOpportunity.
+- planSheetRepository: create (verifies artifact org), getForOrganization.
+- planSheetRevisionRepository: create (verifies sheet org), getForOrganization.
+- planMeasurementRepository: create (verifies revision org), getForOrganization
+  (with full provenance chain: revision → sheet → artifact + estimateLines).
+- All methods are tenant-scoped — cross-tenant access is impossible.
+
+SERVICE (src/application/plan-service.ts):
+- createArtifact: verifies opportunity org, creates artifact.
+- createSheet: validates sheetNumber non-empty, creates sheet.
+- createRevision: validates revision non-empty, creates immutable revision.
+- createMeasurement: validates (validatePlanMeasurement), computes content hash
+  (computeMeasurementContentHash — normalized basis), persists. The content hash
+  is NEVER caller-supplied — the service always computes it.
+- linkToEstimateLine: verifies both EstimateLine + PlanMeasurement belong to
+  this org, sets EstimateLine.currentMeasurementId (mutable pointer).
+- getProvenanceChain: returns measurement → revision → sheet → artifact +
+  the EstimateLines that currently reference it.
+- VALIDATION CONTRACT: validatePlanMeasurement() must pass before the hash is
+  treated as authoritative. The pure hash function is NOT a validation function.
+
+API ROUTES (6 thin routes):
+- POST /api/plan/artifacts — register uploaded drawing file
+- POST /api/plan/artifacts/:artifactId/sheets — create logical sheet
+- POST /api/plan/sheets/:sheetId/revisions — create immutable revision
+- POST /api/plan/revisions/:revisionId/measurements — create manual measurement
+- GET  /api/plan/measurements/:measurementId — retrieve provenance chain
+- POST /api/plan/measurements/:measurementId/link — link to EstimateLine
+
+INTEGRATION TESTS (tests/integration/plan-provenance-chain.test.ts — 14 tests):
+1. Create PlanArtifact → registered.
+2. Create PlanSheet → registered.
+3. Create PlanSheetRevision → immutable.
+4. Create PlanMeasurement → validated + content-hashed.
+5. Content hash is deterministic (same input → same hash).
+6. Link measurement to EstimateLine → current lineage set.
+7. One measurement supports multiple EstimateLines (slab area → concrete +
+   formwork).
+8. Retrieve provenance chain → measurement → revision → sheet → artifact +
+   both EstimateLines.
+9. Cross-tenant: Org B cannot read Org A measurement → 404.
+10. Cross-tenant: Org B cannot create artifact on Org A opportunity → 404.
+11. NaN quantity → 422.
+12. Negative quantity → 422.
+13. Invalid measurement method → 422.
+14. Rebinding EstimateLine to a new measurement → old measurement unchanged
+    (immutable evidence).
+
+HTTP VERIFICATION (authenticated curl, full chain):
+- POST /api/plan/artifacts → 200 (artifact created). ✅
+- POST .../artifacts/{id}/sheets → 200 (sheet A-101 created). ✅
+- POST .../sheets/{id}/revisions → 200 (Rev C created). ✅
+- POST .../revisions/{id}/measurements → 200 (measurement: 184.6 m2, manual,
+  content hash computed). ✅
+- GET .../measurements/{id} → 200 (full provenance chain:
+  measurement → Rev C → A-101 Ground Floor Plan → test-drawing.pdf). ✅
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 328 pass / 0 fail (0 regressions)
+- Plan provenance (Neon) .............. 14 pass / 0 fail / 48 expect()
+- HTTP: full chain → 200 ............... ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE EVIDENCE CHAIN IS NOW PROVEN END-TO-END:
+  authenticated tenant
+  → upload/register PlanArtifact
+  → create PlanSheet + immutable revision
+  → create manual PlanMeasurement
+  → validate + content-hash it
+  → link it to an EstimateLine
+  → retrieve the complete provenance chain
+
+  drawing file
+     ↓
+  sheet revision
+     ↓
+  measured fact
+     ↓
+  measurement provenance
+     ↓
+  explicit EstimateLine linkage
+
+NO CAD parser, IFC engine, PDF takeoff, AI extraction, or plan UI was added.
+The domain boundary is proven against PostgreSQL. The next step is the manual
+measurement UI, then format-specific adapters around the stable PlanMeasurement
+protocol.

@@ -1367,3 +1367,11 @@ export {
   activityRepository,
   activityDependencyRepository,
 } from './programme-repositories'
+
+// Plan domain — drawing artifacts, sheets, revisions, measurements.
+export {
+  planArtifactRepository,
+  planSheetRepository,
+  planSheetRevisionRepository,
+  planMeasurementRepository,
+} from './plan-repositories'
