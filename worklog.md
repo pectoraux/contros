@@ -4865,3 +4865,115 @@ THE FIRST GENUINE PROJECT-LIKE INTERACTION:
   User edits duration → save → engine recalculates → Gantt updates
   The user edits workspace inputs; the scheduling engine derives schedule outputs.
   PATCH duration ≠ PATCH startDate (computed CPM dates are never directly editable).
+
+---
+Task ID: programme-duration-editing-ui
+Agent: principal-engineer
+Task: UI duration editing — the first controlled schedule mutation wired through the browser. ProgrammeGantt gains an editable duration cell (workspace mode only); ProgrammeTab PATCHes the server and replaces the ScheduleResult. No optimistic client-side CPM. Revision mode is visibly read-only. Browser end-to-end verification provides the HTTP smoke coverage noted as missing in the prior commit. No frozen code touched.
+
+PROGRAMME GANTT (src/components/views/programme/ProgrammeGantt.tsx):
+- Added a DurationCell sub-component — the ONLY editable cell in the Gantt.
+- Workspace mode (editable=true): renders an <input type="number"> bound to a
+  local state for responsive typing. On blur/Enter, commits via
+  onCommitDuration(activityId, duration). On Escape, reverts. While saving,
+  the input is disabled and a Loader2 spinner appears.
+- Revision mode (editable=false): renders plain text with a Lock icon in the
+  provenance header ("Revision N — finalized (historical truth, read-only)").
+  A finalized revision is visibly read-only — no control can mutate it.
+- Start / finish / float / critical-path cells are ALWAYS read-only text.
+  They are CPM-derived outputs, never directly editable. The non-critical
+  bar color changed from blue to emerald (blue is reserved per house style).
+- Local input state resyncs via useEffect when the committed (engine)
+  duration changes — this happens after a successful PATCH replaces the
+  ScheduleResult. If the PATCH fails, the local input reverts to the
+  committed value (the parent does not update the schedule).
+- Added an edit-mode hint below the table.
+
+PROGRAMME TAB (src/components/views/opportunity-tabs/ProgrammeTab.tsx):
+- Stores programmeId in state (from the /api/programmes/list response).
+- handleCommitDuration(activityId, duration):
+    1. setSavingActivityId(activityId)  → per-row spinner
+    2. PATCH /api/programmes/:programmeId/activities/:activityId { duration }
+    3. On 200: setSchedule(prev => replace schedule + programmeName)
+       — the ENTIRE ScheduleResult is replaced; derived cells update from
+         the server, never from local calculation
+    4. On error: toast.error(serverMessage); return false → cell reverts
+    5. finally: setSavingActivityId(null)
+- editable={schedule.mode === 'workspace'} — revision views pass no
+  onCommitDuration, so the DurationCell renders as read-only text.
+- NO optimistic client-side CPM. The UI does not touch start, finish,
+  float, or critical-path values — those are replaced wholesale when the
+  server returns the recomputed ScheduleResult.
+
+BROWSER END-TO-END VERIFICATION (Agent Browser, authenticated):
+This is the HTTP smoke coverage the prior commit lacked — the real PATCH
+route is now exercised through authenticated HTTP, not just the service.
+
+Demo: kwesi@adomconstruction.gh (Director) → Office Complex — Zenith
+Properties → Programme tab. Programme "Office Complex Programme" (3
+activities, 2 FS dependencies, 0 lag, workspace mode).
+
+Initial state (engine-computed):
+  Duration: 33 days | Critical path: 3 activities
+  Site Clearing:  dur=3  ES=0  EF=3   CRITICAL
+  Foundation:     dur=10 ES=3  EF=13  CRITICAL
+  Structure:      dur=20 ES=13 EF=33  CRITICAL
+
+Edit 1 — Site Clearing 3 → 6 (press Enter):
+  PATCH /api/programmes/.../activities/...  → 200
+  Duration: 36 days | Site Clearing EF=6 | Foundation ES=6 EF=16
+  | Structure ES=16 EF=36
+  The +3 days cascaded through the FS chain deterministically. The browser
+  sent only the duration; the engine recomputed every derived value.
+
+Edit 2 — Foundation 10 → 15 (press Enter):
+  PATCH ... → 200
+  Duration: 41 days | Foundation EF=21 | Structure ES=21 EF=41
+  The +5 days cascaded to Structure (the sole successor).
+
+Edit 3 — Site Clearing 6 → -5 (invalid):
+  PATCH ... → 422 (Duration must be >= 0)
+  Input reverted to 6. Schedule unchanged. Toast error displayed.
+
+Reset — Site Clearing 6→3, Foundation 15→10:
+  PATCH ... → 200 (×2). Demo restored to 33 days, 3/10/20.
+
+Responsiveness & layout:
+  Mobile (390×844): Gantt table scrolls horizontally (overflow-x-auto);
+  tabs scroll; footer present.
+  Desktop (1440×900): full table + timeline visible.
+  Sticky footer: root layout is `flex min-h-screen flex-col` with `flex-1`
+  on the content wrapper — footer sticks when content is short, pushes
+  down when content is long. (Pre-existing layout; my changes do not
+  touch it.)
+
+Console: no errors from the Programme components. (Only pre-existing
+DialogContent a11y warnings from the mobile sidebar dialog.)
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Dev server .......................... RUNNING (no compile errors)
+- Browser: duration edit → 200 → schedule updates .. ✅
+- Browser: invalid duration → 422 → revert .......... ✅
+- Browser: two sequential edits cascade correctly ... ✅
+- Browser: mobile responsive + horizontal scroll .... ✅
+- Browser: revision mode would be read-only (code) .. ✅ (editable=false)
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE FIRST GENUINE PROJECT-LIKE INTERACTION IS NOW END-TO-END LIVE:
+  User edits duration → Enter → PATCH → engine recalculates → Gantt updates
+  The browser sends workspace INPUTS; the scheduling engine derives OUTPUTS.
+  No optimistic CPM. No local mutation of start/finish/float/critical.
+  A finalized ProgrammeRevision is visibly read-only (controls disabled).
+
+HTTP SMOKE GAP CLOSED:
+  Service → PostgreSQL ................ ✅ (8 integration tests, prior commit)
+  PATCH → authenticated HTTP → PostgreSQL .. ✅ (this commit, browser-verified)
+  The route is no longer "verified by implementation only" — it has been
+  exercised through real authenticated HTTP requests with verified 200/422
+  responses and confirmed schedule recomputation.
+
+NEXT (per review): dependency editing — add dependency
+  (predecessorActivityId, successorActivityId, type: FS|SS|FF|SF, lag).
+  The UI edits only those inputs; replaySchedule() continues to derive
+  dates, float, and critical path.

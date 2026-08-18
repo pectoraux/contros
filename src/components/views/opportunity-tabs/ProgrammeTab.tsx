@@ -1,12 +1,11 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
-import { Button } from '@/components/ui/button'
 import type { OpportunityDetail } from '@/lib/api'
 import { ProgrammeGantt } from '@/components/views/programme/ProgrammeGantt'
 import type { ScheduleResult } from '@/lib/engines/schedule-engine'
-import { CalendarRange, Download, Info, Loader2 } from 'lucide-react'
+import { Info, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 interface ScheduleResponse {
@@ -20,10 +19,19 @@ interface ScheduleResponse {
   schedule: ScheduleResult
 }
 
+interface PatchResponse {
+  ok?: true
+  schedule?: ScheduleResult
+  programmeName?: string
+  error?: string
+}
+
 export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
+  const [programmeId, setProgrammeId] = useState<string | null>(null)
   const [schedule, setSchedule] = useState<ScheduleResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [savingActivityId, setSavingActivityId] = useState<string | null>(null)
 
   useEffect(() => {
     // Try to fetch the programme schedule from the API.
@@ -33,14 +41,13 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
       setError(null)
       try {
         // First, find a programme for this opportunity.
-        // For now, we try the schedule endpoint directly — if no programme
-        // exists, it returns 404 and we show the empty state.
         const res = await fetch(`/api/programmes/list?opportunityId=${opp.id}`)
         if (res.ok) {
           const programmes = await res.json()
           if (programmes.length > 0) {
-            const progId = programmes[0].id
-            const schedRes = await fetch(`/api/programmes/${progId}/schedule`)
+            const prog = programmes[0]
+            setProgrammeId(prog.id)
+            const schedRes = await fetch(`/api/programmes/${prog.id}/schedule`)
             if (schedRes.ok) {
               const data = await schedRes.json()
               setSchedule(data)
@@ -51,9 +58,11 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
             }
           } else {
             setSchedule(null)
+            setProgrammeId(null)
           }
         } else {
           setSchedule(null)
+          setProgrammeId(null)
         }
       } catch {
         setError('Failed to load programme.')
@@ -63,6 +72,66 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
     }
     fetchSchedule()
   }, [opp.id])
+
+  /**
+   * Commit a duration edit. The flow is:
+   *
+   *   duration input
+   *       ↓
+   *   PATCH /api/programmes/:programmeId/activities/:activityId
+   *       ↓
+   *   updated ScheduleResult
+   *       ↓
+   *   replace Gantt state
+   *
+   * NO optimistic client-side CPM. The UI does not touch start, finish,
+   * float, or critical-path values — those are replaced wholesale when
+   * the server returns the recomputed ScheduleResult.
+   *
+   * Returns true on success (the Gantt cell keeps its value), false on
+   * failure (the Gantt cell reverts to the committed value).
+   */
+  const handleCommitDuration = useCallback(
+    async (activityId: string, duration: number): Promise<boolean> => {
+      if (!programmeId) return false
+      setSavingActivityId(activityId)
+      try {
+        const res = await fetch(
+          `/api/programmes/${programmeId}/activities/${activityId}`,
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ duration }),
+          },
+        )
+        const data: PatchResponse = await res.json().catch(() => ({}))
+        if (res.ok && data.ok && data.schedule) {
+          // Replace the entire schedule state with the engine's recomputed
+          // result. Derived cells (start/finish/float/critical) update from
+          // the server, never from local calculation.
+          setSchedule((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  schedule: data.schedule!,
+                  programmeName: data.programmeName ?? prev.programmeName,
+                }
+              : prev,
+          )
+          return true
+        }
+        // Failure: show the server's error, revert the cell.
+        toast.error(data.error ?? 'Could not update duration.')
+        return false
+      } catch {
+        toast.error('Network error while updating duration.')
+        return false
+      } finally {
+        setSavingActivityId(null)
+      }
+    },
+    [programmeId],
+  )
 
   if (loading) {
     return (
@@ -100,14 +169,27 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
     )
   }
 
+  const isWorkspace = schedule.mode === 'workspace'
+
   return (
     <div className="space-y-4">
       <Card className="bg-muted/30">
         <CardContent className="py-3 flex items-start gap-3">
           <Info className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
           <div className="text-xs text-muted-foreground">
-            Schedule computed by the deterministic CPM engine (replaySchedule). The browser renders
-            schedule truth; it does not create schedule truth. Critical-path activities are highlighted in red.
+            {isWorkspace ? (
+              <>
+                Schedule computed by the deterministic CPM engine (replaySchedule). Edit a
+                duration to recompute start, finish, float and the critical path — the engine
+                derives those outputs, the browser never edits them directly.
+              </>
+            ) : (
+              <>
+                This is a finalized ProgrammeRevision — a historical snapshot. It is read-only:
+                durations, dependencies and all derived values are frozen. Edit the current
+                workspace to produce a new revision.
+              </>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -118,6 +200,10 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
         programmeName={schedule.programmeName}
         revisionNo={schedule.revisionNo}
         snapshotContentHash={schedule.snapshotContentHash}
+        editable={isWorkspace}
+        programmeId={programmeId ?? undefined}
+        onCommitDuration={isWorkspace ? handleCommitDuration : undefined}
+        savingActivityId={savingActivityId}
       />
     </div>
   )
