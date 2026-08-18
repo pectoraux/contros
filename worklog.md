@@ -4823,3 +4823,45 @@ VERIFICATION:
 THE BROWSER RENDERS SCHEDULE TRUTH; IT DOES NOT CREATE SCHEDULE TRUTH.
   Programme → getProgrammeSchedule → replaySchedule() → ScheduleResult → Gantt
   No client-side CPM. No drag/drop. No date editing. No persistence.
+
+---
+Task ID: programme-activity-duration-editing
+Agent: principal-engineer
+Task: V1 (tenant isolation for list route — covered by existing service-level scoping, documented). V2-V4: Activity duration editing — the first controlled schedule mutation. Service + API route + 8 PostgreSQL integration tests. No frozen code touched.
+
+V2 — ProgrammeService.updateActivityDuration().
+- Input: { ctx, programmeId, activityId, duration }
+- Validates: duration is finite + >= 0 (before touching DB).
+- Verifies: programme exists (tenant-scoped), activity belongs to programme.
+- Updates via activityRepository.update() (which takes the Programme-row lock).
+- Returns the updated ScheduleResult (replays the workspace after the edit).
+- The user edits workspace INPUTS (duration); the engine derives OUTPUTS.
+
+V3 — PATCH /api/programmes/:programmeId/activities/:activityId
+- Body: { duration: number }
+- Thin route: requireAuth → parse → updateActivityDuration → JSON.
+- 200 → { ok, schedule, programmeName }
+- 404 → programme/activity not found / wrong tenant
+- 422 → invalid duration
+
+V4 — 8 PostgreSQL integration tests (all passing):
+1. Duration edit → schedule changes deterministically (5→8: 15→18 days).
+2. Finalized ProgrammeRevision unchanged after edit (historical truth).
+3. Cross-tenant: Org B cannot edit Org A activity → 404.
+4. Cross-programme: Act B (Programme B) via Programme A → 404.
+5. NaN duration → 422.
+6. Infinity duration → 422.
+7. Negative duration → 422.
+8. Concurrent edit + finalization → both succeed, revision is internally
+   consistent (Programme-row serialization holds).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Activity edit integration (Neon) .... 8 pass / 0 fail / 27 expect()
+- Frozen Phase 1 code ................. UNTOUCHED
+
+THE FIRST GENUINE PROJECT-LIKE INTERACTION:
+  User edits duration → save → engine recalculates → Gantt updates
+  The user edits workspace inputs; the scheduling engine derives schedule outputs.
+  PATCH duration ≠ PATCH startDate (computed CPM dates are never directly editable).

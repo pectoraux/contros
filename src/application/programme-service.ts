@@ -399,4 +399,85 @@ export const programmeService = {
       programmeName: programme.name,
     }
   },
+
+  /**
+   * V2: Update an activity's duration — the first controlled schedule mutation.
+   *
+   * The user edits workspace INPUTS (duration); the scheduling engine derives
+   * schedule OUTPUTS (start, finish, float, critical path). The UI never
+   * edits computed CPM dates directly.
+   *
+   * Flow:
+   *   RequestContext → tenant + programme validation → Programme-row lock
+   *   → update Activity.duration → return updated workspace schedule
+   *
+   * The Programme-row lock (via activityRepository.update) serializes against
+   * concurrent finalization — a finalization running in parallel sees either
+   * the pre-edit or post-edit duration, never a mixed state.
+   *
+   * Validation:
+   *   - duration must be finite (Number.isFinite)
+   *   - duration must be >= 0
+   *   - The activity must belong to the requested programme (same org)
+   *
+   * Returns the updated ScheduleResult so the UI can re-render immediately.
+   */
+  async updateActivityDuration(
+    input: {
+      ctx: RequestContext
+      programmeId: string
+      activityId: string
+      duration: number
+    },
+  ): Promise<
+    | {
+        ok: true
+        schedule: ScheduleResult
+        programmeName: string
+      }
+    | Err
+  > {
+    const { ctx, programmeId, activityId, duration } = input
+
+    // Validate the duration BEFORE touching the database.
+    if (!Number.isFinite(duration)) {
+      return { ok: false, error: 'Duration must be a finite number', status: 422 }
+    }
+    if (duration < 0) {
+      return { ok: false, error: 'Duration must be >= 0', status: 422 }
+    }
+
+    // Verify the programme exists (tenant-scoped).
+    const programme = await programmeRepository.getForOrganization(
+      ctx.organizationId,
+      programmeId,
+    )
+    if (!programme) {
+      return { ok: false, error: 'Programme not found in this organization', status: 404 }
+    }
+
+    // Verify the activity belongs to this programme.
+    const activity = programme.activities.find((a) => a.id === activityId)
+    if (!activity) {
+      return { ok: false, error: 'Activity not found in this programme', status: 404 }
+    }
+
+    // Update the activity (activityRepository.update takes the Programme-row lock).
+    await activityRepository.update(ctx.organizationId, activityId, { duration })
+
+    // Re-fetch the schedule to return the updated CPM result.
+    const scheduleResult = await this.getProgrammeSchedule({
+      ctx,
+      programmeId,
+    })
+    if (!scheduleResult.ok) {
+      return scheduleResult
+    }
+
+    return {
+      ok: true,
+      schedule: scheduleResult.schedule,
+      programmeName: scheduleResult.programmeName,
+    }
+  },
 }
