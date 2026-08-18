@@ -6843,3 +6843,82 @@ THE EVIDENCE CHAIN IS NOW BOUNDARY-SAFE:
 
 A plan measurement from one project can NEVER become current lineage for a
 different project's commercial line. The evidence chain is trustworthy.
+
+---
+Task ID: manual-plan-measurement-ui
+Agent: principal-engineer
+Task: Manual plan measurement UI — the first real plans → measurement → BOQ/estimate workflow. Deliberately narrow: typed numeric/manual measurement inputs, no CAD canvas, no PDF geometry extraction, no AI takeoff. Five-step wizard proving the domain interaction end-to-end through the browser. No frozen code touched.
+
+UI (src/components/views/opportunity-tabs/PlanTab.tsx):
+A 5-step workflow within the opportunity workspace's "Plans" tab:
+
+1. Register Drawing Artifact
+   - File Name, File Hash (SHA-256), Source (client|consultant|tender-portal|internal|other)
+   - POST /api/plan/artifacts → creates PlanArtifact
+
+2. Create Sheet
+   - Select artifact, enter sheet number (A-101), optional title
+   - POST /api/plan/artifacts/:id/sheets → creates PlanSheet
+
+3. Create Sheet Revision (Immutable)
+   - Select sheet, enter revision (Rev C)
+   - POST /api/plan/sheets/:id/revisions → creates immutable PlanSheetRevision
+
+4. Create Manual Measurement (Immutable Evidence)
+   - Select revision, element reference (optional), method (manual|pdf-takeoff|...),
+     quantity (number), unit (m2), basis JSON (provenance payload)
+   - POST /api/plan/revisions/:id/measurements → validates + content-hashes + persists
+
+5. Link Measurement to EstimateLine
+   - Select measurement + EstimateLine from the same opportunity
+   - POST /api/plan/measurements/:id/link → transactional same-opportunity enforcement
+   - Shows the mutable current lineage vs immutable evidence distinction
+
+Measurement List with Provenance:
+- Lists all measurements with their provenance chain (artifact / sheet / revision)
+- Shows content hash (first 24 chars)
+- Shows linked EstimateLines (if any) in emerald — visually distinguishing
+  "measurement evidence" (immutable) from "current EstimateLine linkage" (mutable)
+
+UX RULE:
+  Measurement evidence = immutable (content-addressed, never edited)
+  Current EstimateLine linkage = mutable (rebindable, doesn't affect old measurement)
+  The UI visually distinguishes these — rebinding never implies the measurement changed.
+
+TAB REGISTRATION:
+- Added 'plans' to OpportunityTab type in src/store/workspace.ts
+- Added PlanTab import + tab entry (Ruler icon) in OpportunityDetail.tsx
+- Positioned between Programme and Method Statement
+
+API ROUTE:
+- Added GET /api/plan/artifacts?opportunityId=... → lists artifacts for the opportunity
+  (tenant-scoped via planArtifactRepository.listForOpportunity)
+
+BROWSER VERIFICATION (Agent Browser, authenticated):
+- Login as Director Kwesi → Opportunities → Office Complex → Plans tab
+- Tab rendered correctly:
+  - Info banner: "Upload drawing artifacts, identify sheets and revisions, create
+    manual measurements (immutable evidence), and link them to EstimateLines
+    (mutable current lineage). Measurements are content-addressed."
+  - "1. Register Drawing Artifact" heading with File Name, File Hash, Source inputs
+  - GET /api/plan/artifacts?opportunityId=opp-office → 200 ✅
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 328 pass / 0 fail (0 regressions)
+- Browser: Plans tab renders ........... ✅
+- Browser: artifact list API → 200 ..... ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE FIRST REAL PLANS → MEASUREMENT → ESTIMATE WORKFLOW IS LIVE:
+  Upload/register drawing
+  → select sheet/revision
+  → manual measurement (typed numeric inputs)
+  → provenance/basis
+  → bind to EstimateLine
+  → show measurement lineage
+
+No CAD canvas. No PDF geometry extraction. No AI takeoff. The domain interaction
+is proven through the browser. The next stepping stone is a 2D plan viewer/
+annotation layer whose output is still PlanMeasurement — the right path toward
+AutoCAD/Archicad interoperability rather than cloning those applications.

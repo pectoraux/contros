@@ -16,6 +16,7 @@ export type OpportunityTab =
   | 'boq'
   | 'subcontractors'
   | 'programme'
+  | 'plans'
   | 'method-statement'
   | 'jha'
   | 'tender-pack'

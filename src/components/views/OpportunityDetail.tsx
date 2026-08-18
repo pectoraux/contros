@@ -16,6 +16,7 @@ import {
   Sheet,
   GitCompareArrows,
   CalendarRange,
+  Ruler,
   FileText,
   ShieldAlert,
   PackageCheck,
@@ -31,6 +32,7 @@ import { EstimateTab } from './opportunity-tabs/EstimateTab'
 import { BoqTab } from './opportunity-tabs/BoqTab'
 import { SubcontractorsTab } from './opportunity-tabs/SubcontractorsTab'
 import { ProgrammeTab } from './opportunity-tabs/ProgrammeTab'
+import { PlanTab } from './opportunity-tabs/PlanTab'
 import { MethodStatementTab } from './opportunity-tabs/MethodStatementTab'
 import { JhaTab } from './opportunity-tabs/JhaTab'
 import { TenderPackTab } from './opportunity-tabs/TenderPackTab'
@@ -43,6 +45,7 @@ const TABS: { id: OpportunityTab; label: string; icon: typeof LayoutDashboard }[
   { id: 'boq', label: 'BOQ', icon: Sheet },
   { id: 'subcontractors', label: 'Subcontractors', icon: GitCompareArrows },
   { id: 'programme', label: 'Programme', icon: CalendarRange },
+  { id: 'plans', label: 'Plans', icon: Ruler },
   { id: 'method-statement', label: 'Method Statement', icon: FileText },
   { id: 'jha', label: 'JHA', icon: ShieldAlert },
   { id: 'tender-pack', label: 'Tender Pack', icon: PackageCheck },
@@ -257,6 +260,9 @@ export function OpportunityDetail() {
         </TabsContent>
         <TabsContent value="programme" className="mt-4 focus-visible:outline-none">
           <ProgrammeTab opp={opp} />
+        </TabsContent>
+        <TabsContent value="plans" className="mt-4 focus-visible:outline-none">
+          <PlanTab opp={opp} />
         </TabsContent>
         <TabsContent value="method-statement" className="mt-4 focus-visible:outline-none">
           <MethodStatementTab opp={opp} />
