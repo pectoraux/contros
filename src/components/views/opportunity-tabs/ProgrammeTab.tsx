@@ -5,6 +5,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import type { OpportunityDetail } from '@/lib/api'
 import { ProgrammeGantt } from '@/components/views/programme/ProgrammeGantt'
 import type { ScheduleResult } from '@/lib/engines/schedule-engine'
+import type { DependencyType } from '@/lib/programme'
 import { Info, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -26,12 +27,20 @@ interface PatchResponse {
   error?: string
 }
 
+interface DependencyResponse {
+  ok?: true
+  schedule?: ScheduleResult
+  programmeName?: string
+  error?: string
+}
+
 export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
   const [programmeId, setProgrammeId] = useState<string | null>(null)
   const [schedule, setSchedule] = useState<ScheduleResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [savingActivityId, setSavingActivityId] = useState<string | null>(null)
+  const [savingDependency, setSavingDependency] = useState(false)
 
   useEffect(() => {
     // Try to fetch the programme schedule from the API.
@@ -133,6 +142,72 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
     [programmeId],
   )
 
+  /**
+   * Commit a new dependency edge. The flow is:
+   *
+   *   predecessor + successor + type + lag
+   *       ↓
+   *   POST /api/programmes/:programmeId/dependencies
+   *       ↓
+   *   updated ScheduleResult
+   *       ↓
+   *   replace Gantt state
+   *
+   * NO optimistic client-side CPM. The UI sends only the edge inputs; the
+   * server validates (same-tenant, same-programme, activities exist, no
+   * self-reference, finite lag, no cycle) inside the Programme-row lock and
+   * returns the engine's recomputed ScheduleResult.
+   *
+   * Returns true on success (the form resets), false on failure (the form
+   * keeps its values so the user can adjust and retry).
+   */
+  const handleAddDependency = useCallback(
+    async (input: {
+      predecessorActivityId: string
+      successorActivityId: string
+      type: DependencyType
+      lag: number
+    }): Promise<boolean> => {
+      if (!programmeId) return false
+      setSavingDependency(true)
+      try {
+        const res = await fetch(
+          `/api/programmes/${programmeId}/dependencies`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(input),
+          },
+        )
+        const data: DependencyResponse = await res.json().catch(() => ({}))
+        if (res.ok && data.ok && data.schedule) {
+          // Replace the entire schedule state with the engine's recomputed
+          // result. The new edge may shift start/finish/float/critical-path
+          // values across the whole graph — all derived from the server.
+          setSchedule((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  schedule: data.schedule!,
+                  programmeName: data.programmeName ?? prev.programmeName,
+                }
+              : prev,
+          )
+          return true
+        }
+        // Failure: show the server's error (e.g. cycle, self-reference).
+        toast.error(data.error ?? 'Could not add dependency.')
+        return false
+      } catch {
+        toast.error('Network error while adding dependency.')
+        return false
+      } finally {
+        setSavingDependency(false)
+      }
+    },
+    [programmeId],
+  )
+
   if (loading) {
     return (
       <Card>
@@ -204,6 +279,8 @@ export function ProgrammeTab({ opp }: { opp: OpportunityDetail }) {
         programmeId={programmeId ?? undefined}
         onCommitDuration={isWorkspace ? handleCommitDuration : undefined}
         savingActivityId={savingActivityId}
+        onAddDependency={isWorkspace ? handleAddDependency : undefined}
+        savingDependency={savingDependency}
       />
     </div>
   )

@@ -39,6 +39,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { Loader2, Lock } from 'lucide-react'
 import type { ScheduleResult, ScheduledActivity } from '@/lib/engines/schedule-engine'
+import type { DependencyType } from '@/lib/programme'
+import { AddDependencyForm } from './AddDependencyForm'
 
 interface ProgrammeGanttProps {
   schedule: ScheduleResult
@@ -50,6 +52,13 @@ interface ProgrammeGanttProps {
   programmeId?: string
   onCommitDuration?: (activityId: string, duration: number) => Promise<boolean>
   savingActivityId?: string | null
+  onAddDependency?: (input: {
+    predecessorActivityId: string
+    successorActivityId: string
+    type: DependencyType
+    lag: number
+  }) => Promise<boolean>
+  savingDependency?: boolean
 }
 
 // Pixel width per day.
@@ -64,8 +73,11 @@ export function ProgrammeGantt({
   revisionNo,
   snapshotContentHash,
   editable = false,
+  programmeId,
   onCommitDuration,
   savingActivityId = null,
+  onAddDependency,
+  savingDependency = false,
 }: ProgrammeGanttProps) {
   const { activities, projectDuration, criticalPath } = schedule
   const totalWidth = Math.max(projectDuration * DAY_WIDTH, 200)
@@ -113,7 +125,7 @@ export function ProgrammeGantt({
           >
             <div className="w-48 shrink-0 border-r border-border px-3 py-1">Activity</div>
             <div className="w-20 shrink-0 border-r border-border px-3 py-1 text-right">
-              Dur{editable ? '' : ''}
+              Dur
             </div>
             <div className="w-16 shrink-0 border-r border-border px-3 py-1 text-right">Start</div>
             <div className="w-16 shrink-0 border-r border-border px-3 py-1 text-right">Finish</div>
@@ -151,6 +163,25 @@ export function ProgrammeGantt({
           Edit a duration and press Enter (or blur) to recompute the schedule. Start, finish, float
           and critical path are derived by the CPM engine — they are never edited directly.
         </p>
+      )}
+
+      {/* Add dependency form — workspace mode only.
+          The UI adds workspace INPUTS (predecessor, successor, type, lag);
+          the engine derives the schedule OUTPUTS. */}
+      {editable && onAddDependency && (
+        <div className="rounded-lg border border-border bg-card p-4">
+          <h4 className="mb-1 text-sm font-medium">Add dependency</h4>
+          <p className="mb-3 text-xs text-muted-foreground">
+            Add a precedence edge. The server validates same-programme, no
+            self-reference, finite lag, and no resulting cycle before persisting.
+          </p>
+          <AddDependencyForm
+            programmeId={programmeId ?? ''}
+            activities={activities}
+            onAdd={onAddDependency}
+            saving={savingDependency}
+          />
+        </div>
       )}
     </div>
   )

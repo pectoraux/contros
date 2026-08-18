@@ -403,6 +403,67 @@ export const activityDependencyRepository = {
   },
 
   /**
+   * D1: Create a dependency WITHIN a caller-held transaction.
+   *
+   * The caller (ProgrammeService.addDependency) has ALREADY:
+   *   - acquired the Programme row lock (SELECT FOR UPDATE)
+   *   - read activities + dependencies under the lock
+   *   - validated no self-reference, finite lag, and no resulting cycle
+   *
+   * This method does the authoritative X3 same-programme enforcement
+   * (predecessor + successor both belong to `programmeId`) and persists.
+   * It does NOT lock — the caller holds the lock. It does NOT do cycle
+   * detection — that is the service's responsibility (it needs the full
+   * graph, which is domain logic, not repository logic).
+   *
+   * Throws if either activity is not found in the programme (X3).
+   */
+  async createInTransaction(
+    tx: Tx,
+    programmeId: string,
+    data: {
+      predecessorActivityId: string
+      successorActivityId: string
+      type: string
+      lag: number
+    },
+  ) {
+    // X3: Verify both activities belong to the SAME programme. This is the
+    // authoritative same-programme enforcement — a dependency edge cannot
+    // cross programme boundaries.
+    const [pred, succ] = await Promise.all([
+      tx.activity.findFirst({
+        where: { id: data.predecessorActivityId, programmeId },
+        select: { id: true, programmeId: true },
+      }),
+      tx.activity.findFirst({
+        where: { id: data.successorActivityId, programmeId },
+        select: { id: true, programmeId: true },
+      }),
+    ])
+    if (!pred) {
+      throw new Error(
+        `Cannot create dependency: predecessor "${data.predecessorActivityId}" not found in programme "${programmeId}"`,
+      )
+    }
+    if (!succ) {
+      throw new Error(
+        `Cannot create dependency: successor "${data.successorActivityId}" not found in programme "${programmeId}"`,
+      )
+    }
+
+    return tx.activityDependency.create({
+      data: {
+        programmeId,
+        predecessorActivityId: data.predecessorActivityId,
+        successorActivityId: data.successorActivityId,
+        type: data.type,
+        lag: data.lag,
+      },
+    })
+  },
+
+  /**
    * R1: Delete all dependencies for a programme. Takes the Programme row lock
    * first to serialize against concurrent finalization.
    */

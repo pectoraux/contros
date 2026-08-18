@@ -56,12 +56,27 @@ import {
   type ProgrammeSnapshot,
   type ProgrammeActivity,
   type ActivityDependency,
+  type DependencyType,
 } from '@/lib/programme'
 import type { ScheduleResult } from '@/lib/engines/schedule-engine'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 type Err = { ok: false; error: string; status: number }
+
+/**
+ * D1: Internal error class for dependency validation failures thrown inside
+ * the locked transaction. The service catches these and converts them to
+ * typed { ok: false, error, status } results. Other thrown errors (e.g. X3
+ * cross-programme from the repo) propagate as 500s — they indicate a
+ * service-level check was bypassed, which is a programming error.
+ */
+class DependencyValidationError extends Error {
+  constructor(message: string, public status: number) {
+    super(message)
+    this.name = 'DependencyValidationError'
+  }
+}
 
 export interface FinalizeProgrammeInput {
   ctx: RequestContext
@@ -464,6 +479,221 @@ export const programmeService = {
 
     // Update the activity (activityRepository.update takes the Programme-row lock).
     await activityRepository.update(ctx.organizationId, activityId, { duration })
+
+    // Re-fetch the schedule to return the updated CPM result.
+    const scheduleResult = await this.getProgrammeSchedule({
+      ctx,
+      programmeId,
+    })
+    if (!scheduleResult.ok) {
+      return scheduleResult
+    }
+
+    return {
+      ok: true,
+      schedule: scheduleResult.schedule,
+      programmeName: scheduleResult.programmeName,
+    }
+  },
+
+  /**
+   * D1: Add a dependency edge — the second controlled schedule mutation.
+   *
+   * The user adds workspace INPUTS (a precedence edge: predecessor,
+   * successor, type, lag); the scheduling engine derives schedule OUTPUTS
+   * (start, finish, float, critical path). The UI never edits computed CPM
+   * dates directly.
+   *
+   * Flow (snapshot-at-lock — mirrors finalizeProgramme):
+   *   RequestContext
+   *       ↓
+   *   validate type ∈ {FS,SS,FF,SF} + finite lag  (pure, pre-DB)
+   *       ↓
+   *   pre-flight: programme exists (tenant-scoped read)
+   *       ↓
+   *   TRANSACTION:
+   *     SELECT FOR UPDATE on Programme row  (lock)
+   *     read activities + dependencies UNDER THE LOCK
+   *     verify both activities exist in programme  → 404
+   *     check self-reference (pred === succ)       → 422
+   *     build would-be snapshot (current deps + new edge)
+   *     validateProgrammeSnapshot (cycle + finite) → 422 on cycle
+   *     activityDependencyRepository.createInTransaction  (X3 + persist)
+   *       ↓
+   *   getProgrammeSchedule (workspace preview with the new edge)
+   *       ↓
+   *   updated ScheduleResult
+   *
+   * CONCURRENCY: the cycle check is authoritative because it runs INSIDE the
+   * Programme-row lock. Two concurrent addDependency calls that would jointly
+   * form a cycle cannot both pass: the second sees the first's committed edge
+   * under the lock. This is the snapshot-at-lock discipline (Q1) applied to
+   * dependency creation.
+   *
+   * Validation summary (the server must validate all of these):
+   *   same tenant        — programmeRepository.getForOrganization (tenant scope)
+   *   same programme     — X3 in createInTransaction (pred+succ both in programme)
+   *   activities exist   — service checks under the lock → 404
+   *   no self-reference  — service checks (pred !== succ) → 422
+   *   finite lag         — service checks pre-DB (Number.isFinite) → 422
+   *   valid type         — service checks pre-DB (∈ {FS,SS,FF,SF}) → 422
+   *   no cycle           — validateProgrammeSnapshot under the lock → 422
+   */
+  async addDependency(
+    input: {
+      ctx: RequestContext
+      programmeId: string
+      predecessorActivityId: string
+      successorActivityId: string
+      type: DependencyType
+      lag: number
+    },
+  ): Promise<
+    | {
+        ok: true
+        schedule: ScheduleResult
+        programmeName: string
+      }
+    | Err
+  > {
+    const {
+      ctx,
+      programmeId,
+      predecessorActivityId,
+      successorActivityId,
+      type,
+      lag,
+    } = input
+
+    // ── Pre-DB validation (pure) ──────────────────────────────────────────
+    const VALID_TYPES: DependencyType[] = ['FS', 'SS', 'FF', 'SF']
+    if (!VALID_TYPES.includes(type)) {
+      return { ok: false, error: `Invalid dependency type: ${type}`, status: 422 }
+    }
+    if (!Number.isFinite(lag)) {
+      return { ok: false, error: 'Lag must be a finite number', status: 422 }
+    }
+
+    // Pre-flight: verify the programme exists (tenant-scoped). The
+    // authoritative read is inside the transaction under the lock.
+    const programmeExists = await programmeRepository.getForOrganization(
+      ctx.organizationId,
+      programmeId,
+    )
+    if (!programmeExists) {
+      return { ok: false, error: 'Programme not found in this organization', status: 404 }
+    }
+
+    // ── Transaction: lock → read → validate → persist ─────────────────────
+    try {
+      await dbTx.$transaction(async (tx) => {
+        // Lock the Programme row FIRST (snapshot-at-lock, Q1).
+        await tx.$queryRaw`SELECT id FROM "Programme" WHERE id = ${programmeId} FOR UPDATE`
+
+        // Read activities + dependencies UNDER THE LOCK.
+        const [activities, dependencies] = await Promise.all([
+          activityRepository.listForProgrammeInTransaction(tx, ctx.organizationId, programmeId),
+          activityDependencyRepository.listForProgrammeInTransaction(tx, ctx.organizationId, programmeId),
+        ])
+
+        // Verify both activities exist in this programme.
+        const predExists = activities.some((a) => a.id === predecessorActivityId)
+        const succExists = activities.some((a) => a.id === successorActivityId)
+        if (!predExists || !succExists) {
+          throw new DependencyValidationError(
+            !predExists
+              ? `Predecessor activity "${predecessorActivityId}" not found in this programme`
+              : `Successor activity "${successorActivityId}" not found in this programme`,
+            404,
+          )
+        }
+
+        // Check self-reference.
+        if (predecessorActivityId === successorActivityId) {
+          throw new DependencyValidationError(
+            'An activity cannot depend on itself',
+            422,
+          )
+        }
+
+        // Build the WOULD-BE snapshot (current graph + the new edge) and
+        // validate it. validateProgrammeSnapshot catches:
+        //   - cycles (via the schedule engine's cycle detection)
+        //   - non-finite values (defensive — already checked above)
+        //   - dangling refs (defensive — already checked above)
+        //   - self-reference (defensive — already checked above)
+        // The cycle check is the novel validation here.
+        const wouldBeDependencies: ActivityDependency[] = [
+          ...dependencies.map((d) => ({
+            id: d.id,
+            predecessorActivityId: d.predecessorActivityId,
+            successorActivityId: d.successorActivityId,
+            type: d.type as DependencyType,
+            lag: d.lag,
+          })),
+          {
+            id: '__pending__',
+            predecessorActivityId,
+            successorActivityId,
+            type,
+            lag,
+          },
+        ]
+
+        const wouldBeActivities: ProgrammeActivity[] = activities.map((a) => ({
+          id: a.id,
+          name: a.name,
+          duration: a.duration,
+          constructionRefs: {
+            estimateLineId: a.estimateLineId,
+            workDefinitionVersionId: a.workDefinitionVersionId,
+            workPackageId: null,
+          },
+          plannedQuantity: a.plannedQuantity,
+          status: a.status as 'planned' | 'in-progress' | 'complete',
+          predecessorDependencies: [],
+        }))
+
+        const wouldBeSnapshot: ProgrammeSnapshot = {
+          programmeId,
+          programmeName: programmeExists.name,
+          revisionNo: 0,
+          scheduleEngineVersion: CURRENT_SCHEDULE_ENGINE_VERSION,
+          activities: wouldBeActivities,
+          dependencies: wouldBeDependencies,
+          finalizedAt: '',
+        }
+
+        const validation = validateProgrammeSnapshot(wouldBeSnapshot)
+        if (validation.hasCycle) {
+          throw new DependencyValidationError(
+            'Dependency would create a cycle — schedule is infeasible',
+            422,
+          )
+        }
+        if (!validation.ok) {
+          // Defensive: should not happen if the checks above passed.
+          throw new DependencyValidationError(
+            `Dependency validation failed: ${validation.errors.join('; ')}`,
+            422,
+          )
+        }
+
+        // Persist — createInTransaction does the authoritative X3
+        // same-programme enforcement + insert.
+        await activityDependencyRepository.createInTransaction(tx, programmeId, {
+          predecessorActivityId,
+          successorActivityId,
+          type,
+          lag,
+        })
+      })
+    } catch (e) {
+      if (e instanceof DependencyValidationError) {
+        return { ok: false, error: e.message, status: e.status }
+      }
+      throw e
+    }
 
     // Re-fetch the schedule to return the updated CPM result.
     const scheduleResult = await this.getProgrammeSchedule({

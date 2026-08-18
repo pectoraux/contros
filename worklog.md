@@ -4977,3 +4977,147 @@ NEXT (per review): dependency editing — add dependency
   (predecessorActivityId, successorActivityId, type: FS|SS|FF|SF, lag).
   The UI edits only those inputs; replaySchedule() continues to derive
   dates, float, and critical path.
+
+---
+Task ID: programme-dependency-editing
+Agent: principal-engineer
+Task: D1 — Dependency editing: the second controlled schedule mutation. Service + repo + API route + 10 PostgreSQL integration tests + UI form + browser end-to-end verification. Also cleaned up the dead `Dur{editable ? '' : ''}` conditional noted in the prior review. No frozen code touched.
+
+CODE QUALITY FIX:
+- Removed the dead `Dur{editable ? '' : ''}` conditional in ProgrammeGantt's
+  header (now just `Dur`). Noted in the prior review as non-blocking; fixed
+  here as a trivial cleanup.
+
+REPOSITORY (src/repositories/programme-repositories.ts):
+- Added `activityDependencyRepository.createInTransaction(tx, programmeId, data)`.
+  This does the authoritative X3 same-programme enforcement (predecessor +
+  successor both belong to `programmeId`) + persist, assuming the caller
+  holds the Programme-row lock. It does NOT lock (caller holds it) and does
+  NOT do cycle detection (that is service-level domain logic, not repo
+  logic). Mirrors the `*InTransaction` pattern used by finalization.
+- The existing `create(orgId, programmeId, data)` remains for backward
+  compatibility (the X3 cross-programme test uses it).
+
+SERVICE (src/application/programme-service.ts):
+- `addDependency({ ctx, programmeId, predecessorActivityId, successorActivityId, type, lag })`
+  → `{ ok: true, schedule, programmeName } | Err`
+- Flow (snapshot-at-lock — mirrors finalizeProgramme):
+    1. Pre-DB validation (pure): type ∈ {FS,SS,FF,SF}, lag finite → 422.
+    2. Pre-flight: programme exists (tenant-scoped read) → 404.
+    3. TRANSACTION:
+       a. SELECT FOR UPDATE on Programme row (lock).
+       b. Read activities + dependencies UNDER THE LOCK.
+       c. Verify both activities exist in programme → 404.
+       d. Check self-reference (pred === succ) → 422.
+       e. Build WOULD-BE snapshot (current graph + new edge).
+       f. validateProgrammeSnapshot → if hasCycle → 422.
+       g. activityDependencyRepository.createInTransaction (X3 + persist).
+    4. getProgrammeSchedule → return updated ScheduleResult.
+- The cycle check is AUTHORITATIVE: it runs inside the Programme-row lock.
+  Two concurrent addDependency calls that would jointly form a cycle cannot
+  both pass — the second sees the first's committed edge under the lock.
+- `DependencyValidationError` internal class: thrown inside the transaction,
+  caught by the service and converted to typed { ok: false, error, status }.
+
+API ROUTE (src/app/api/programmes/[programmeId]/dependencies/route.ts):
+- POST → requireAuth → parse body → programmeService.addDependency() → JSON.
+- 200 → { ok, schedule, programmeName }
+- 404 → programme or activity not found / wrong tenant
+- 422 → invalid type, non-finite lag, self-reference, or cycle
+- Thin route: no domain logic, no CPM calculation.
+
+INTEGRATION TESTS (tests/integration/programme-dependency-edit.test.ts — 10 tests, all passing):
+1. Add FS dependency → schedule changes (ACT_3: ES 0→15, EF 20→35, duration 20→35).
+2. Finalized ProgrammeRevision unchanged after adding a dependency.
+3. Cross-tenant: Org B cannot add dependency to Org A programme → 404.
+4. Cross-programme: predecessor from Programme B → 404.
+5. Self-reference (ACT_1→ACT_1) → 422.
+6. Missing activity (nonexistent ID) → 404.
+7. NaN lag → 422.
+8. Infinity lag → 422.
+9. Invalid type 'XX' → 422.
+10. Cycle: add B→A when A→B exists → 422 (and no dependency persisted —
+    the transaction rolled back).
+
+UI (src/components/views/programme/AddDependencyForm.tsx):
+- Form with: predecessor (Select), type (Select: FS/SS/FF/SF), lag (number
+  Input), successor (Select), Add button.
+- Workspace mode only — in revision mode the form is not rendered.
+- On submit: POST → parent replaces ScheduleResult → form resets on success.
+- On failure: toast error, form keeps values (user can adjust and retry).
+- Inline validation hint when predecessor === successor.
+- The UI sends only edge INPUTS; the engine derives OUTPUTS.
+
+UI WIRING (ProgrammeGantt.tsx + ProgrammeTab.tsx):
+- ProgrammeGantt: new props `onAddDependency`, `savingDependency`. Renders
+  <AddDependencyForm /> below the activity table in workspace mode only.
+- ProgrammeTab: `handleAddDependency` → POST → replace schedule state.
+  No optimistic client-side CPM. The entire ScheduleResult is replaced
+  with the engine's recomputed result.
+
+BROWSER END-TO-END VERIFICATION (Agent Browser, authenticated):
+Demo: kwesi@adomconstruction.gh (Director) → Office Complex → Programme tab.
+Programme "Office Complex Programme" (3 activities: Site Clearing 3d,
+Foundation 10d, Structure 20d; 2 FS dependencies lag 0).
+
+Initial state (engine-computed):
+  Duration: 33 days | Critical path: 3 activities
+  Site Clearing:  dur=3  ES=0  EF=3   CRITICAL
+  Foundation:     dur=10 ES=3  EF=13  CRITICAL
+  Structure:      dur=20 ES=13 EF=33  CRITICAL
+
+Edit 1 — Add FS Site Clearing → Structure, lag 15:
+  POST /api/programmes/.../dependencies → 200
+  Duration: 38 days | Critical path: 2 activities
+  Site Clearing:  dur=3  ES=0  EF=3   CRITICAL (unchanged)
+  Foundation:     dur=10 ES=3  EF=13  Float=5.0 (no longer critical!)
+  Structure:      dur=20 ES=18 EF=38  CRITICAL (shifted: 13→18, 33→38)
+  The new FS+lag constraint (ES_Structure ≥ EF_SiteClearing + 15 = 18)
+  overrode the old FS chain (ES_Structure ≥ EF_Foundation = 13). Foundation
+  gained 5 days of float. The critical path changed from the 3-activity FS
+  chain to the 2-activity FS+lag edge (Site Clearing → Structure).
+  The browser sent only the edge inputs; the engine recomputed every
+  derived value across the whole graph.
+
+Edit 2 — Add FS Structure → Site Clearing, lag 0 (CYCLE):
+  POST /api/programmes/.../dependencies → 422
+  Schedule unchanged (Duration still 38). Form kept its values.
+  The cycle check ran inside the Programme-row lock and rejected the edge.
+  No dependency was persisted (transaction rolled back).
+
+Cleanup: removed the test dependency (FS Site Clearing → Structure, lag 15)
+via direct DB script. Demo restored to 33 days, 3 critical activities, 2
+dependencies.
+
+Responsiveness: AddDependency form renders correctly on mobile (390px) —
+form fields wrap, dropdowns accessible. Desktop (1440px): full layout.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Dependency edit integration (Neon) .. 10 pass / 0 fail / 32 expect()
+- Browser: add dependency → 200 → schedule updates .. ✅
+- Browser: cycle → 422 → schedule unchanged ......... ✅
+- Browser: mobile responsive ......................... ✅
+- Browser: no console errors from new code ........... ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE SECOND CONTROLLED SCHEDULE MUTATION IS NOW END-TO-END LIVE:
+  User adds edge (pred, succ, type, lag) → POST → engine recalculates → Gantt updates
+  The browser sends workspace INPUTS; the scheduling engine derives OUTPUTS.
+  Cycles are rejected inside the Programme-row lock — no cyclic workspace
+  can be created. A finalized ProgrammeRevision remains read-only.
+
+VALIDATION SUMMARY (all server-side, inside the lock):
+  same tenant        ✅ (programmeRepository.getForOrganization)
+  same programme     ✅ (X3 in createInTransaction)
+  activities exist   ✅ (service check under the lock → 404)
+  no self-reference  ✅ (service check → 422)
+  finite lag         ✅ (service check pre-DB → 422)
+  valid type         ✅ (service check pre-DB → 422)
+  no cycle           ✅ (validateProgrammeSnapshot under the lock → 422)
+
+NEXT (per review sequence): the remaining edit primitives toward a real
+Microsoft Project-like scheduler — change dependency type, change lag,
+reorder/rename activities — then save → finalize → compare revisions.
+Each mutation follows the same model: UI edits INPUTS, engine derives OUTPUTS.
