@@ -49,6 +49,19 @@ import {
 
 type Err = { ok: false; error: string; status: number }
 
+/**
+ * P3: Internal error class for plan link validation failures thrown inside
+ * the transaction. The service catches these and converts them to typed
+ * { ok: false, error, status } results. Other thrown errors propagate as 500s.
+ * Mirrors the ProgrammeValidationError pattern.
+ */
+class PlanLinkError extends Error {
+  constructor(message: string, public status: number) {
+    super(message)
+    this.name = 'PlanLinkError'
+  }
+}
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface CreateArtifactInput {
@@ -264,8 +277,16 @@ export const planService = {
    *   A plan measurement from one project must NEVER become current lineage
    *   for a different project's commercial line merely because both belong
    *   to the same tenant.
-   * P3: The link operation (verify + update) runs inside one transaction so
-   *   the identity checks and pointer update form one atomic decision.
+   * P3: The ENTIRE link operation — identity verification + pointer update —
+   *   runs inside ONE transaction. The identity checks and the mutation form
+   *   one atomic domain decision:
+   *
+   *     BEGIN
+   *       load measurement link context (InTransaction)
+   *       load EstimateLine link context (InTransaction)
+   *       verify same-opportunity identity
+   *       update currentMeasurementId (InTransaction)
+   *     COMMIT
    *
    * This sets EstimateLine.currentMeasurementId — a mutable pointer, NOT
    * ownership. One measurement can support multiple lines. Rebinding to a
@@ -274,45 +295,55 @@ export const planService = {
   async linkToEstimateLine(input: LinkMeasurementInput) {
     const { ctx, estimateLineId, planMeasurementId } = input
 
-    // P2: Get the measurement's opportunity context (tenant-scoped).
-    const measurementCtx = await planMeasurementRepository.getLinkContext(
-      ctx.organizationId,
-      planMeasurementId,
-    )
-    if (!measurementCtx) {
-      return { ok: false, error: 'PlanMeasurement not found in this organization', status: 404 } as const
-    }
+    // P3: The ENTIRE operation — verify + update — runs inside one transaction.
+    // The identity checks and the pointer update form one atomic domain decision.
+    try {
+      await dbTx.$transaction(async (tx) => {
+        // P2: Get the measurement's opportunity context INSIDE the transaction.
+        const measurementCtx = await planMeasurementRepository.getLinkContextInTransaction(
+          tx,
+          ctx.organizationId,
+          planMeasurementId,
+        )
+        if (!measurementCtx) {
+          throw new PlanLinkError('PlanMeasurement not found in this organization', 404)
+        }
 
-    // P2: Get the estimate line's opportunity context (tenant-scoped).
-    const lineCtx = await planEstimateLineRepository.getForPlanLink(
-      ctx.organizationId,
-      estimateLineId,
-    )
-    if (!lineCtx) {
-      return { ok: false, error: 'EstimateLine not found in this organization', status: 404 } as const
-    }
+        // P2: Get the estimate line's opportunity context INSIDE the transaction.
+        const lineCtx = await planEstimateLineRepository.getForPlanLinkInTransaction(
+          tx,
+          ctx.organizationId,
+          estimateLineId,
+        )
+        if (!lineCtx) {
+          throw new PlanLinkError('EstimateLine not found in this organization', 404)
+        }
 
-    // P2: SAME-OPPORTUNITY IDENTITY ENFORCEMENT.
-    // The measurement and the estimate line must belong to the SAME opportunity.
-    // A plan measurement from one project must never become current lineage for
-    // a different project's commercial line merely because both belong to the
-    // same tenant.
-    if (measurementCtx.opportunityId !== lineCtx.opportunityId) {
-      return {
-        ok: false,
-        error: 'PlanMeasurement and EstimateLine must belong to the same opportunity',
-        status: 422,
-      } as const
-    }
+        // P2: SAME-OPPORTUNITY IDENTITY ENFORCEMENT.
+        // The measurement and the estimate line must belong to the SAME opportunity.
+        // A plan measurement from one project must never become current lineage for
+        // a different project's commercial line merely because both belong to the
+        // same tenant.
+        if (measurementCtx.opportunityId !== lineCtx.opportunityId) {
+          throw new PlanLinkError(
+            'PlanMeasurement and EstimateLine must belong to the same opportunity',
+            422,
+          )
+        }
 
-    // P3: Transactional link — verify + update in one atomic decision.
-    await dbTx.$transaction(async (tx) => {
-      await planEstimateLineRepository.setCurrentMeasurementInTransaction(
-        tx,
-        estimateLineId,
-        planMeasurementId,
-      )
-    })
+        // P3: Update the pointer — same transaction as the identity checks.
+        await planEstimateLineRepository.setCurrentMeasurementInTransaction(
+          tx,
+          estimateLineId,
+          planMeasurementId,
+        )
+      })
+    } catch (e) {
+      if (e instanceof PlanLinkError) {
+        return { ok: false, error: e.message, status: e.status } as const
+      }
+      throw e
+    }
 
     return { ok: true, linked: true } as const
   },

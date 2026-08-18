@@ -367,6 +367,30 @@ describe('Plan domain integration tests — provenance chain', () => {
     if (res.ok) return
     expect(res.status).toBe(422)
     expect(res.error).toMatch(/same opportunity/i)
+
+    // P3: Verify the EstimateLine was NOT mutated — the transaction rolled back.
+    const lineB = await db.estimateLine.findUnique({ where: { id: ESTIMATE_LINE_B } })
+    expect(lineB!.currentMeasurementId).toBeNull() // unchanged — atomic rollback
+  }, 60000)
+
+  // ── 12b. P3: Transaction-boundary atomicity — failed link leaves no side effects ─
+
+  test('P3: failed link (nonexistent measurement) → EstimateLine unchanged (atomic)', async () => {
+    // Attempt a link with a nonexistent measurement ID. The transaction should
+    // roll back — the EstimateLine must NOT be mutated.
+    const res = await planService.linkToEstimateLine({
+      ctx: ctxA,
+      estimateLineId: ESTIMATE_LINE_2, // a valid line
+      planMeasurementId: 'nonexistent-measurement-id', // invalid
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.status).toBe(404)
+
+    // The EstimateLine must be unchanged — the transaction rolled back.
+    const line2 = await db.estimateLine.findUnique({ where: { id: ESTIMATE_LINE_2 } })
+    // It should still point to the old measurement (or null if not yet linked).
+    expect(line2!.currentMeasurementId).not.toBe('nonexistent-measurement-id')
   }, 60000)
 
   // ── 13. P4: Invalid documentId → 422 ─────────────────────────────────────

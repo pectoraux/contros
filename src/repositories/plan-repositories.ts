@@ -345,6 +345,47 @@ export const planMeasurementRepository = {
       opportunityId: measurement.planSheetRevision.planSheet.planArtifact.opportunityId,
     }
   },
+
+  /**
+   * P3: Transaction-aware variant of getLinkContext. Reads the measurement's
+   * opportunity context WITHIN a caller-held transaction so the identity
+   * verification and the pointer update form one atomic decision.
+   */
+  async getLinkContextInTransaction(
+    tx: Tx,
+    orgId: string,
+    measurementId: string,
+  ) {
+    const measurement = await tx.planMeasurement.findFirst({
+      where: {
+        id: measurementId,
+        planSheetRevision: {
+          planSheet: {
+            planArtifact: { organizationId: orgId },
+          },
+        },
+      },
+      select: {
+        id: true,
+        planSheetRevision: {
+          select: {
+            planSheet: {
+              select: {
+                planArtifact: {
+                  select: { opportunityId: true },
+                },
+              },
+            },
+          },
+        },
+      },
+    })
+    if (!measurement) return null
+    return {
+      id: measurement.id,
+      opportunityId: measurement.planSheetRevision.planSheet.planArtifact.opportunityId,
+    }
+  },
 }
 
 // ─── Plan EstimateLine Repository ───────────────────────────────────────────
@@ -364,6 +405,37 @@ export const planEstimateLineRepository = {
    */
   async getForPlanLink(orgId: string, estimateLineId: string) {
     const line = await db.estimateLine.findFirst({
+      where: {
+        id: estimateLineId,
+        estimate: { opportunity: { organizationId: orgId } },
+      },
+      select: {
+        id: true,
+        estimate: {
+          select: {
+            opportunityId: true,
+          },
+        },
+      },
+    })
+    if (!line) return null
+    return {
+      id: line.id,
+      opportunityId: line.estimate.opportunityId,
+    }
+  },
+
+  /**
+   * P3: Transaction-aware variant of getForPlanLink. Reads the EstimateLine's
+   * opportunity context WITHIN a caller-held transaction so the identity
+   * verification and the pointer update form one atomic decision.
+   */
+  async getForPlanLinkInTransaction(
+    tx: Tx,
+    orgId: string,
+    estimateLineId: string,
+  ) {
+    const line = await tx.estimateLine.findFirst({
       where: {
         id: estimateLineId,
         estimate: { opportunity: { organizationId: orgId } },
