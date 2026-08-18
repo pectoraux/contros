@@ -5873,3 +5873,97 @@ with three explicit categories:
 
 This is the bridge to a genuinely useful programme graph — not just a
 Gantt chart, but a historical decision trail with explainable categories.
+
+---
+Task ID: comparison-from-to-contract
+Agent: principal-engineer
+Task: F2-refinement — Comparison from/to contract. Each change now carries BOTH the `from` and `to` state (names, sequence, duration, construction refs), not just the "to" names. This makes the comparison a genuinely historical record rather than a current-state annotation. Critical for renamed/removed activities where the "to" snapshot cannot supply the old name. No frozen code touched.
+
+ISSUE (per review):
+  The comparison enriched dependency names from the "to" snapshot only:
+    predecessorName = "Substructure" (the new name)
+  This is misleading for renamed activities and impossible for removed
+  activities (where the "to" snapshot can't supply the name at all).
+
+FIX:
+  Refactored the ChangeSummary types so every change carries BOTH:
+    from: ActivityState | null  (null for "added")
+    to:   ActivityState | null  (null for "removed")
+
+  ActivityState = { name, sequence, duration, estimateLineId,
+                    workDefinitionVersionId, plannedQuantity }
+
+  DependencyState = { predecessorName, successorName, type, lag }
+
+  The pure computeChangeSummary now:
+  - Builds name lookups from BOTH snapshots (baseNameById + headNameById).
+  - For "added" changes: from=null, to={names from head snapshot}.
+  - For "removed" changes: from={names from base snapshot}, to=null.
+  - For field changes: both from and to carry the full state with names
+    from their respective snapshots.
+
+  The service methods (getChangeSummary, compareRevisions) no longer
+  enrich names — the pure diff handles it correctly from both snapshots.
+
+EXAMPLE:
+  Revision 3: "Foundation" → "Structure"
+  Revision 4: "Substructure" → "Structure"
+
+  Before (misleading):
+    predecessorName = "Substructure"  (only the new name)
+
+  After (historical):
+    from: { predecessorName: "Foundation", ... }
+    to:   { predecessorName: "Substructure", ... }
+
+UI (FinalizePanel):
+  Updated ActivityChangeRow and DependencyChangeRow to derive display
+  values from the from/to state. For renamed activities, shows the "to"
+  name as the label and from→to values. For removed, shows the "from" name.
+
+INTEGRATION TESTS (4 new, 14 total):
+11. From/to contract: renamed activity carries both from.name and to.name.
+    ACT_2: from.name="Foundation", to.name="Footings". ✅
+12. From/to contract: removed activity has from state, to is null.
+    ACT_3 removed: from.name="Structure", to=null. ✅
+13. From/to contract: added activity has to state, from is null.
+    ACT_3 re-added: from=null, to.name="Structure Re-added", to.duration=25. ✅
+14. From/to contract: dependency added carries to names, from is null.
+    ACT_1→ACT_3 added: from=null, to.predecessorName="Excavation",
+    to.successorName="Structure", to.type="FS", to.lag=0. ✅
+
+  Also fixed 2 existing tests that referenced the old oldValue/newValue
+  fields — now use from.duration/to.duration etc.
+
+HTTP VERIFICATION (authenticated curl):
+- Finalize rev A, rename "Site Clearing"→"Renamed Activity", finalize rev B.
+- Compare A → B:
+    renamed (presentation):
+      from.name: Site Clearing
+      to.name: Renamed Activity
+  ✅ Both names carried — genuinely historical.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Revision compare (Neon) ............. 14 pass / 0 fail / 86 expect()
+- HTTP: from/to contract for rename .... ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE COMPARISON IS NOW A GENUINELY HISTORICAL RECORD:
+  Every change carries both the "from" and "to" state.
+  Renamed activities show both names.
+  Removed activities show the from state (to is null).
+  Added activities show the to state (from is null).
+  Dependency changes carry from/to names from both snapshots.
+
+This closes the from/to contract gap before the comparison UI becomes the
+canonical presentation. The Programme history chain is now strong:
+  mutable Programme → immutable ProgrammeRevision → revision-to-revision
+  comparison → explained change categories → historical from/to record.
+
+NEXT (per review): the plan ↔ BOQ ↔ programme linkage model:
+  construction plan / drawing → measured quantities → BOQ item →
+  EstimateLine → ProgrammeActivity → execution evidence.
+That is the architectural path toward the integrated AutoCAD/Archicad +
+BOQ + Microsoft Project-style system, while keeping each domain authoritative.

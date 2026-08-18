@@ -413,15 +413,9 @@ export const programmeService = {
       }
     }
 
-    // Compute the pure diff.
+    // Compute the pure diff. The diff now carries from/to state (including
+    // names from both snapshots) — no service-level enrichment needed.
     const summary = computeChangeSummary(baseSnapshot, workspaceSnapshot)
-
-    // Enrich dependency change names from the workspace activities.
-    const nameById = new Map(workspaceActivities.map((a) => [a.id, a.name]))
-    for (const dc of summary.dependencies) {
-      dc.predecessorName = nameById.get(dc.predecessorActivityId) ?? dc.predecessorActivityId
-      dc.successorName = nameById.get(dc.successorActivityId) ?? dc.successorActivityId
-    }
 
     return {
       ok: true,
@@ -492,15 +486,9 @@ export const programmeService = {
     const fromSnapshot = deserializeSnapshot(fromRev.snapshotJson)
     const toSnapshot = deserializeSnapshot(toRev.snapshotJson)
 
-    // Compute the pure diff.
+    // Compute the pure diff. The diff carries from/to state (including
+    // names from both snapshots) — no service-level enrichment needed.
     const summary = computeChangeSummary(fromSnapshot, toSnapshot)
-
-    // Enrich dependency change names from the "to" snapshot's activities.
-    const nameById = new Map(toSnapshot.activities.map((a) => [a.id, a.name]))
-    for (const dc of summary.dependencies) {
-      dc.predecessorName = nameById.get(dc.predecessorActivityId) ?? dc.predecessorActivityId
-      dc.successorName = nameById.get(dc.successorActivityId) ?? dc.successorActivityId
-    }
 
     return {
       ok: true,

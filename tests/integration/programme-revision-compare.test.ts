@@ -191,16 +191,16 @@ describe('Programme finalization 422 + revision comparison integration tests', (
     expect(act1Change).toBeDefined()
     expect(act1Change!.kind).toBe('duration-changed')
     expect(act1Change!.category).toBe('schedule')
-    expect(act1Change!.oldValue).toBe(5)
-    expect(act1Change!.newValue).toBe(8)
+    expect(act1Change!.from!.duration).toBe(5)
+    expect(act1Change!.to!.duration).toBe(8)
 
     // ACT_2: renamed (presentation)
     const act2Change = res.summary.activities.find((c) => c.activityId === ACT_2)
     expect(act2Change).toBeDefined()
     expect(act2Change!.kind).toBe('renamed')
     expect(act2Change!.category).toBe('presentation')
-    expect(act2Change!.oldValue).toBe('Foundation')
-    expect(act2Change!.newValue).toBe('Footings')
+    expect(act2Change!.from!.name).toBe('Foundation')
+    expect(act2Change!.to!.name).toBe('Footings')
 
     // Dependency changes: ACT_1→ACT_3 added (schedule)
     const depAdded = res.summary.dependencies.find(
@@ -209,8 +209,8 @@ describe('Programme finalization 422 + revision comparison integration tests', (
     expect(depAdded).toBeDefined()
     expect(depAdded!.kind).toBe('added')
     expect(depAdded!.category).toBe('schedule')
-    expect(depAdded!.predecessorName).toBe('Excavation')
-    expect(depAdded!.successorName).toBe('Structure')
+    expect(depAdded!.to!.predecessorName).toBe('Excavation')
+    expect(depAdded!.to!.successorName).toBe('Structure')
 
     // Counts.
     expect(res.summary.counts.activitiesDurationChanged).toBe(1)
@@ -237,8 +237,8 @@ describe('Programme finalization 422 + revision comparison integration tests', (
 
     // Duration: 8→5 (reversed).
     const act1Change = res.summary.activities.find((c) => c.activityId === ACT_1)
-    expect(act1Change!.oldValue).toBe(8)
-    expect(act1Change!.newValue).toBe(5)
+    expect(act1Change!.from!.duration).toBe(8)
+    expect(act1Change!.to!.duration).toBe(5)
   }, 60000)
 
   // ── 7. Compare revision to itself → no changes ───────────────────────────
@@ -329,5 +329,127 @@ describe('Programme finalization 422 + revision comparison integration tests', (
 
     // Restore.
     await db.activity.update({ where: { id: ACT_1 }, data: { plannedQuantity: null } })
+  }, 60000)
+
+  // ── 11. From/to contract: renamed activity carries BOTH names ────────────
+
+  test('from/to contract: renamed activity carries both from.name and to.name', async () => {
+    // rev1 has "Excavation" (ACT_1), rev2 has "Excavation" (unchanged in rev2
+    // since we only renamed ACT_2). Let's verify ACT_2's rename:
+    // rev1: "Foundation" → rev2: "Footings"
+    const res = await programmeService.compareRevisions({
+      ctx: ctxA, programmeId: PROG_A,
+      fromRevisionId: rev1Id, toRevisionId: rev2Id,
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+
+    const act2Change = res.summary.activities.find((c) => c.activityId === ACT_2)
+    expect(act2Change).toBeDefined()
+    expect(act2Change!.kind).toBe('renamed')
+    // The from state carries the OLD name; the to state carries the NEW name.
+    expect(act2Change!.from).not.toBeNull()
+    expect(act2Change!.from!.name).toBe('Foundation')
+    expect(act2Change!.to).not.toBeNull()
+    expect(act2Change!.to!.name).toBe('Footings')
+  }, 60000)
+
+  // ── 12. From/to contract: removed activity carries from state (to is null) ──
+
+  test('from/to contract: removed activity has from state, to is null', async () => {
+    // Remove ACT_3 from the workspace, finalize revision 4, then compare
+    // revision 3 → revision 4. ACT_3 was removed, so:
+    //   from: { name: 'Structure', ... }
+    //   to: null
+    await db.activityDependency.deleteMany({
+      where: { OR: [{ predecessorActivityId: ACT_3 }, { successorActivityId: ACT_3 }] },
+    }).catch(() => {})
+    await db.activity.delete({ where: { id: ACT_3 } }).catch(() => {})
+
+    const rev4 = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
+    expect(rev4.ok).toBe(true)
+    if (!rev4.ok) return
+
+    // Get revision 3's ID.
+    const rev3 = await db.programmeRevision.findFirst({
+      where: { programmeId: PROG_A, revisionNo: 3 },
+    })
+
+    const cmp = await programmeService.compareRevisions({
+      ctx: ctxA, programmeId: PROG_A,
+      fromRevisionId: rev3!.id, toRevisionId: rev4.revisionId,
+    })
+    expect(cmp.ok).toBe(true)
+    if (!cmp.ok) return
+
+    const act3Change = cmp.summary.activities.find((c) => c.activityId === ACT_3)
+    expect(act3Change).toBeDefined()
+    expect(act3Change!.kind).toBe('removed')
+    // from carries the removed activity's state; to is null.
+    expect(act3Change!.from).not.toBeNull()
+    expect(act3Change!.from!.name).toBe('Structure')
+    expect(act3Change!.to).toBeNull()
+  }, 60000)
+
+  // ── 13. From/to contract: added activity has to state, from is null ───────
+
+  test('from/to contract: added activity has to state, from is null', async () => {
+    // Re-add ACT_3, finalize revision 5, compare revision 4 → revision 5.
+    // ACT_3 was added, so:
+    //   from: null
+    //   to: { name: 'Structure Re-added', ... }
+    await db.activity.create({
+      data: { id: ACT_3, programmeId: PROG_A, name: 'Structure Re-added', duration: 25, status: 'planned', sequence: 2 },
+    })
+
+    const rev5 = await programmeService.finalizeProgramme({ ctx: ctxA, programmeId: PROG_A })
+    expect(rev5.ok).toBe(true)
+    if (!rev5.ok) return
+
+    const rev4 = await db.programmeRevision.findFirst({
+      where: { programmeId: PROG_A, revisionNo: 4 },
+    })
+
+    const cmp = await programmeService.compareRevisions({
+      ctx: ctxA, programmeId: PROG_A,
+      fromRevisionId: rev4!.id, toRevisionId: rev5.revisionId,
+    })
+    expect(cmp.ok).toBe(true)
+    if (!cmp.ok) return
+
+    const act3Change = cmp.summary.activities.find((c) => c.activityId === ACT_3)
+    expect(act3Change).toBeDefined()
+    expect(act3Change!.kind).toBe('added')
+    // from is null (didn't exist in rev4); to carries the new state.
+    expect(act3Change!.from).toBeNull()
+    expect(act3Change!.to).not.toBeNull()
+    expect(act3Change!.to!.name).toBe('Structure Re-added')
+    expect(act3Change!.to!.duration).toBe(25)
+  }, 60000)
+
+  // ── 14. From/to contract: dependency change carries from/to names ─────────
+
+  test('from/to contract: dependency added carries to names, from is null', async () => {
+    // rev1 → rev2: we added ACT_1→ACT_3 (FS, lag 0).
+    // Verify the from/to contract for that dependency change.
+    const res = await programmeService.compareRevisions({
+      ctx: ctxA, programmeId: PROG_A,
+      fromRevisionId: rev1Id, toRevisionId: rev2Id,
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+
+    const depAdded = res.summary.dependencies.find(
+      (d) => d.predecessorActivityId === ACT_1 && d.successorActivityId === ACT_3,
+    )
+    expect(depAdded).toBeDefined()
+    expect(depAdded!.kind).toBe('added')
+    // from is null (didn't exist in rev1); to carries names from rev2.
+    expect(depAdded!.from).toBeNull()
+    expect(depAdded!.to).not.toBeNull()
+    expect(depAdded!.to!.predecessorName).toBe('Excavation')
+    expect(depAdded!.to!.successorName).toBe('Structure')
+    expect(depAdded!.to!.type).toBe('FS')
+    expect(depAdded!.to!.lag).toBe(0)
   }, 60000)
 })

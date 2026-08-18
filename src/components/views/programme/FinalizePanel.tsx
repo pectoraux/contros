@@ -264,16 +264,23 @@ function ActivityChangeRow({ change }: { change: ActivityChange }) {
   const label = getActivityLabel(change.kind)
   const isSchedule = change.scheduleAffecting
 
+  // Derive display name and old→new values from the from/to state.
+  // For "added": from is null, show the "to" name.
+  // For "removed": to is null, show the "from" name.
+  // For others: both exist; show the "to" name + the specific old→new value.
+  const displayName = change.to?.name ?? change.from?.name ?? change.activityId
+  const { oldVal, newVal } = getActivityChangeValues(change)
+
   return (
     <div className="flex items-center gap-2 text-xs">
       <span className={isSchedule ? 'text-amber-600 dark:text-amber-400' : 'text-blue-600 dark:text-blue-400'}>
         {icon}
       </span>
-      <span className="font-medium truncate">{change.name}</span>
+      <span className="font-medium truncate">{displayName}</span>
       <span className="text-muted-foreground">{label}</span>
-      {change.oldValue !== undefined && change.newValue !== undefined && (
+      {oldVal !== undefined && newVal !== undefined && (
         <span className="text-muted-foreground tabular-nums">
-          {String(change.oldValue)} → {String(change.newValue)}
+          {String(oldVal)} → {String(newVal)}
         </span>
       )}
       <span className={`ml-auto text-[10px] ${isSchedule ? 'text-amber-600 dark:text-amber-400' : 'text-blue-600 dark:text-blue-400'}`}>
@@ -283,25 +290,74 @@ function ActivityChangeRow({ change }: { change: ActivityChange }) {
   )
 }
 
+/** Extract the specific old→new values for an activity change based on kind. */
+function getActivityChangeValues(change: ActivityChange): { oldVal?: string | number; newVal?: string | number } {
+  if (!change.from || !change.to) return {}
+  switch (change.kind) {
+    case 'renamed':
+      return { oldVal: change.from.name, newVal: change.to.name }
+    case 'reordered':
+      return { oldVal: change.from.sequence, newVal: change.to.sequence }
+    case 'duration-changed':
+      return { oldVal: change.from.duration, newVal: change.to.duration }
+    case 'estimate-line-changed':
+      return { oldVal: change.from.estimateLineId ?? 'none', newVal: change.to.estimateLineId ?? 'none' }
+    case 'wdv-changed':
+      return { oldVal: change.from.workDefinitionVersionId ?? 'none', newVal: change.to.workDefinitionVersionId ?? 'none' }
+    case 'planned-quantity-changed':
+      return { oldVal: change.from.plannedQuantity ?? 'none', newVal: change.to.plannedQuantity ?? 'none' }
+    default:
+      return {}
+  }
+}
+
 function DependencyChangeRow({ change }: { change: DependencyChange }) {
   const icon = getDependencyIcon(change.kind)
   const label = getDependencyLabel(change.kind)
 
+  // Derive display names from from/to state.
+  // For "added": from is null, use "to" names.
+  // For "removed": to is null, use "from" names.
+  // For type/lag changes: both exist — show from→to if names differ, else just "to".
+  const fromNames = change.from
+    ? `${change.from.predecessorName} → ${change.from.successorName}`
+    : null
+  const toNames = change.to
+    ? `${change.to.predecessorName} → ${change.to.successorName}`
+    : null
+
+  // Show the "to" names (or "from" if removed) as the primary display.
+  const displayNames = toNames ?? fromNames ?? ''
+
+  // For type/lag changes, show the specific old→new value.
+  const { oldVal, newVal } = getDependencyChangeValues(change)
+
   return (
     <div className="flex items-center gap-2 text-xs">
       <span className="text-amber-600 dark:text-amber-400">{icon}</span>
-      <span className="font-medium truncate">{change.predecessorName}</span>
-      <span className="text-muted-foreground">→</span>
-      <span className="font-medium truncate">{change.successorName}</span>
+      <span className="font-medium truncate">{displayNames}</span>
       <span className="text-muted-foreground">{label}</span>
-      {change.oldValue !== undefined && change.newValue !== undefined && (
+      {oldVal !== undefined && newVal !== undefined && (
         <span className="text-muted-foreground tabular-nums">
-          {String(change.oldValue)} → {String(change.newValue)}
+          {String(oldVal)} → {String(newVal)}
         </span>
       )}
       <span className="ml-auto text-[10px] text-amber-600 dark:text-amber-400">schedule</span>
     </div>
   )
+}
+
+/** Extract the specific old→new values for a dependency change based on kind. */
+function getDependencyChangeValues(change: DependencyChange): { oldVal?: string | number; newVal?: string | number } {
+  if (!change.from || !change.to) return {}
+  switch (change.kind) {
+    case 'type-changed':
+      return { oldVal: change.from.type, newVal: change.to.type }
+    case 'lag-changed':
+      return { oldVal: change.from.lag, newVal: change.to.lag }
+    default:
+      return {}
+  }
 }
 
 function getActivityIcon(kind: ActivityChange['kind']) {

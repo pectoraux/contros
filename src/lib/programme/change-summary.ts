@@ -1,32 +1,42 @@
 /**
  * Change Summary — pure diff between two ProgrammeSnapshots.
  *
- * Compares the current workspace against the latest finalized ProgrammeRevision
- * and produces a structured summary of what changed. This is the "what
- * changed since last revision?" surface for the finalization UX.
+ * Compares two programme states and produces a structured summary of what
+ * changed. Used for:
+ *   - Workspace vs latest revision ("what changed since last finalization?")
+ *   - Revision-to-revision comparison ("what changed from Rev 3 to Rev 4?")
  *
  * ARCHITECTURE:
  *   This is a PURE function — no DB, no Prisma, no side effects. It takes
- *   two ProgrammeSnapshots (the "base" = latest revision, the "head" =
- *   current workspace) and returns a structured ChangeSummary.
+ *   two ProgrammeSnapshots (base = "from", head = "to") and returns a
+ *   structured ChangeSummary.
+ *
+ * FROM/TO CONTRACT (F2-refinement):
+ *   Each change carries BOTH the `from` and `to` state, not just the "to"
+ *   state. This makes the comparison a genuinely historical record rather
+ *   than a current-state annotation. For example, if an activity was
+ *   renamed from "Foundation" to "Substructure", the change records:
+ *     from: { name: "Foundation", ... }
+ *     to:   { name: "Substructure", ... }
+ *   This is critical for removed activities (where the "to" snapshot cannot
+ *   supply the name) and for renamed activities (where only showing the new
+ *   name is misleading).
  *
  * CATEGORIZATION:
  *   Changes are categorized by their relationship to the schedule:
- *     - "schedule-affecting" — duration or dependency changes. These change
- *       the CPM outputs (start, finish, float, critical path).
+ *     - "schedule" — duration or dependency changes. These change the CPM
+ *       outputs (start, finish, float, critical path).
  *     - "presentation" — name and sequence changes. These do NOT change the
- *       CPM outputs — they're the contractor's authored programme document,
- *       not scheduling inputs.
- *
- *   This distinction is the key explainability the Contractor OS thesis
- *   needs: the contractor can see which changes affect the schedule vs
- *   which are just presentation/organization.
+ *       CPM outputs — they're the contractor's authored programme document.
+ *     - "construction" — EstimateLine/WDV/plannedQuantity changes, activity
+ *       added/removed. Construction-identity / scope changes.
  *
  * INVARIANTS:
  *   - Same snapshots → empty change summary (no changes).
  *   - The change summary is deterministic: same inputs → same output.
  *   - Activities are matched by ID (not name or sequence).
  *   - Dependencies are matched by (predecessor, successor) ordered pair (U1).
+ *   - Every change carries both `from` and `to` state (null for added/removed).
  */
 
 import type {
@@ -37,10 +47,26 @@ import type {
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
+/** A snapshot of an activity's state at one point in time (for from/to). */
+export interface ActivityState {
+  name: string
+  sequence: number
+  duration: number
+  estimateLineId: string | null
+  workDefinitionVersionId: string | null
+  plannedQuantity: number | null
+}
+
+/** A snapshot of a dependency's state at one point in time (for from/to). */
+export interface DependencyState {
+  predecessorName: string
+  successorName: string
+  type: string
+  lag: number
+}
+
 export interface ActivityChange {
   activityId: string
-  /** The activity's name in the head snapshot (for display). */
-  name: string
   kind:
     | 'added'
     | 'removed'
@@ -50,18 +76,22 @@ export interface ActivityChange {
     | 'estimate-line-changed'
     | 'wdv-changed'
     | 'planned-quantity-changed'
-  /** For renamed: the old name. For reordered: the old sequence. For duration: the old duration. Etc. */
-  oldValue?: string | number
-  /** For renamed: the new name. For reordered: the new sequence. For duration: the new duration. Etc. */
-  newValue?: string | number
+  /**
+   * The activity's state in the "from" snapshot. null for "added" (the
+   * activity didn't exist in the from snapshot).
+   */
+  from: ActivityState | null
+  /**
+   * The activity's state in the "to" snapshot. null for "removed" (the
+   * activity didn't exist in the to snapshot).
+   */
+  to: ActivityState | null
   /**
    * Category of this change:
    *   - "schedule" — duration or dependency changes (change CPM outputs)
    *   - "presentation" — name or sequence changes (do NOT change CPM outputs)
    *   - "construction" — EstimateLine/WDV/plannedQuantity changes, activity
-   *     added/removed (construction-identity / scope changes; may indirectly
-   *     affect schedule if duration also changed, but the relationship change
-   *     itself is construction-domain, not scheduling)
+   *     added/removed (construction-identity / scope changes)
    */
   category: 'schedule' | 'presentation' | 'construction'
   /** Whether this change affects the CPM schedule outputs. */
@@ -72,14 +102,18 @@ export interface DependencyChange {
   /** The dependency's ordered pair (predecessor → successor). */
   predecessorActivityId: string
   successorActivityId: string
-  /** Names for display. */
-  predecessorName: string
-  successorName: string
   kind: 'added' | 'removed' | 'type-changed' | 'lag-changed'
-  /** For type-changed: the old type. For lag-changed: the old lag. */
-  oldValue?: string | number
-  /** For type-changed: the new type. For lag-changed: the new lag. */
-  newValue?: string | number
+  /**
+   * The dependency's state in the "from" snapshot. null for "added".
+   * Carries predecessor/successor names from the FROM snapshot — critical
+   * for removed activities (where the "to" snapshot can't supply names).
+   */
+  from: DependencyState | null
+  /**
+   * The dependency's state in the "to" snapshot. null for "removed".
+   * Carries predecessor/successor names from the TO snapshot.
+   */
+  to: DependencyState | null
   /** Category — dependencies are always "schedule" (they affect CPM). */
   category: 'schedule'
   /** Whether this change affects the CPM schedule outputs. */
@@ -119,8 +153,8 @@ export interface ChangeSummary {
 /**
  * Compute a structured change summary between two ProgrammeSnapshots.
  *
- * @param base — the "before" snapshot (typically the latest finalized revision)
- * @param head — the "after" snapshot (typically the current workspace)
+ * @param base — the "from" snapshot (before)
+ * @param head — the "to" snapshot (after)
  * @returns a ChangeSummary describing what changed from base to head.
  *
  * PURE: same inputs → same output. No side effects.
@@ -129,8 +163,18 @@ export function computeChangeSummary(
   base: ProgrammeSnapshot,
   head: ProgrammeSnapshot,
 ): ChangeSummary {
+  // Build name lookups from BOTH snapshots so dependency changes can carry
+  // from/to names correctly (critical for renamed/removed activities).
+  const baseNameById = new Map(base.activities.map((a) => [a.id, a.name]))
+  const headNameById = new Map(head.activities.map((a) => [a.id, a.name]))
+
   const activities = diffActivities(base.activities, head.activities)
-  const dependencies = diffDependencies(base.dependencies, head.dependencies)
+  const dependencies = diffDependencies(
+    base.dependencies,
+    head.dependencies,
+    baseNameById,
+    headNameById,
+  )
 
   const hasScheduleChanges =
     activities.some((a) => a.category === 'schedule') ||
@@ -166,6 +210,19 @@ export function computeChangeSummary(
   }
 }
 
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function toActivityState(a: ProgrammeActivity): ActivityState {
+  return {
+    name: a.name,
+    sequence: a.sequence,
+    duration: a.duration,
+    estimateLineId: a.constructionRefs.estimateLineId,
+    workDefinitionVersionId: a.constructionRefs.workDefinitionVersionId,
+    plannedQuantity: a.plannedQuantity,
+  }
+}
+
 // ─── Activity diff ──────────────────────────────────────────────────────────
 
 function diffActivities(
@@ -181,10 +238,11 @@ function diffActivities(
     if (!baseById.has(h.id)) {
       changes.push({
         activityId: h.id,
-        name: h.name,
         kind: 'added',
+        from: null, // didn't exist in base
+        to: toActivityState(h),
         category: 'construction',
-        scheduleAffecting: true, // a new activity affects the schedule
+        scheduleAffecting: true,
       })
     }
   }
@@ -194,10 +252,11 @@ function diffActivities(
     if (!headById.has(b.id)) {
       changes.push({
         activityId: b.id,
-        name: b.name,
         kind: 'removed',
+        from: toActivityState(b),
+        to: null, // doesn't exist in head
         category: 'construction',
-        scheduleAffecting: true, // removing an activity affects the schedule
+        scheduleAffecting: true,
       })
     }
   }
@@ -207,14 +266,16 @@ function diffActivities(
     const b = baseById.get(h.id)
     if (!b) continue // already handled as "added"
 
+    const fromState = toActivityState(b)
+    const toState = toActivityState(h)
+
     // Duration changed (schedule category).
     if (b.duration !== h.duration) {
       changes.push({
         activityId: h.id,
-        name: h.name,
         kind: 'duration-changed',
-        oldValue: b.duration,
-        newValue: h.duration,
+        from: fromState,
+        to: toState,
         category: 'schedule',
         scheduleAffecting: true,
       })
@@ -224,10 +285,9 @@ function diffActivities(
     if (b.name !== h.name) {
       changes.push({
         activityId: h.id,
-        name: h.name,
         kind: 'renamed',
-        oldValue: b.name,
-        newValue: h.name,
+        from: fromState,
+        to: toState,
         category: 'presentation',
         scheduleAffecting: false,
       })
@@ -237,10 +297,9 @@ function diffActivities(
     if (b.sequence !== h.sequence) {
       changes.push({
         activityId: h.id,
-        name: h.name,
         kind: 'reordered',
-        oldValue: b.sequence,
-        newValue: h.sequence,
+        from: fromState,
+        to: toState,
         category: 'presentation',
         scheduleAffecting: false,
       })
@@ -250,12 +309,11 @@ function diffActivities(
     if (b.constructionRefs.estimateLineId !== h.constructionRefs.estimateLineId) {
       changes.push({
         activityId: h.id,
-        name: h.name,
         kind: 'estimate-line-changed',
-        oldValue: b.constructionRefs.estimateLineId ?? 'none',
-        newValue: h.constructionRefs.estimateLineId ?? 'none',
+        from: fromState,
+        to: toState,
         category: 'construction',
-        scheduleAffecting: false, // relationship change doesn't directly affect CPM
+        scheduleAffecting: false,
       })
     }
 
@@ -263,10 +321,9 @@ function diffActivities(
     if (b.constructionRefs.workDefinitionVersionId !== h.constructionRefs.workDefinitionVersionId) {
       changes.push({
         activityId: h.id,
-        name: h.name,
         kind: 'wdv-changed',
-        oldValue: b.constructionRefs.workDefinitionVersionId ?? 'none',
-        newValue: h.constructionRefs.workDefinitionVersionId ?? 'none',
+        from: fromState,
+        to: toState,
         category: 'construction',
         scheduleAffecting: false,
       })
@@ -276,12 +333,11 @@ function diffActivities(
     if (b.plannedQuantity !== h.plannedQuantity) {
       changes.push({
         activityId: h.id,
-        name: h.name,
         kind: 'planned-quantity-changed',
-        oldValue: b.plannedQuantity ?? 'none',
-        newValue: h.plannedQuantity ?? 'none',
+        from: fromState,
+        to: toState,
         category: 'construction',
-        scheduleAffecting: false, // quantity doesn't directly affect CPM dates
+        scheduleAffecting: false,
       })
     }
   }
@@ -294,6 +350,8 @@ function diffActivities(
 function diffDependencies(
   base: ActivityDependency[],
   head: ActivityDependency[],
+  baseNameById: Map<string, string>,
+  headNameById: Map<string, string>,
 ): DependencyChange[] {
   const changes: DependencyChange[] = []
   // U1: dependencies are identified by (predecessor, successor) ordered pair.
@@ -304,10 +362,8 @@ function diffDependencies(
     head.map((d) => [`${d.predecessorActivityId}|${d.successorActivityId}`, d]),
   )
 
-  // Build a name lookup from both base and head activities (for display).
-  // The caller should pass snapshots that include activity names; we use
-  // the activity IDs for matching and look up names from the head snapshot.
-  // If a name isn't found, we fall back to the ID.
+  // Helper: look up a name from a name map, falling back to the ID.
+  const name = (map: Map<string, string>, id: string) => map.get(id) ?? id
 
   // Dependencies added (in head but not in base).
   for (const h of head) {
@@ -316,9 +372,14 @@ function diffDependencies(
       changes.push({
         predecessorActivityId: h.predecessorActivityId,
         successorActivityId: h.successorActivityId,
-        predecessorName: h.predecessorActivityId, // fallback; service enriches with names
-        successorName: h.successorActivityId,
         kind: 'added',
+        from: null, // didn't exist in base
+        to: {
+          predecessorName: name(headNameById, h.predecessorActivityId),
+          successorName: name(headNameById, h.successorActivityId),
+          type: h.type,
+          lag: h.lag,
+        },
         category: 'schedule',
         scheduleAffecting: true,
       })
@@ -332,9 +393,16 @@ function diffDependencies(
       changes.push({
         predecessorActivityId: b.predecessorActivityId,
         successorActivityId: b.successorActivityId,
-        predecessorName: b.predecessorActivityId,
-        successorName: b.successorActivityId,
         kind: 'removed',
+        from: {
+          // Names from the BASE snapshot — critical for removed activities
+          // where the head snapshot can't supply names.
+          predecessorName: name(baseNameById, b.predecessorActivityId),
+          successorName: name(baseNameById, b.successorActivityId),
+          type: b.type,
+          lag: b.lag,
+        },
+        to: null, // doesn't exist in head
         category: 'schedule',
         scheduleAffecting: true,
       })
@@ -347,16 +415,28 @@ function diffDependencies(
     const b = baseByPair.get(key)
     if (!b) continue // already handled as "added"
 
+    // Build from/to states with names from BOTH snapshots.
+    const fromState: DependencyState = {
+      predecessorName: name(baseNameById, b.predecessorActivityId),
+      successorName: name(baseNameById, b.successorActivityId),
+      type: b.type,
+      lag: b.lag,
+    }
+    const toState: DependencyState = {
+      predecessorName: name(headNameById, h.predecessorActivityId),
+      successorName: name(headNameById, h.successorActivityId),
+      type: h.type,
+      lag: h.lag,
+    }
+
     // Type changed (schedule-affecting).
     if (b.type !== h.type) {
       changes.push({
         predecessorActivityId: h.predecessorActivityId,
         successorActivityId: h.successorActivityId,
-        predecessorName: h.predecessorActivityId,
-        successorName: h.successorActivityId,
         kind: 'type-changed',
-        oldValue: b.type,
-        newValue: h.type,
+        from: fromState,
+        to: toState,
         category: 'schedule',
         scheduleAffecting: true,
       })
@@ -367,11 +447,9 @@ function diffDependencies(
       changes.push({
         predecessorActivityId: h.predecessorActivityId,
         successorActivityId: h.successorActivityId,
-        predecessorName: h.predecessorActivityId,
-        successorName: h.successorActivityId,
         kind: 'lag-changed',
-        oldValue: b.lag,
-        newValue: h.lag,
+        from: fromState,
+        to: toState,
         category: 'schedule',
         scheduleAffecting: true,
       })
