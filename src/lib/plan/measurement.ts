@@ -133,6 +133,24 @@ export function validatePlanMeasurement(
  *   same content → same hash
  *   different recorder/time → same hash (content is the same)
  *
+ * BASIS NORMALIZATION:
+ *   measurementBasisJson is NORMALIZED before inclusion in the projection.
+ *   The raw input JSON text is parsed and re-serialized via stableJsonStringify
+ *   (sorted keys at every depth). This ensures:
+ *
+ *     {"points":["p1","p2"],"scale":"1:100"}
+ *     {"scale":"1:100","points":["p1","p2"]}
+ *
+ *   produce the SAME content hash, because the basis is canonicalized before
+ *   hashing. Do NOT use raw input JSON text as identity — that would make the
+ *   hash depend on the caller's key ordering, violating the invariant:
+ *
+ *     same measurement input + same basis + same engine version
+ *         → same content hash
+ *
+ *   This is the same canonicalization discipline established for Programme
+ *   snapshots (serializeSnapshot) and BOQ content (stableJsonStringify).
+ *
  * This mirrors the Programme domain's extractSnapshotContent (P1).
  */
 export function extractMeasurementContent(
@@ -144,8 +162,34 @@ export function extractMeasurementContent(
     measurementMethod: measurement.measurementMethod,
     quantity: measurement.quantity,
     unit: measurement.unit,
-    measurementBasisJson: measurement.measurementBasisJson,
+    // Normalize the basis: parse → stableJsonStringify → canonical form.
+    // If the basis is empty or invalid JSON, use the raw string (validation
+    // will have already caught invalid JSON).
+    measurementBasisJson: normalizeBasisJson(measurement.measurementBasisJson),
     measurementEngineVersion: measurement.measurementEngineVersion,
+  }
+}
+
+/**
+ * Normalize a measurementBasisJson string to canonical form.
+ *
+ * Parses the JSON and re-serializes with stableJsonStringify (sorted keys
+ * at every depth). This makes the content hash independent of the caller's
+ * JSON key ordering — the same logical basis always produces the same hash.
+ *
+ * If the input is empty, null, or not valid JSON, returns the input unchanged
+ * (validation catches invalid JSON separately).
+ */
+function normalizeBasisJson(basisJson: string): string {
+  if (!basisJson || basisJson.trim() === '') {
+    return basisJson
+  }
+  try {
+    const parsed = JSON.parse(basisJson)
+    return stableJsonStringify(parsed)
+  } catch {
+    // Invalid JSON — return as-is. Validation will catch this.
+    return basisJson
   }
 }
 

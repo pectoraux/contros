@@ -162,6 +162,29 @@ describe('Plan measurement content hash determinism', () => {
     expect(computeMeasurementContentHash(m1)).not.toBe(computeMeasurementContentHash(m2))
   })
 
+  test('same basis with different JSON key ordering → SAME hash (normalization)', () => {
+    // These two JSON strings are logically identical — same content, different
+    // key ordering. The content hash must be the same because the basis is
+    // normalized (parse → stableJsonStringify → canonical form) before hashing.
+    const m1 = makeMeasurement({ measurementBasisJson: '{"points":["p1","p2"],"scale":"1:100"}' })
+    const m2 = makeMeasurement({ measurementBasisJson: '{"scale":"1:100","points":["p1","p2"]}' })
+    expect(computeMeasurementContentHash(m1)).toBe(computeMeasurementContentHash(m2))
+  })
+
+  test('same basis with nested different key ordering → SAME hash', () => {
+    // Nested objects must also be normalized.
+    const m1 = makeMeasurement({ measurementBasisJson: '{"outer":{"b":2,"a":1},"x":1}' })
+    const m2 = makeMeasurement({ measurementBasisJson: '{"x":1,"outer":{"a":1,"b":2}}' })
+    expect(computeMeasurementContentHash(m1)).toBe(computeMeasurementContentHash(m2))
+  })
+
+  test('same basis with whitespace differences → SAME hash', () => {
+    // Extra whitespace in the JSON text should not affect the hash.
+    const m1 = makeMeasurement({ measurementBasisJson: '{"scale":"1:100"}' })
+    const m2 = makeMeasurement({ measurementBasisJson: '{ "scale" : "1:100" }' })
+    expect(computeMeasurementContentHash(m1)).toBe(computeMeasurementContentHash(m2))
+  })
+
   test('different planSheetRevisionId → different hash', () => {
     const m1 = makeMeasurement({ planSheetRevisionId: 'rev-A' })
     const m2 = makeMeasurement({ planSheetRevisionId: 'rev-B' })
@@ -199,7 +222,7 @@ describe('Plan measurement content projection', () => {
     expect('contentHash' in content).toBe(false)
   })
 
-  test('includes all content fields', () => {
+  test('includes all content fields (basis is normalized)', () => {
     const m = makeMeasurement()
     const content = extractMeasurementContent(m)
     expect(content.planSheetRevisionId).toBe('rev-1')
@@ -207,7 +230,9 @@ describe('Plan measurement content projection', () => {
     expect(content.measurementMethod).toBe('manual')
     expect(content.quantity).toBe(184.6)
     expect(content.unit).toBe('m2')
-    expect(content.measurementBasisJson).toBe('{"source":"manual","scale":"1:100"}')
+    // The basis is NORMALIZED: keys sorted alphabetically by stableJsonStringify.
+    // Input was {"source":"manual","scale":"1:100"} → normalized to {"scale":"1:100","source":"manual"}
+    expect(content.measurementBasisJson).toBe('{"scale":"1:100","source":"manual"}')
     expect(content.measurementEngineVersion).toBe(CURRENT_MEASUREMENT_ENGINE_VERSION)
   })
 })

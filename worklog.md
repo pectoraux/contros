@@ -6595,3 +6595,60 @@ NEXT: the first schema migration (PlanArtifact + PlanSheet + PlanSheetRevision +
 PlanMeasurement tables), then the first concrete feature: manual plan
 measurement (upload a drawing, identify a sheet, create a measurement, bind it
 to an EstimateLine, prove the provenance chain end-to-end).
+
+---
+Task ID: plan-basis-normalization
+Agent: principal-engineer
+Task: Fix the content hash semantics — normalize measurementBasisJson before hashing so that JSON key ordering does not affect the content hash. Same canonicalization discipline as Programme snapshots and BOQ content. No frozen code touched.
+
+ISSUE (per review):
+  measurementBasisJson was included in the content projection as a raw string.
+  Two logically identical bases with different key ordering:
+    {"points":["p1","p2"],"scale":"1:100"}
+    {"scale":"1:100","points":["p1","p2"]}
+  would hash differently, violating:
+    same measurement input + same basis + same engine version → same content hash
+
+FIX:
+  extractMeasurementContent now NORMALIZES measurementBasisJson before
+  inclusion in the projection:
+    measurementBasisJson
+        ↓ JSON.parse()
+        ↓ stableJsonStringify()  (sorted keys at every depth)
+        ↓ content projection
+        ↓ SHA-256
+
+  The raw input JSON text is never used as identity. This is the same
+  canonicalization discipline established for Programme snapshots
+  (serializeSnapshot) and BOQ content (stableJsonStringify).
+
+  normalizeBasisJson(basisJson):
+  - If empty/whitespace: return as-is.
+  - If valid JSON: parse → stableJsonStringify → canonical form.
+  - If invalid JSON: return as-is (validation catches this separately).
+
+UNIT TESTS (3 new, 31 total):
+- same basis with different JSON key ordering → SAME hash. ✅
+- same basis with nested different key ordering → SAME hash. ✅
+- same basis with whitespace differences → SAME hash. ✅
+- Also fixed the "includes all content fields" test to expect the normalized
+  form (keys sorted alphabetically).
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 328 pass / 0 fail (0 regressions)
+- Plan contract tests ................. 31 pass / 0 fail / 55 expect()
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE CONTENT HASH INVARIANT IS NOW COMPLETE:
+  same PlanSheetRevision
+  + same measurement input (quantity, method, unit)
+  + same basis (normalized — key ordering independent)
+  + same engine version
+      → same PlanMeasurement content
+      → same content hash
+
+READY FOR SCHEMA MIGRATION:
+  PlanArtifact → PlanSheet → PlanSheetRevision → PlanMeasurement
+  with EstimateLine.currentMeasurementId as optional mutable lineage
+  (not required ownership).
