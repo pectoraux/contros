@@ -41,11 +41,29 @@ export interface ActivityChange {
   activityId: string
   /** The activity's name in the head snapshot (for display). */
   name: string
-  kind: 'added' | 'removed' | 'renamed' | 'reordered' | 'duration-changed'
-  /** For renamed: the old name. For reordered: the old sequence. For duration: the old duration. */
+  kind:
+    | 'added'
+    | 'removed'
+    | 'renamed'
+    | 'reordered'
+    | 'duration-changed'
+    | 'estimate-line-changed'
+    | 'wdv-changed'
+    | 'planned-quantity-changed'
+  /** For renamed: the old name. For reordered: the old sequence. For duration: the old duration. Etc. */
   oldValue?: string | number
-  /** For renamed: the new name. For reordered: the new sequence. For duration: the new duration. */
+  /** For renamed: the new name. For reordered: the new sequence. For duration: the new duration. Etc. */
   newValue?: string | number
+  /**
+   * Category of this change:
+   *   - "schedule" — duration or dependency changes (change CPM outputs)
+   *   - "presentation" — name or sequence changes (do NOT change CPM outputs)
+   *   - "construction" — EstimateLine/WDV/plannedQuantity changes, activity
+   *     added/removed (construction-identity / scope changes; may indirectly
+   *     affect schedule if duration also changed, but the relationship change
+   *     itself is construction-domain, not scheduling)
+   */
+  category: 'schedule' | 'presentation' | 'construction'
   /** Whether this change affects the CPM schedule outputs. */
   scheduleAffecting: boolean
 }
@@ -62,17 +80,21 @@ export interface DependencyChange {
   oldValue?: string | number
   /** For type-changed: the new type. For lag-changed: the new lag. */
   newValue?: string | number
+  /** Category — dependencies are always "schedule" (they affect CPM). */
+  category: 'schedule'
   /** Whether this change affects the CPM schedule outputs. */
   scheduleAffecting: boolean
 }
 
 export interface ChangeSummary {
-  /** True if the workspace is identical to the base revision (no changes). */
+  /** True if the two snapshots differ in any way. */
   hasChanges: boolean
   /** True if any change affects the CPM schedule outputs. */
   hasScheduleChanges: boolean
   /** True if any change is presentation-only (name/sequence). */
   hasPresentationChanges: boolean
+  /** True if any change is construction-domain (EstimateLine/WDV/plannedQuantity/added/removed). */
+  hasConstructionChanges: boolean
   activities: ActivityChange[]
   dependencies: DependencyChange[]
   /** Counts for quick display. */
@@ -82,6 +104,9 @@ export interface ChangeSummary {
     activitiesRenamed: number
     activitiesReordered: number
     activitiesDurationChanged: number
+    activitiesEstimateLineChanged: number
+    activitiesWdvChanged: number
+    activitiesPlannedQuantityChanged: number
     dependenciesAdded: number
     dependenciesRemoved: number
     dependenciesTypeChanged: number
@@ -108,16 +133,20 @@ export function computeChangeSummary(
   const dependencies = diffDependencies(base.dependencies, head.dependencies)
 
   const hasScheduleChanges =
-    activities.some((a) => a.scheduleAffecting) ||
-    dependencies.some((d) => d.scheduleAffecting)
+    activities.some((a) => a.category === 'schedule') ||
+    dependencies.some((d) => d.category === 'schedule')
 
   const hasPresentationChanges =
-    activities.some((a) => !a.scheduleAffecting)
+    activities.some((a) => a.category === 'presentation')
+
+  const hasConstructionChanges =
+    activities.some((a) => a.category === 'construction')
 
   return {
     hasChanges: activities.length > 0 || dependencies.length > 0,
     hasScheduleChanges,
-    hasPresentationChanges: hasPresentationChanges && !hasScheduleChanges || hasPresentationChanges,
+    hasPresentationChanges,
+    hasConstructionChanges,
     activities,
     dependencies,
     counts: {
@@ -126,6 +155,9 @@ export function computeChangeSummary(
       activitiesRenamed: activities.filter((a) => a.kind === 'renamed').length,
       activitiesReordered: activities.filter((a) => a.kind === 'reordered').length,
       activitiesDurationChanged: activities.filter((a) => a.kind === 'duration-changed').length,
+      activitiesEstimateLineChanged: activities.filter((a) => a.kind === 'estimate-line-changed').length,
+      activitiesWdvChanged: activities.filter((a) => a.kind === 'wdv-changed').length,
+      activitiesPlannedQuantityChanged: activities.filter((a) => a.kind === 'planned-quantity-changed').length,
       dependenciesAdded: dependencies.filter((d) => d.kind === 'added').length,
       dependenciesRemoved: dependencies.filter((d) => d.kind === 'removed').length,
       dependenciesTypeChanged: dependencies.filter((d) => d.kind === 'type-changed').length,
@@ -144,25 +176,27 @@ function diffActivities(
   const baseById = new Map(base.map((a) => [a.id, a]))
   const headById = new Map(head.map((a) => [a.id, a]))
 
-  // Activities added (in head but not in base).
+  // Activities added (in head but not in base) — construction category.
   for (const h of head) {
     if (!baseById.has(h.id)) {
       changes.push({
         activityId: h.id,
         name: h.name,
         kind: 'added',
+        category: 'construction',
         scheduleAffecting: true, // a new activity affects the schedule
       })
     }
   }
 
-  // Activities removed (in base but not in head).
+  // Activities removed (in base but not in head) — construction category.
   for (const b of base) {
     if (!headById.has(b.id)) {
       changes.push({
         activityId: b.id,
         name: b.name,
         kind: 'removed',
+        category: 'construction',
         scheduleAffecting: true, // removing an activity affects the schedule
       })
     }
@@ -173,7 +207,7 @@ function diffActivities(
     const b = baseById.get(h.id)
     if (!b) continue // already handled as "added"
 
-    // Duration changed (schedule-affecting).
+    // Duration changed (schedule category).
     if (b.duration !== h.duration) {
       changes.push({
         activityId: h.id,
@@ -181,11 +215,12 @@ function diffActivities(
         kind: 'duration-changed',
         oldValue: b.duration,
         newValue: h.duration,
+        category: 'schedule',
         scheduleAffecting: true,
       })
     }
 
-    // Name changed (presentation only).
+    // Name changed (presentation category).
     if (b.name !== h.name) {
       changes.push({
         activityId: h.id,
@@ -193,11 +228,12 @@ function diffActivities(
         kind: 'renamed',
         oldValue: b.name,
         newValue: h.name,
+        category: 'presentation',
         scheduleAffecting: false,
       })
     }
 
-    // Sequence changed (presentation only).
+    // Sequence changed (presentation category).
     if (b.sequence !== h.sequence) {
       changes.push({
         activityId: h.id,
@@ -205,7 +241,47 @@ function diffActivities(
         kind: 'reordered',
         oldValue: b.sequence,
         newValue: h.sequence,
+        category: 'presentation',
         scheduleAffecting: false,
+      })
+    }
+
+    // EstimateLine relationship changed (construction category).
+    if (b.constructionRefs.estimateLineId !== h.constructionRefs.estimateLineId) {
+      changes.push({
+        activityId: h.id,
+        name: h.name,
+        kind: 'estimate-line-changed',
+        oldValue: b.constructionRefs.estimateLineId ?? 'none',
+        newValue: h.constructionRefs.estimateLineId ?? 'none',
+        category: 'construction',
+        scheduleAffecting: false, // relationship change doesn't directly affect CPM
+      })
+    }
+
+    // WorkDefinitionVersion relationship changed (construction category).
+    if (b.constructionRefs.workDefinitionVersionId !== h.constructionRefs.workDefinitionVersionId) {
+      changes.push({
+        activityId: h.id,
+        name: h.name,
+        kind: 'wdv-changed',
+        oldValue: b.constructionRefs.workDefinitionVersionId ?? 'none',
+        newValue: h.constructionRefs.workDefinitionVersionId ?? 'none',
+        category: 'construction',
+        scheduleAffecting: false,
+      })
+    }
+
+    // Planned quantity changed (construction category).
+    if (b.plannedQuantity !== h.plannedQuantity) {
+      changes.push({
+        activityId: h.id,
+        name: h.name,
+        kind: 'planned-quantity-changed',
+        oldValue: b.plannedQuantity ?? 'none',
+        newValue: h.plannedQuantity ?? 'none',
+        category: 'construction',
+        scheduleAffecting: false, // quantity doesn't directly affect CPM dates
       })
     }
   }
@@ -243,6 +319,7 @@ function diffDependencies(
         predecessorName: h.predecessorActivityId, // fallback; service enriches with names
         successorName: h.successorActivityId,
         kind: 'added',
+        category: 'schedule',
         scheduleAffecting: true,
       })
     }
@@ -258,6 +335,7 @@ function diffDependencies(
         predecessorName: b.predecessorActivityId,
         successorName: b.successorActivityId,
         kind: 'removed',
+        category: 'schedule',
         scheduleAffecting: true,
       })
     }
@@ -279,6 +357,7 @@ function diffDependencies(
         kind: 'type-changed',
         oldValue: b.type,
         newValue: h.type,
+        category: 'schedule',
         scheduleAffecting: true,
       })
     }
@@ -293,6 +372,7 @@ function diffDependencies(
         kind: 'lag-changed',
         oldValue: b.lag,
         newValue: h.lag,
+        category: 'schedule',
         scheduleAffecting: true,
       })
     }

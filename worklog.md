@@ -5769,3 +5769,107 @@ The contractor can now answer:
 NEXT: revision comparison — the bridge to a genuinely useful programme graph:
   Programme Revision 1 ↕ Programme Revision 2
       ↓ What changed in duration? dependencies? planned work? commercial linkage?
+
+---
+Task ID: finalization-error-contract-and-revision-comparison
+Agent: principal-engineer
+Task: F1-fix + F2 — Fix finalization error contract (typed 422 instead of thrown exception) + implement revision-to-revision comparison. The comparison gives a genuinely historical answer to "What changed from Programme Revision 3 to Revision 4?" with three categories: schedule, presentation, construction. No frozen code touched.
+
+PART 1: FINALIZATION ERROR CONTRACT FIX
+
+ISSUE (per review):
+  finalizeProgramme() threw a plain Error on validation failure, which could
+  escape as a 500 rather than the advertised 422 domain error.
+
+FIX:
+- Generalized `DependencyValidationError` → `ProgrammeValidationError` (a
+  single typed error class for all programme validation failures).
+- finalizeProgramme now throws `ProgrammeValidationError(message, 422)`
+  instead of `new Error(...)`.
+- The catch block uses `instanceof ProgrammeValidationError` instead of
+  fragile string matching ("validation failed").
+- Genuine infrastructure/database failures still propagate as 500s.
+- All 14 existing `DependencyValidationError` usages updated to
+  `ProgrammeValidationError`.
+
+TEST: cyclic workspace → 422 (typed, not 500). The cycle is created via
+direct DB insert (bypassing the service's cycle check), then finalize is
+called. Returns 422 with "cycle" in the message.
+
+PART 2: REVISION-TO-REVISION COMPARISON
+
+EXTENDED CHANGE SUMMARY (src/lib/programme/change-summary.ts):
+- Added `category: 'schedule' | 'presentation' | 'construction'` to
+  ActivityChange and DependencyChange.
+- Added construction-category changes:
+    estimate-line-changed (EstimateLine relationship changed)
+    wdv-changed (WorkDefinitionVersion relationship changed)
+    planned-quantity-changed
+    added/removed (construction-identity / scope changes)
+- Added `hasConstructionChanges` to ChangeSummary.
+- Added 3 new count fields: activitiesEstimateLineChanged,
+  activitiesWdvChanged, activitiesPlannedQuantityChanged.
+
+THREE CATEGORIES:
+  schedule      — duration / dependency changes (change CPM outputs)
+  presentation  — name / sequence changes (do NOT change CPM outputs)
+  construction  — EstimateLine / WDV / plannedQuantity / added / removed
+                  (construction-identity / scope changes; may indirectly
+                  affect schedule if duration also changed, but the
+                  relationship change itself is construction-domain)
+
+SERVICE (src/application/programme-service.ts):
+- `compareRevisions({ ctx, programmeId, fromRevisionId, toRevisionId })`
+  → { ok, summary, from, to } | Err
+- Loads both revisions (tenant-scoped), validates both belong to the
+  requested programme (T1 identity), deserializes both snapshots, computes
+  the pure diff, enriches dependency names.
+- Returns metadata: revisionNo, finalizedAt, snapshotContentHash for both.
+
+API ROUTE (src/app/api/programmes/[programmeId]/revisions/compare/route.ts):
+- GET ?from=revA&to=revB → requireAuth → compareRevisions() → JSON.
+- 422 if from/to missing.
+- 404 if either revision not found / wrong tenant / mismatched programme.
+
+INTEGRATION TESTS (tests/integration/programme-revision-compare.test.ts — 10 tests):
+1. Finalize valid workspace → revision 1.
+2. Finalize with cyclic workspace → 422 (typed, not 500). ✅
+3. Cross-tenant finalize → 404.
+4. Make schedule + presentation changes, finalize revision 2.
+5. Compare revision 1 → revision 2: duration-changed (schedule), renamed
+   (presentation), dependency added (schedule). Correct categories + values.
+6. Compare revision 2 → revision 1 (reverse): changes are mirrored
+   (added→removed, 5→8 becomes 8→5).
+7. Compare revision to itself → no changes.
+8. Cross-tenant comparison → 404.
+9. Mismatched programme → 404.
+10. Construction category: plannedQuantity change between revisions →
+    hasConstructionChanges=true, category='construction',
+    scheduleAffecting=false.
+
+HTTP VERIFICATION (authenticated curl):
+- Finalize rev 1 + rev 2. ✅
+- Compare rev 1 → rev 2: hasChanges=true, schedule=true, "Site Clearing:
+  duration-changed (schedule) 3 → 7". ✅
+- Compare rev to itself: hasChanges=false. ✅
+- Dev log: GET .../revisions/compare 200.
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 297 pass / 0 fail (0 regressions)
+- Revision compare (Neon) ............. 10 pass / 0 fail / 55 expect()
+- HTTP: finalize → 200 .................. ✅
+- HTTP: compare rev-to-rev → 200 ........ ✅
+- HTTP: compare self → no changes ....... ✅
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE CONTRACTOR CAN NOW ANSWER:
+  "What changed from Programme Revision 3 to Revision 4?"
+
+with three explicit categories:
+  schedule      — what changed in duration/dependencies (affects CPM)
+  presentation  — what was renamed/reordered (doesn't affect CPM)
+  construction  — what changed in scope/commercial linkage (EstimateLine/WDV/qty)
+
+This is the bridge to a genuinely useful programme graph — not just a
+Gantt chart, but a historical decision trail with explainable categories.

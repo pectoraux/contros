@@ -85,16 +85,21 @@ export interface DependencyView {
 }
 
 /**
- * D1: Internal error class for dependency validation failures thrown inside
- * the locked transaction. The service catches these and converts them to
- * typed { ok: false, error, status } results. Other thrown errors (e.g. X3
- * cross-programme from the repo) propagate as 500s — they indicate a
- * service-level check was bypassed, which is a programming error.
+ * Internal error class for programme validation failures thrown inside
+ * locked transactions. The service catches these and converts them to
+ * typed { ok: false, error, status } results. Other thrown errors (e.g.
+ * X3 cross-programme from the repo, or genuine infrastructure failures)
+ * propagate as 500s — they indicate a service-level check was bypassed
+ * or an infrastructure problem, which is not a domain validation error.
+ *
+ * Used by:
+ *   - dependency mutations (addDependency, updateDependency, deleteDependency)
+ *   - finalization (finalizeProgramme) — F1: invalid workspace → 422
  */
-class DependencyValidationError extends Error {
+class ProgrammeValidationError extends Error {
   constructor(message: string, public status: number) {
     super(message)
-    this.name = 'DependencyValidationError'
+    this.name = 'ProgrammeValidationError'
   }
 }
 
@@ -213,10 +218,14 @@ export const programmeService = {
         finalizedAt: '', // assigned below; NOT part of the content hash (P1)
       }
 
-      // Validate the snapshot.
+      // Validate the snapshot. F1: throw a typed ProgrammeValidationError
+      // so the catch block converts it to a clean 422 — not a 500.
       const validation = validateProgrammeSnapshot(snapshot)
       if (!validation.ok) {
-        throw new Error(`Programme snapshot validation failed: ${validation.errors.join('; ')}`)
+        throw new ProgrammeValidationError(
+          `Programme snapshot validation failed: ${validation.errors.join('; ')}`,
+          422,
+        )
       }
 
       // Compute the content hash from the content projection (P1).
@@ -267,9 +276,11 @@ export const programmeService = {
 
       return revision
     }).catch((e: unknown) => {
-      // If the error is a validation error, return a 422.
-      if (e instanceof Error && e.message.includes('validation failed')) {
-        return { _validationError: e.message }
+      // F1: typed validation errors are returned as { _validationError }
+      // so the outer code converts them to a clean 422. Genuine
+      // infrastructure/database failures propagate as 500s.
+      if (e instanceof ProgrammeValidationError) {
+        return { _validationError: e.message, _status: e.status }
       }
       throw e
     })
@@ -279,7 +290,7 @@ export const programmeService = {
       return {
         ok: false,
         error: (result as { _validationError: string })._validationError,
-        status: 422,
+        status: (result as { _status: number })._status,
       }
     }
 
@@ -416,6 +427,96 @@ export const programmeService = {
       ok: true,
       summary,
       latestRevisionNo: latestRevision?.revisionNo ?? null,
+    }
+  },
+
+  /**
+   * F2: Compare two ProgrammeRevisions revision-to-revision.
+   *
+   * This gives a genuinely historical answer to:
+   *   "What changed from Programme Revision 3 to Revision 4?"
+   *
+   * Unlike getChangeSummary (which compares workspace vs latest revision),
+   * this method compares any two finalized revisions by their IDs. Both
+   * revisions must belong to the same programme (and the same tenant).
+   *
+   * The comparison uses the same pure computeChangeSummary function, so the
+   * categorization is identical:
+   *   - "schedule" — duration / dependency changes
+   *   - "presentation" — name / sequence changes
+   *   - "construction" — EstimateLine / WDV / plannedQuantity / added / removed
+   *
+   * Returns the ChangeSummary + metadata about both revisions (revisionNo,
+   * finalizedAt, snapshotContentHash) for display.
+   */
+  async compareRevisions(
+    input: {
+      ctx: RequestContext
+      programmeId: string
+      fromRevisionId: string
+      toRevisionId: string
+    },
+  ): Promise<
+    | {
+        ok: true
+        summary: ChangeSummary
+        from: { revisionId: string; revisionNo: number; finalizedAt: string; snapshotContentHash: string }
+        to: { revisionId: string; revisionNo: number; finalizedAt: string; snapshotContentHash: string }
+      }
+    | Err
+  > {
+    const { ctx, programmeId, fromRevisionId, toRevisionId } = input
+
+    // Load both revisions (tenant-scoped via Programme.organizationId).
+    const [fromRev, toRev] = await Promise.all([
+      programmeRevisionRepo.getForOrganization(ctx.organizationId, fromRevisionId),
+      programmeRevisionRepo.getForOrganization(ctx.organizationId, toRevisionId),
+    ])
+
+    if (!fromRev) {
+      return { ok: false, error: 'From revision not found in this organization', status: 404 }
+    }
+    if (!toRev) {
+      return { ok: false, error: 'To revision not found in this organization', status: 404 }
+    }
+
+    // T1: both revisions must belong to the requested programme.
+    if (fromRev.programmeId !== programmeId) {
+      return { ok: false, error: 'From revision does not belong to this programme', status: 404 }
+    }
+    if (toRev.programmeId !== programmeId) {
+      return { ok: false, error: 'To revision does not belong to this programme', status: 404 }
+    }
+
+    // Deserialize both snapshots.
+    const fromSnapshot = deserializeSnapshot(fromRev.snapshotJson)
+    const toSnapshot = deserializeSnapshot(toRev.snapshotJson)
+
+    // Compute the pure diff.
+    const summary = computeChangeSummary(fromSnapshot, toSnapshot)
+
+    // Enrich dependency change names from the "to" snapshot's activities.
+    const nameById = new Map(toSnapshot.activities.map((a) => [a.id, a.name]))
+    for (const dc of summary.dependencies) {
+      dc.predecessorName = nameById.get(dc.predecessorActivityId) ?? dc.predecessorActivityId
+      dc.successorName = nameById.get(dc.successorActivityId) ?? dc.successorActivityId
+    }
+
+    return {
+      ok: true,
+      summary,
+      from: {
+        revisionId: fromRev.id,
+        revisionNo: fromRev.revisionNo,
+        finalizedAt: fromRev.finalizedAt?.toISOString() ?? '',
+        snapshotContentHash: fromRev.snapshotContentHash,
+      },
+      to: {
+        revisionId: toRev.id,
+        revisionNo: toRev.revisionNo,
+        finalizedAt: toRev.finalizedAt?.toISOString() ?? '',
+        snapshotContentHash: toRev.snapshotContentHash,
+      },
     }
   },
 
@@ -806,7 +907,7 @@ export const programmeService = {
         const predExists = activities.some((a) => a.id === predecessorActivityId)
         const succExists = activities.some((a) => a.id === successorActivityId)
         if (!predExists || !succExists) {
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             !predExists
               ? `Predecessor activity "${predecessorActivityId}" not found in this programme`
               : `Successor activity "${successorActivityId}" not found in this programme`,
@@ -816,7 +917,7 @@ export const programmeService = {
 
         // Check self-reference.
         if (predecessorActivityId === successorActivityId) {
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             'An activity cannot depend on itself',
             422,
           )
@@ -841,7 +942,7 @@ export const programmeService = {
             d.successorActivityId === successorActivityId,
         )
         if (existingEdge) {
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             `A dependency from "${predecessorActivityId}" to "${successorActivityId}" already exists (type: ${existingEdge.type}, lag: ${existingEdge.lag}). Update the existing dependency to change its type or lag.`,
             409,
           )
@@ -898,14 +999,14 @@ export const programmeService = {
 
         const validation = validateProgrammeSnapshot(wouldBeSnapshot)
         if (validation.hasCycle) {
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             'Dependency would create a cycle — schedule is infeasible',
             422,
           )
         }
         if (!validation.ok) {
           // Defensive: should not happen if the checks above passed.
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             `Dependency validation failed: ${validation.errors.join('; ')}`,
             422,
           )
@@ -921,7 +1022,7 @@ export const programmeService = {
         })
       })
     } catch (e) {
-      if (e instanceof DependencyValidationError) {
+      if (e instanceof ProgrammeValidationError) {
         return { ok: false, error: e.message, status: e.status }
       }
       // U1 backstop: if the DB-level unique constraint
@@ -1081,7 +1182,7 @@ export const programmeService = {
         // fixed for this edge.
         const existingEdge = dependencies.find((d) => d.id === dependencyId)
         if (!existingEdge) {
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             `Dependency "${dependencyId}" not found in programme "${programmeId}"`,
             404,
           )
@@ -1144,14 +1245,14 @@ export const programmeService = {
         // loop through another edge).
         const validation = validateProgrammeSnapshot(wouldBeSnapshot)
         if (validation.hasCycle) {
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             'Updated dependency would create a cycle — schedule is infeasible',
             422,
           )
         }
         if (!validation.ok) {
           // Defensive: should not happen if the checks above passed.
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             `Dependency validation failed: ${validation.errors.join('; ')}`,
             422,
           )
@@ -1168,7 +1269,7 @@ export const programmeService = {
         )
       })
     } catch (e) {
-      if (e instanceof DependencyValidationError) {
+      if (e instanceof ProgrammeValidationError) {
         return { ok: false, error: e.message, status: e.status }
       }
       throw e
@@ -1261,14 +1362,14 @@ export const programmeService = {
           dependencyId,
         )
         if (!deleted) {
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             `Dependency "${dependencyId}" not found in programme "${programmeId}"`,
             404,
           )
         }
       })
     } catch (e) {
-      if (e instanceof DependencyValidationError) {
+      if (e instanceof ProgrammeValidationError) {
         return { ok: false, error: e.message, status: e.status }
       }
       throw e
@@ -1479,7 +1580,7 @@ export const programmeService = {
         // Find the target activity by row ID.
         const target = activities.find((a) => a.id === activityId)
         if (!target) {
-          throw new DependencyValidationError(
+          throw new ProgrammeValidationError(
             `Activity "${activityId}" not found in programme "${programmeId}"`,
             404,
           )
@@ -1538,7 +1639,7 @@ export const programmeService = {
         }
       })
     } catch (e) {
-      if (e instanceof DependencyValidationError) {
+      if (e instanceof ProgrammeValidationError) {
         return { ok: false, error: e.message, status: e.status }
       }
       // R1 backstop: if the DB-level unique constraint
