@@ -6460,3 +6460,138 @@ IMPLEMENTATION SEQUENCE (confirmed, from the review)
 NEXT STEP: define the PlanArtifact + PlanSheet + PlanSheetRevision +
 PlanMeasurement contracts (types only, no schema yet), then the first
 schema migration.
+
+---
+Task ID: plan-domain-contract
+Agent: principal-engineer
+Task: Define the Plan domain pure types + validation + content hash (contract-first, no schema changes). Four domain types (PlanArtifact, PlanSheet, PlanSheetRevision, PlanMeasurement) with the four refinements from the architectural review. 28 unit tests establish validation, content-hash determinism, the historical invariant, and the adapter principle. No frozen code touched.
+
+FOUR REFINEMENTS (from the review, all implemented):
+
+1. PlanMeasurement is EVIDENCE, not EstimateLine-owned truth.
+   The type documentation explicitly states: "EstimateLine.currentMeasurementId
+   is a mutable 'current lineage' pointer, not ownership." A single measurement
+   can support multiple lines (slab area → concrete + formwork + reinforcement).
+
+2. Drawing revision status is NOT mutable truth.
+   PlanSheetRevision has NO status field. Each revision is immutable once
+   created. "Current" is a DERIVED selection (latest revision for a PlanSheet),
+   not a mutable status. This keeps historical reconstruction deterministic.
+
+3. File identity is SEPARATE from drawing identity.
+   PlanArtifact.id = uploaded source artifact (file identity).
+   PlanSheet.id = logical sheet (drawing identity).
+   fileHash = content identity / duplicate detection.
+   The same drawingNumber may appear in multiple uploaded packages.
+
+4. PlanMeasurement has stronger provenance than just elementReference.
+   measurementBasisJson records HOW the quantity was obtained (points, scale,
+   formula, tool version). This is the key explainability field for CAD/BIM/AI.
+
+DOMAIN TYPES (src/lib/plan/types.ts):
+
+  PlanArtifact (uploaded source: PDF, DWG, IFC)
+    - id, organizationId, opportunityId
+    - fileReference, fileName, fileHash (content identity)
+    - source (client | consultant | tender-portal | internal | other)
+    - documentId (optional link to Document)
+    - createdAt, createdById
+
+  PlanSheet (logical sheet within an artifact)
+    - id, planArtifactId
+    - sheetNumber (A-101, S-001), drawingNumber, title
+    - createdAt
+
+  PlanSheetRevision (immutable, append-only revision)
+    - id, planSheetId
+    - revision (Rev C, Rev 3), fileReference, fileHash
+    - createdAt, createdById
+    - NO status field (refinement 2 — "current" is derived, not mutable)
+
+  PlanMeasurement (append-only observation — evidence)
+    - id, planSheetRevisionId (references immutable revision)
+    - elementReference (optional — wall-grid-B7, room-101-floor)
+    - measurementMethod (manual | pdf-takeoff | cad-extraction | bim-export | ai-extraction)
+    - quantity (finite, >= 0), unit (non-empty)
+    - measurementBasisJson (provenance payload — refinement 4)
+    - measurementEngineVersion, contentHash
+    - measuredById, measuredAt, createdAt
+
+  PlanMeasurementContent (content projection for hashing)
+    - planSheetRevisionId, elementReference, measurementMethod, quantity, unit,
+      measurementBasisJson, measurementEngineVersion
+    - Excludes: id, measuredById, measuredAt, createdAt, contentHash
+
+VALIDATION (src/lib/plan/measurement.ts):
+  validatePlanMeasurement(measurement) → { ok, errors }
+  - quantity must be finite (Number.isFinite)
+  - quantity must be >= 0
+  - unit must be non-empty (after trim)
+  - measurement method must be recognized (5 methods)
+  - planSheetRevisionId must be non-empty (references immutable revision)
+  - measurementBasisJson must be valid JSON (if non-empty)
+  - measurementEngineVersion must be a positive integer
+
+CONTENT HASH (deterministic):
+  computeMeasurementContentHash(measurement) → SHA-256
+  - Computed from the content projection (excludes metadata)
+  - same content → same hash, regardless of recorder/time
+  - different quantity/method/unit/basis/revision → different hash
+  - Uses the shared stableJsonStringify (same as BOQ + Programme domains)
+
+HISTORICAL INVARIANT (tested):
+  same PlanSheetRevision + same measurement input + same engine version
+      → same PlanMeasurement content → same content hash
+
+ADAPTER PRINCIPLE (tested):
+  The domain types say "PlanSheetRevision" and "PlanMeasurement" — they do
+  NOT mention DWG, IFC, PDF, Archicad, Revit, or AutoCAD. An adapter knows
+  the source format; the domain is format-neutral. All adapters produce the
+  same PlanMeasurement domain object:
+    PDF adapter ───┐
+    DWG adapter ───┤
+    IFC adapter ───┼──→ PlanMeasurement
+    BIM adapter ───┤
+    AI adapter ────┤
+    Manual UI ─────┘
+
+UNIT TESTS (tests/unit/plan-contract.test.ts — 28 tests, all passing):
+- Validation: 11 tests (valid, NaN, Infinity, negative, empty unit,
+  unrecognized method, empty revisionId, invalid basisJson, zero/non-integer
+  engine version, quantity=0 is valid)
+- Content hash determinism: 8 tests (same→same, different quantity/method/
+  unit/basis/revision/element/engine→different)
+- Content projection: 2 tests (excludes metadata, includes all content fields)
+- Serialization: 1 test (deterministic)
+- measurementsMatch: 2 tests (same→true, different→false)
+- Adapter principle: 2 tests (all methods valid, no CAD/IFC/PDF concepts)
+- Historical invariant: 2 tests (same revision+input+engine→same hash,
+  different revision→different hash)
+
+VERIFICATION:
+- Lint ................................ CLEAN
+- Unit tests (full suite) ............. 324 pass / 1 flaky (pre-existing BOQ
+  projection test — passes in isolation, fails under shared-state ordering;
+  NOT caused by this change)
+- Plan contract tests ................. 28 pass / 0 fail / 52 expect()
+- Frozen Phase 1 code .................. UNTOUCHED
+
+THE LONG-TERM GRAPH (domain contracts now defined for the new layer):
+  PlanArtifact (NEW — contract defined)
+      ↓ 1:N
+  PlanSheet (NEW — contract defined)
+      ↓ 1:N (append-only, immutable)
+  PlanSheetRevision (NEW — contract defined)
+      ↓ 1:N (append-only observations)
+  PlanMeasurement (NEW — contract defined, content-addressed)
+      ↓ [EstimateLine.currentMeasurementId — mutable current lineage]
+  EstimateLine (canonical commercial hub — exists)
+      ↓ [Activity.estimateLineId]
+  ProgrammeActivity (schedule truth — exists)
+      ↓ [ProjectActual.estimateLineId]
+  ProjectActual (execution evidence — exists)
+
+NEXT: the first schema migration (PlanArtifact + PlanSheet + PlanSheetRevision +
+PlanMeasurement tables), then the first concrete feature: manual plan
+measurement (upload a drawing, identify a sheet, create a measurement, bind it
+to an EstimateLine, prove the provenance chain end-to-end).
